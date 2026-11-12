@@ -6,7 +6,9 @@
 //! monodromy recurrence (`Mono.zig`), a dense finite-difference Jacobian
 //! below `krylov_threshold` unknowns, or JFNK GMRES. Pinned once `init`
 //! ran: `sc` and `krylov` are reached by pointer.
-//! Cites: none beyond pss.zig's.
+//! Cites: pss.zig's; ngspice pssinit.c:16-20, dcpss.c:3560-3566, 3884 and
+//! 4218 (an oscillator's one settling transient, whose time the shooting
+//! continues); ngspice-45 dcpss.c:762-786 (the steadycoeff test).
 //!
 //! Contents:
 //! - `pub const Request = struct`
@@ -27,6 +29,7 @@ const root = @import("../types.zig");
 const Mono = @import("Mono.zig");
 const period = @import("period.zig");
 const pss = @import("pss.zig");
+const tran = @import("../tran/tran.zig");
 
 const Companion = period.Companion;
 const MonoKrylovCtx = Mono.MonoKrylovCtx;
@@ -66,11 +69,16 @@ krylov: ?Gmres,
 mono: ?Mono = null,
 iter: u16 = 0,
 res_norm: f64 = std.math.inf(f64),
+/// The last base period passed `shooting_tol` and `steady`.
+settled: bool = false,
 stage: Stage = .base,
 /// The FD column the `.column` stage integrates next.
 col: usize = 0,
 /// Set when `stage` reaches `.done`.
 result: SolveResult = undefined,
+/// An autonomous start's swing ratio per period (`Start`), named when the
+/// solve finds no periodic orbit.
+swing_ratio: f64 = 1,
 
 /// One period integration: `x` holds its start and receives its end;
 /// a non-empty `wave` records it as `integrateOnePeriod` documents.
@@ -98,6 +106,13 @@ const osc_kick: f64 = 1e-3;
 /// Cap on the periods an autonomous start settles past
 /// `osc_settle_periods` while the swing still grows by over 1 % a period.
 const max_settle_periods: usize = 2000;
+
+/// An autonomous start's outcome: the shooting's first period, the phase
+/// node, the anchor's time on the sources' axis (`Pss.t_origin`), and the
+/// phase node's swing ratio per period over the record, last crossing
+/// interval to first: a decaying oscillation's dominant Floquet multiplier
+/// magnitude, 1 on a limit cycle.
+const Start = struct { period: f64, osc_node: u32, t_origin: f64, swing_ratio: f64 };
 
 /// GMRES matvec context: one FD directional derivative of the shooting map.
 const ShootingKrylovCtx = struct {
@@ -165,7 +180,8 @@ pub fn init(s: *Shoot, ckt: *root.Circuit, x_dc: []const f64, probes: []const u3
     }
     errdefer if (krylov) |*k| k.deinit(allocator);
 
-    var mono = try Mono.init(allocator, ckt, options.n_samples, options.osc_node != root.GROUND);
+    const autonomous = options.osc_node != root.GROUND or options.phase_node == .largest_swing;
+    var mono = try Mono.init(allocator, ckt, options.n_samples, autonomous);
     errdefer if (mono) |*m| m.deinit(allocator);
     try ckt.computeBaseline();
     const ws = try ckt.workspace();
@@ -192,7 +208,14 @@ pub fn init(s: *Shoot, ckt: *root.Circuit, x_dc: []const f64, probes: []const u3
         .krylov = krylov,
     };
     num.copySimd(x0, x_dc[0..n]);
-    if (options.osc_node != root.GROUND) s.opts.period = try startOscillator(ckt, ws, &s.sc, x0, options, allocator);
+    if (autonomous) {
+        const start = try startOscillator(ckt, ws, &s.sc, x0, options, allocator);
+        s.options.osc_node = start.osc_node;
+        s.opts.osc_node = start.osc_node;
+        s.opts.period = start.period;
+        s.opts.t_origin = start.t_origin;
+        s.swing_ratio = start.swing_ratio;
+    }
 }
 
 /// Frees what `init` allocated.
@@ -239,21 +262,19 @@ pub fn next(s: *Shoot) error{QueryCancelled}!?Request {
 
 /// Consumes the outcome of the request `next` returned: `ok` is that
 /// integration's return. Errors as `solve`'s: a Krylov solve's
-/// cancellation or memory, `dense_lu`'s singular Jacobian.
+/// cancellation or memory, `dense_lu`'s singular Jacobian, and an
+/// autonomous solve's error.NoPeriodicSteadyState (`end`).
 pub fn done(s: *Shoot, ok: bool) !void {
     const n = s.n;
     switch (s.stage) {
         .base => {
-            if (!ok) {
-                s.result = .{ .converged = false, .iterations = s.iter, .residual_norm = std.math.inf(f64) };
-                s.stage = .done;
-                return;
-            }
+            if (!ok) return s.end(.{ .converged = false, .iterations = s.iter, .residual_norm = std.math.inf(f64) });
             // x_end + (-1)*x0 is exactly x_end - x0.
             num.copySimd(s.phi, s.x_end);
             num.axpy(s.phi, -1.0, s.x0);
             s.res_norm = num.normInf(s.phi);
-            if (s.res_norm < s.options.shooting_tol) {
+            s.settled = s.res_norm < s.options.shooting_tol and s.steady();
+            if (s.settled) {
                 s.stage = .final;
                 return;
             }
@@ -285,8 +306,7 @@ pub fn done(s: *Shoot, ok: bool) !void {
         },
         .final => {
             if (!ok) @memset(s.wave, 0);
-            s.result = .{ .converged = s.res_norm < s.options.shooting_tol, .iterations = s.iter, .residual_norm = s.res_norm };
-            s.stage = .done;
+            try s.end(.{ .converged = s.settled, .iterations = s.iter, .residual_norm = s.res_norm });
         },
         .done => unreachable,
     }
@@ -299,6 +319,47 @@ pub fn runAlone(s: *Shoot) !SolveResult {
 }
 
 // ---- private ----
+/// Ends the solve on `result`. An autonomous solve that did not converge
+/// found no periodic orbit: a decaying oscillation has none but its
+/// equilibrium, which the pinned phase node excludes, so the shooting
+/// residual stalls at the decay. That is error.NoPeriodicSteadyState,
+/// after a line naming the residual and `swing_ratio`, never the last
+/// iterate published as a steady state. A driven solve publishes its last
+/// period with a warning (`pss.finish`).
+fn end(s: *Shoot, result: SolveResult) error{NoPeriodicSteadyState}!void {
+    // ponytail: convergence is the only certificate, so an unstable periodic
+    // orbit the Newton lands on publishes as a steady state. The upgrade is
+    // the Floquet eigenvalues of the converged monodromy (`Mono`): refuse
+    // when any but the phase multiplier 1 has magnitude above 1.
+    s.result = result;
+    s.stage = .done;
+    if (result.converged or s.options.osc_node == root.GROUND) return;
+    std.debug.print("pss: no periodic steady state: the oscillator's shooting did not converge (residual {e}); " ++
+        "over its start-up the swing changed by a factor {d:.6} a period (below 1: it decays)\n", .{ result.residual_norm, s.swing_ratio });
+    return error.NoPeriodicSteadyState;
+}
+
+/// ngspice's steadycoeff test (ngspice-45 dcpss.c:762-786) on the base
+/// period just integrated, as `Options.steady_coeff` states it; true at 0.
+/// The swing is read from the monodromy's trajectory of that period.
+fn steady(s: *const Shoot) bool {
+    const c = s.options.steady_coeff;
+    if (c == 0) return true;
+    const tol = s.options.tol;
+    // ponytail: past `Mono`'s budget no trajectory is kept and the swing
+    // is 0: the floor alone bounds the residual, tighter than ngspice. A
+    // running max/min per unknown in the period integration lifts that.
+    const traj: []const f64 = if (s.mono) |m| m.traj else &.{};
+    for (s.phi[0..s.n], 0..) |r, i| {
+        const name = s.ckt.nodeName(@intCast(i));
+        const floor = if (name.len == 0 or std.mem.indexOfScalar(u8, name, '#') != null) tol.abstol else tol.vntol;
+        const swing = if (traj.len == 0) 0 else swingOf(traj, s.n, @intCast(i));
+        // Negated, so a NaN residual fails.
+        if (!(@abs(r) <= (swing * tol.reltol + floor) * tol.trtol * c)) return false;
+    }
+    return true;
+}
+
 /// The Newton step on the recorded monodromy (`Mono`): every column of
 /// the dense Jacobian in one recurrence pass, or GMRES on (Φ - I) with
 /// one pass per matvec. The autonomous period column is one more
@@ -429,13 +490,18 @@ fn krylovSolve(
     if (ctx.failure) |err| return err;
 }
 
-/// Starts an oscillator for the autonomous solve: kicks `x` (the DC point)
-/// off its equilibrium at the osc node, integrates `osc_settle_periods`
-/// guess periods and then until the swing settles (at most
-/// `max_settle_periods`), then records `measure_periods` more. The period
-/// is the mean spacing of the osc node's rising mid-swing crossings in
-/// that record. Leaves `x` at the first sample after the last crossing, the
-/// phase anchor the solve pins, and returns the period.
+/// Starts an oscillator for the autonomous solve, as ngspice's PSS does: one
+/// transient from t = 0 (the DC point, or the `.ic` values under `uic`)
+/// over `osc_settle_periods` guess periods, its first step and step cap
+/// ngspice's (pssinit.c:16-20, dcpss.c:3560-3566), so a PWL or pulse
+/// start-up kick plays once. A given osc node is kicked off its equilibrium
+/// first. Fixed-step periods then continue that transient's time until the
+/// phase node's swing settles (at most `max_settle_periods`), and record
+/// `measure_periods` more. Under `.largest_swing` the phase node is the net
+/// that swings most over the last settle period (`largestSwing`), named in
+/// a warning. The period is the mean spacing of the phase node's rising
+/// mid-swing crossings in that record. Leaves `x` at the first sample after
+/// the last crossing, the phase anchor the solve pins.
 fn startOscillator(
     ckt: *root.Circuit,
     ws: *converger.Workspace,
@@ -443,46 +509,69 @@ fn startOscillator(
     x: []f64,
     options: Options,
     allocator: std.mem.Allocator,
-) !f64 {
+) !Start {
     const n: usize = ckt.n;
-    const osc = options.osc_node;
     const steps: usize = options.n_samples;
-    x[osc] += osc_kick;
-    for (0..options.osc_settle_periods) |_|
-        if (!try integrateOnePeriod(ckt, ws, sc, x, &.{}, &.{}, options)) return error.OscillatorDidNotStart;
-    // A weakly unstable tank grows from the kick over many periods: keep
-    // settling until the osc node's swing moves under 1 % a period.
-    const swing = try allocator.alloc(f64, 2 * (steps + 1));
-    defer allocator.free(swing);
-    var prev_swing: f64 = 0;
-    for (0..max_settle_periods) |_| {
-        if (!try integrateOnePeriod(ckt, ws, sc, x, &.{osc}, swing, options)) return error.OscillatorDidNotStart;
-        var lo = std.math.inf(f64);
-        var hi = -std.math.inf(f64);
-        for (0..steps + 1) |k| {
-            lo = @min(lo, swing[2 * k + 1]);
-            hi = @max(hi, swing[2 * k + 1]);
-        }
-        if (@abs(hi - lo - prev_swing) <= 0.01 * (hi - lo)) break;
-        prev_swing = hi - lo;
+    const guess = options.period;
+    var osc = options.osc_node;
+    if (osc != root.GROUND) x[osc] += osc_kick;
+    const t_stab = @as(f64, @floatFromInt(options.osc_settle_periods)) * guess;
+    if (t_stab > 0) {
+        var wf = try tran.Waveform.init(allocator, 0, 1);
+        defer wf.deinit();
+        const reached = try tran.simulate(ckt, x, &.{}, &wf, .{
+            .tol = options.tol,
+            .t_stop = t_stab,
+            .t_start = t_stab,
+            .dt_init = guess / 100,
+            .dt_max = guess / 2,
+            .uic = options.uic,
+        }, allocator);
+        if (!reached) return error.TimestepTooSmall;
     }
 
+    // Every unknown, each period: the settle test reads the phase node, the
+    // pick every net, and the anchor its whole state.
     const rows = try allocator.alloc(u32, n);
     defer allocator.free(rows);
     for (rows, 0..) |*r, i| r.* = @intCast(i);
     const stride = (steps + 1) * (n + 1);
     const record = try allocator.alloc(f64, measure_periods * stride);
     defer allocator.free(record);
-    for (0..measure_periods) |p|
-        if (!try integrateOnePeriod(ckt, ws, sc, x, rows, record[p * stride ..][0..stride], options)) return error.OscillatorDidNotStart;
+    var opts = options;
+    // A weakly unstable tank grows from the kick over many periods: keep
+    // settling until the phase node's swing moves under 1 % a period.
+    var settled: usize = 0;
+    var prev_swing: f64 = 0;
+    while (settled < max_settle_periods) {
+        opts.t_origin = t_stab + @as(f64, @floatFromInt(settled)) * guess;
+        settled += 1;
+        if (!try integrateOnePeriod(ckt, ws, sc, x, rows, record[0..stride], opts)) return error.OscillatorDidNotStart;
+        if (options.phase_node == .largest_swing) osc = largestSwing(ckt, record[0..stride]);
+        if (osc == root.GROUND) return error.OscillatorDidNotStart;
+        const swing = swingOf(record[0..stride], n, osc);
+        if (@abs(swing - prev_swing) <= 0.01 * swing) break;
+        prev_swing = swing;
+    }
+    if (options.phase_node == .largest_swing)
+        std.debug.print("Warning: pss: no net names the phase node; picked v({s}), the net with the largest swing\n", .{ckt.nodeName(osc)});
+    const t_record = t_stab + @as(f64, @floatFromInt(settled)) * guess;
+    for (0..measure_periods) |p| {
+        opts.t_origin = t_record + @as(f64, @floatFromInt(p)) * guess;
+        if (!try integrateOnePeriod(ckt, ws, sc, x, rows, record[p * stride ..][0..stride], opts)) return error.OscillatorDidNotStart;
+    }
 
     // Sample g of the record is row g % steps of period g / steps; the last
     // row of each period repeats the next period's first.
     const total = measure_periods * steps + 1;
     const Sample = struct {
-        fn row(rec: []const f64, g: usize, s: usize, cols: usize) []const f64 {
+        /// The record row of sample g.
+        fn index(g: usize, s: usize) usize {
             const p = @min(g / s, measure_periods - 1);
-            return rec[p * (s + 1) * cols + (g - p * s) * cols + 1 ..][0 .. cols - 1];
+            return p * (s + 1) + g - p * s;
+        }
+        fn row(rec: []const f64, g: usize, s: usize, cols: usize) []const f64 {
+            return rec[index(g, s) * cols + 1 ..][0 .. cols - 1];
         }
     };
     var lo = std.math.inf(f64);
@@ -496,6 +585,10 @@ fn startOscillator(
     var first: f64 = 0;
     var last: f64 = 0;
     var anchor: usize = 0;
+    // Samples after the first, second and next-to-last crossings.
+    var g_first: usize = 0;
+    var g_second: usize = 0;
+    var g_before: usize = 0;
     var crossings: u32 = 0;
     var prev = Sample.row(record, 0, steps, n + 1)[osc];
     for (1..total) |g| {
@@ -503,6 +596,9 @@ fn startOscillator(
         if (prev < level and v >= level) {
             const at = @as(f64, @floatFromInt(g - 1)) + (level - prev) / (v - prev);
             if (crossings == 0) first = at;
+            if (crossings == 0) g_first = g;
+            if (crossings == 1) g_second = g;
+            g_before = anchor;
             last = at;
             anchor = g;
             crossings += 1;
@@ -511,6 +607,47 @@ fn startOscillator(
     }
     if (crossings < 2 or !(hi - lo > osc_kick)) return error.OscillatorDidNotStart;
     num.copySimd(x[0..n], Sample.row(record, anchor, steps, n + 1));
-    const dt = options.period / @as(f64, @floatFromInt(steps));
-    return (last - first) / @as(f64, @floatFromInt(crossings - 1)) * dt;
+    const dt = guess / @as(f64, @floatFromInt(steps));
+    const cols = n + 1;
+    const swing_first = swingOf(record[Sample.index(g_first, steps) * cols .. Sample.index(g_second, steps) * cols], n, osc);
+    const swing_last = swingOf(record[Sample.index(g_before, steps) * cols .. Sample.index(anchor, steps) * cols], n, osc);
+    return .{
+        .period = (last - first) / @as(f64, @floatFromInt(crossings - 1)) * dt,
+        .osc_node = osc,
+        .t_origin = t_record + @as(f64, @floatFromInt(anchor)) * dt,
+        .swing_ratio = if (crossings < 3) 1 else std.math.pow(f64, swing_last / swing_first, 1 / @as(f64, @floatFromInt(crossings - 2))),
+    };
+}
+
+/// The net that swings most over one recorded period `rec` (rows
+/// [t, x...]), the lowest row on a tie; GROUND when none moves. A net is a
+/// named row past ground: branch currents and device-internal unknowns
+/// (unnamed, or `dev#unknown`) are not.
+fn largestSwing(ckt: *const root.Circuit, rec: []const f64) u32 {
+    const n: usize = ckt.n;
+    var best: f64 = 0;
+    var pick: u32 = root.GROUND;
+    for (1..n) |i| {
+        const name = ckt.nodeName(@intCast(i));
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '#') != null) continue;
+        const swing = swingOf(rec, n, @intCast(i));
+        if (swing > best) {
+            best = swing;
+            pick = @intCast(i);
+        }
+    }
+    return pick;
+}
+
+/// Max minus min of unknown `row` over the rows [t, x...] of `rec`.
+fn swingOf(rec: []const f64, n: usize, row: u32) f64 {
+    std.debug.assert(rec.len % (n + 1) == 0 and row < n);
+    var lo = std.math.inf(f64);
+    var hi = -std.math.inf(f64);
+    var k: usize = 0;
+    while (k < rec.len) : (k += n + 1) {
+        lo = @min(lo, rec[k + 1 + row]);
+        hi = @max(hi, rec[k + 1 + row]);
+    }
+    return hi - lo;
 }

@@ -357,7 +357,7 @@ pub fn variantOf(job: Query) ?u32 {
     };
 }
 
-/// The HSPICE `.temp` list entry `job` runs at; null at the deck's.
+/// The temperature `job` runs at alone (`Tolerances.temp_c`); null at the deck's.
 pub fn tempOf(job: Query) ?f64 {
     return switch (job) {
         inline else => |o| o.tol.temp_c,

@@ -1,9 +1,11 @@
 //! The `espice` command line: argv in, one `Problem` per netlist file run
 //! in order, its `.meas` text on stdout (or its JSON, `--measures=-`), the
 //! `--measures` and `--emir` JSON files, and a one-line summary per result
-//! on stderr. Exit 0, 1 if any file failed to read, prepare or run, 2 on a
-//! usage error. The flags, the exit codes and every printed line are the
-//! CLI's contract.
+//! on stderr. A deck in another dialect than ngspice runs as SpiceRack's
+//! translation of it (spicerack.zig), with SpiceRack's time on stderr apart
+//! from ESPice's own. Exit 0, 1 if any file failed to read, translate,
+//! prepare or run, 2 on a usage error. The flags, the exit codes and every
+//! printed line are the CLI's contract.
 //! Cites: none.
 //!
 //! Contents:
@@ -14,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const problem = @import("espice");
+const spicerack = @import("spicerack.zig");
 const vpi_host = @import("vpi_host.zig");
 
 /// std reserves a 256 KB alternate signal stack per thread for stack-overflow
@@ -38,6 +41,9 @@ const backends = blk: {
 
 const help =
     \\Usage: espice [OPTION]... FILE...
+    \\       espice calibrate [--compile-all]
+    \\                              Measure this machine's GPU and CPU for --backend auto (~25 s) and write
+    \\                              the calibration file; --compile-all also compiles heavy models (minutes)
     \\  -b, --batch                 Run all queries (default)
     \\  -r, --rawfile=FILE          Result destination
     \\      --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
@@ -64,7 +70,9 @@ const help =
     \\      --tangents=P,...        Print d(.meas)/d(P) of the first .tran's cards for these .params
     \\      --tangent-step=S        Relative step of --tangents (default 1e-6)
     \\      --lanes                 Solve sweep points' OPs and .dc sweeps as SIMD lanes (CPU)
-    \\      --tokenizer=FMT         ngspice|hspice|spectre (default: detected from the deck, else ngspice)
+    \\      --tokenizer=FMT         ngspice|hspice|spectre|ltspice|xyce|vacask (default: detected from the deck,
+    \\                              else ngspice); any but ngspice is translated by SpiceRack's spice2rack first
+    \\      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else spice2rack on PATH)
     \\      --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
     \\  -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
     \\                              directory; repeatable, in order
@@ -85,7 +93,9 @@ const Cli = struct {
     vpi_apps: std.ArrayList([]const u8) = .empty,
     include_dirs: std.ArrayList([]const u8) = .empty,
     tangents: std.ArrayList([]const u8) = .empty,
-    dialect: ?problem.Dialect = null,
+    dialect: ?spicerack.Dialect = null,
+    /// `--spicerack=PATH`; null falls back to `ESPICE_SPICERACK`, then PATH.
+    spicerack_exe: ?[]const u8 = null,
     selection: problem.Selection = .{},
     /// Null when no `--backend` or `--gpu` was given.
     backend: ?problem.Request = null,
@@ -129,6 +139,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer cli.deinit(init.gpa);
     var args = init.minimal.args.iterate();
     _ = args.skip();
+    {
+        var peek = init.minimal.args.iterate();
+        _ = peek.skip();
+        if (peek.next()) |first| if (std.mem.eql(u8, first, "calibrate")) return calibrate(init, &peek);
+    }
     switch (try parse(init.gpa, &args, &cli)) {
         .run => {},
         .help => {
@@ -253,7 +268,9 @@ fn parse(gpa: std.mem.Allocator, args: anytype, cli: *Cli) std.mem.Allocator.Err
         } else if (optionValue(arg, "-I", "--include", args)) |value| {
             try cli.include_dirs.append(gpa, value orelse return .usage);
         } else if (optionValue(arg, "-tokenizer", "--tokenizer", args)) |value| {
-            cli.dialect = problem.parseDialect(value orelse return .usage) orelse return .usage;
+            cli.dialect = spicerack.parseDialect(value orelse return .usage) orelse return .usage;
+        } else if (optionValue(arg, "", "--spicerack", args)) |value| {
+            cli.spicerack_exe = value orelse return .usage;
         } else if (arg.len > 0 and arg[0] == '-') {
             std.debug.print("Error: unsupported option '{s}'\n", .{arg});
             return .usage;
@@ -264,33 +281,86 @@ fn parse(gpa: std.mem.Allocator, args: anytype, cli: *Cli) std.mem.Allocator.Err
 
 /// Reads, prepares and runs the deck at `path`, printing its `.meas` text
 /// and summary lines; false when it failed, after printing why on stderr.
-/// The deck is read once: a pipe or FIFO (`/dev/stdin`, `<(...)`) drains on
-/// the first read (#234). Fails only when stdout or stderr cannot be written.
+/// A deck in another dialect runs as SpiceRack's translation of it, never
+/// read natively; its two timing lines go to stderr (spicerack.zig). The
+/// deck is read once: a pipe or FIFO (`/dev/stdin`, `<(...)`) drains on
+/// the first read (#234), and spice2rack reads none, so one in another
+/// dialect is refused (`SpiceRackNeedsFile`). Fails only when stdout or
+/// stderr cannot be written.
 fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vpi: *const problem.Vpi, path: []const u8) !bool {
     std.debug.assert(cli.max_parallel != 0);
+    const start = std.Io.Timestamp.now(init.io, .awake);
     if (cli.timing_in_depth) std.debug.print("timing: {s}\n", .{path});
+    // Every timed log names the levers it ran with (`core.perf`).
+    if (cli.timing_in_depth) if (std.c.getenv("ESPICE_PERF")) |v| std.debug.print("timing: ESPICE_PERF={s}\n", .{std.mem.span(v)});
     // Each `.meas` block prints as its point ends (`Options.measures`).
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &out_buf);
     var stderr: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
-    const text = std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .unlimited) catch |err| {
+    // The user's deck, read only to detect its dialect or to run it: a
+    // named other dialect leaves it to spice2rack, which reads it itself.
+    const named = cli.dialect orelse .ngspice;
+    const original: ?[]u8 = if (cli.dialect != null and named != .ngspice) null else readDeck(init, path, path) orelse return false;
+    defer if (original) |t| init.gpa.free(t);
+    const dialect = cli.dialect orelse detected: {
+        const d = spicerack.detect(original.?);
+        if (d.dialect != .ngspice) std.debug.print("{s}:{d}: `{s}` is {t}: reading the deck through SpiceRack (--tokenizer to override)\n", .{ path, d.line, d.marker, d.dialect });
+        break :detected d.dialect;
+    };
+    // spice2rack opens the deck by path with no stdin, so a pipe or FIFO
+    // reaches it empty, drained here to detect its dialect (#234) or not:
+    // refuse it rather than translate nothing. A regular file goes by its
+    // real path, so `/dev/stdin` redirected from a file names that file.
+    // ponytail: refused, not copied, since a copy's relative includes would
+    // resolve against the copy; write it into the kit when a pipe needs it.
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real: []const u8 = if (dialect == .ngspice) path else real: {
+        const st = std.Io.Dir.cwd().statFile(init.io, path, .{}) catch |err| {
+            std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        if (st.kind != .file) {
+            std.debug.print("Error: {s}: SpiceRackNeedsFile\n", .{path});
+            return false;
+        }
+        const n = std.Io.Dir.cwd().realPathFile(init.io, path, &real_buf) catch |err| {
+            std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
+            return false;
+        };
+        break :real real_buf[0..n];
+    };
+    var kit: ?spicerack.Kit = if (dialect == .ngspice) null else spicerack.translate(init.gpa, init.io, .{
+        .exe = cli.spicerack_exe orelse if (std.c.getenv("ESPICE_SPICERACK")) |v| std.mem.span(v) else "spice2rack",
+        .dialect = dialect,
+        .deck = path,
+        .path = real,
+        .tmp_dir = if (std.c.getenv("TMPDIR")) |v| std.mem.span(v) else "/tmp",
+    }, &stderr.interface) catch |err| {
+        try stderr.interface.flush();
         std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
         return false;
     };
-    defer init.gpa.free(text);
+    try stderr.interface.flush();
+    defer if (kit) |*k| k.deinit(init.gpa, init.io);
+    // The second timing line, however the run ends: ESPice's own time apart
+    // from SpiceRack's.
+    defer if (kit) |k| {
+        const total = spicerack.seconds(start.durationTo(std.Io.Timestamp.now(init.io, .awake)));
+        const translating = spicerack.seconds(k.elapsed);
+        std.debug.print("espice: finished {s} in {d:.2} s, plus {d:.2} s in spicerack\n", .{ path, total - translating, translating });
+    };
+    // Includes in the translation resolve against its entry, so they find
+    // the translated copies; output paths stay relative to the cwd.
+    const origin = if (kit) |k| k.entry else path;
+    const text = if (kit != null) readDeck(init, origin, path) orelse return false else original.?;
+    defer if (kit != null) init.gpa.free(text);
     // `--measures=-`: the JSON takes the text blocks' place on stdout.
     var discard_buf: [256]u8 = undefined;
     var discard: std.Io.Writer.Discarding = .init(&discard_buf);
     const meas_out = if (jsonStdout(cli)) &discard.writer else &stdout.interface;
-    const dialect = cli.dialect orelse detected: {
-        const d = problem.detectDialect(text);
-        if (d != .ngspice) std.debug.print("{s}: reading as {t} (--tokenizer to override)\n", .{ path, d });
-        break :detected d;
-    };
     const p = problem.Problem.init(init.gpa, init.io, .{
-        .source = .{ .bytes = .{ .data = text, .origin = path } },
-        .dialect = dialect,
+        .source = .{ .bytes = .{ .data = text, .origin = origin } },
         .output = cli.selection,
         .backend = .{
             .backend = backend,
@@ -352,6 +422,15 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
     try stderr.interface.flush();
     try printSummary(init.gpa, p);
     return ok;
+}
+
+/// The bytes of `file`, in `init.gpa`; null after printing why it failed,
+/// under the user's `deck`.
+fn readDeck(init: std.process.Init, file: []const u8, deck: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(init.io, file, init.gpa, .unlimited) catch |err| {
+        std.debug.print("Error: {s}: {s}\n", .{ deck, @errorName(err) });
+        return null;
+    };
 }
 
 /// `--measures=-`: the JSON goes to stdout in place of the `.meas` text.
@@ -470,6 +549,36 @@ fn optionValue(arg: []const u8, short: []const u8, long: []const u8, args: anyty
     return null;
 }
 
+/// `espice calibrate [--compile-all]`, and its start probes' children
+/// (`--probe-start`, `--probe-none`): 0 when the file was written, 1 with
+/// the reason on stderr and nothing written, 2 on a usage error.
+fn calibrate(init: std.process.Init, args: anytype) !u8 {
+    var opts: problem.calibrate.Options = .{ .version = version };
+    while (args.next()) |arg| {
+        const which: ?problem.calibrate.Probe = if (std.mem.eql(u8, arg, "--probe-start")) .start else if (std.mem.eql(u8, arg, "--probe-none")) .none else null;
+        if (which) |w| {
+            var out: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &.{});
+            problem.calibrate.probe(w, &out.interface) catch |err| {
+                std.debug.print("Error: calibrate: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            return 0;
+        }
+        if (!std.mem.eql(u8, arg, "--compile-all")) return usageFail();
+        opts.compile_all = true;
+    }
+    if (std.c.getenv("XDG_CACHE_HOME")) |v| opts.knobs.xdg_cache_home = std.mem.span(v);
+    if (std.c.getenv("HOME")) |v| opts.knobs.home = std.mem.span(v);
+    var err_buf: [1024]u8 = undefined;
+    var stderr: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
+    problem.calibrate.run(init.gpa, init.io, opts, &stderr.interface) catch |err| {
+        stderr.interface.flush() catch {};
+        std.debug.print("Error: calibrate: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    return 0;
+}
+
 fn usageFail() u8 {
     std.debug.print("Usage: espice [OPTION]... FILE...\nTry 'espice --help' for options.\n", .{});
     return 2;
@@ -478,6 +587,7 @@ fn usageFail() u8 {
 test {
     // Analyzed only from `main` otherwise, which no test build reaches.
     std.testing.refAllDecls(vpi_host);
+    _ = spicerack;
 }
 
 test "--version matches build.zig.zon" {

@@ -20,8 +20,7 @@
 //! - `pub fn value(self: @This(), i: usize, f: expr.Fn, args: []const f64) f64`
 //! - `pub fn siteKey(owner: u64, salt: u64) u64`
 //! - `pub fn nameKey(owner: u64, name: []const u8) u64`
-//! - `pub fn isOpVar(dialect: Dialect, name: []const u8) bool`
-//! - `pub fn isGround(dialect: Dialect, name: []const u8) bool`
+//! - `pub fn isOpVar(name: []const u8) bool`
 //! - `pub fn isGroundName(name: []const u8) bool`
 //! - `pub fn nameIndex(names: []const []const u8, target: []const u8) ?usize`
 //! - `pub fn binHolds(b: [4]f64, l: f64, w: f64) bool`
@@ -31,7 +30,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -43,7 +41,6 @@ const InternPool = core.InternPool;
 const assert = std.debug.assert;
 const card_rows = @import("card_rows.zig");
 const card_table = @import("card_table.zig");
-const Dialect = card_rows.Dialect;
 const VertexId = card_rows.VertexId;
 const EdgeId = card_rows.EdgeId;
 const none = card_rows.none;
@@ -57,6 +54,7 @@ const DataFile = card_rows.DataFile;
 const SoaRating = card_rows.SoaRating;
 const Deck = card_rows.Deck;
 const kvIndex = card_table.kvIndex;
+const TemperSlots = @import("temper_slots.zig").TemperSlots;
 
 /// A parsed, flattened deck. Every slice lives in the parse arena.
 pub const Netlist = struct {
@@ -81,6 +79,8 @@ pub const Netlist = struct {
     model_ids: std.StringHashMapUnmanaged(u32),
     deck: Deck,
     live: Live = .{},
+    /// The values that read `temper`; `temper_slots.setTemp` rewrites them.
+    temper: TemperSlots = .{},
     /// Rows of `live.names` the caller asked to set on the prepared
     /// circuit (`parseLive`), in the caller's order.
     tunable: []const u32 = &.{},
@@ -278,26 +278,14 @@ pub fn nameKey(owner: u64, name: []const u8) u64 {
 }
 
 /// Whether output name `name`, lowercased, is a device operating-point
-/// variable as `dialect` spells one (#236): ngspice's `@m1[gm]` in any,
-/// HSPICE's `lx7(m1)` and `lv9(m1)` element templates, Spectre's `m1:gm`.
-/// `prepare` resolves it or refuses the deck.
-pub fn isOpVar(dialect: Dialect, name: []const u8) bool {
-    if (name.len != 0 and name[0] == '@') return true;
-    return switch (dialect) {
-        .ngspice => false,
-        .hspice => name.len > 3 and name[0] == 'l' and (name[1] == 'x' or name[1] == 'v') and std.ascii.isDigit(name[2]) and name[name.len - 1] == ')',
-        .spectre => std.mem.indexOfScalar(u8, name, ':') != null and std.mem.indexOfScalar(u8, name, '(') == null,
-    };
+/// variable, ngspice's `@m1[gm]` (#236). `prepare` resolves it or refuses
+/// the deck.
+pub fn isOpVar(name: []const u8) bool {
+    return name.len != 0 and name[0] == '@';
 }
 
-/// True for a name that is ground in `dialect`: only `0` in Spectre, where
-/// `gnd` is ground only when `global` names it first (spectre-syntax.md §7).
-pub fn isGround(dialect: Dialect, name: []const u8) bool {
-    return if (dialect == .spectre) std.mem.eql(u8, name, "0") else isGroundName(name);
-}
-
-/// True for `0`, `gnd` and `ground`, case-insensitively: ground in the
-/// ngspice and HSPICE dialects.
+/// True for `0`, `gnd` and `ground`, case-insensitively: ngspice's ground
+/// names.
 pub fn isGroundName(name: []const u8) bool {
     return std.mem.eql(u8, name, "0") or
         std.ascii.eqlIgnoreCase(name, "gnd") or

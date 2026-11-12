@@ -34,6 +34,7 @@ const gpu = @import("context.zig");
 const freq = @import("../ac/freq.zig");
 const freq_engine = @import("freq_engine.zig");
 const freq_held = @import("freq_held.zig");
+const lane_fan = @import("../lane_fan.zig");
 
 const FS = solver.freq_solve.FreqSolver;
 const Chunk = FS.LaneChunk;
@@ -126,7 +127,10 @@ pub const RoundDriver = struct {
                 if (comptime artifacts.has_hip) return runRound(.hip, self.allocator, points, failures, &self.hip, &self.disabled);
             },
         };
-        for (points, failures) |p, *failure| solveHost(p, failure);
+        if (lane_fan.lent) |l| {
+            const rows: Rows = .{ .points = points, .counts = &.{}, .chunks = &.{}, .cchunks = &.{}, .bad = &.{}, .solved = &.{}, .failures = failures };
+            lane_fan.each(l.pool, l.threads, points.len, rows, Rows.host);
+        } else for (points, failures) |p, *failure| solveHost(p, failure);
         return .{ .points = points.len };
     }
 };
@@ -137,6 +141,82 @@ pub const Held = freq_held.Held;
 pub const prepareHeld = freq_held.prepareHeld;
 /// Backend-typed held factors (`freq_held.zig`).
 pub const DeviceHeld = freq_held.DeviceHeld;
+
+/// G1 stage 1: `runRound`'s and `RoundDriver.solve`'s per-point host
+/// steps, for `lane_fan.each` under `lane_fan.lent`. Point i's step reads
+/// and writes only its own solver (no two points share one:
+/// `RoundDriver.solve` asserts it), its `out`, and its own row of the
+/// slices below; no step reaches a checkpoint or a driver. The serial
+/// loops beside each call are the oracle: the same steps, one point at a
+/// time, in point order.
+const Rows = struct {
+    points: []const RoundPoint,
+    counts: []usize,
+    chunks: []?Chunk,
+    cchunks: []?CChunk,
+    bad: []const u64,
+    solved: []const bool,
+    failures: []?SolveError,
+
+    /// `runRound`'s slices, one row per point.
+    fn of(points: []const RoundPoint, counts: []usize, chunks: []?Chunk, cchunks: []?CChunk, bad: []const u64, solved: []const bool, failures: []?SolveError) Rows {
+        assert(counts.len == points.len and chunks.len == points.len and cchunks.len == points.len);
+        assert(bad.len == points.len and solved.len == points.len and failures.len == points.len);
+        return .{ .points = points, .counts = counts, .chunks = chunks, .cchunks = cchunks, .bad = bad, .solved = solved, .failures = failures };
+    }
+
+    /// `RoundDriver.solve`'s host round for point i.
+    fn host(r: Rows, i: usize) void {
+        assert(r.points.len == r.failures.len);
+        solveHost(r.points[i], &r.failures[i]);
+    }
+
+    /// `runRound`'s chunk head for point i: its tape laid, or its round
+    /// solved on the host (frequency-dependent terms, a serial chunk).
+    fn begin(r: Rows, i: usize) void {
+        assert(r.points.len == r.counts.len and r.points.len == r.failures.len);
+        const p = r.points[i];
+        const count = &r.counts[i];
+        const failure = &r.failures[i];
+        count.* = p.omegas.len;
+        assert(count.* > 0 and count.* <= FS.W);
+        assert(p.out.len == p.omegas.len * p.rhs.len);
+        if (p.dyn.slots.len != 0) return solveHost(p, failure);
+        if (p.fs.complex_lanes) {
+            r.cchunks[i] = p.fs.beginComplexChunk(p.omegas, 0, count.*, p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+                return;
+            };
+            // Null with the lanes still on: solved serially.
+            if (r.cchunks[i] != null or p.fs.complex_lanes) return;
+        }
+        r.chunks[i] = p.fs.beginLaneChunk(p.omegas, 0, count.*, p.rhs, p.out, p.adjoint) catch |err| {
+            failure.* = err;
+            return;
+        };
+    }
+
+    /// `runRound`'s chunk tail for point i, as its serial loop.
+    fn finish(r: Rows, i: usize) void {
+        assert(r.points.len == r.solved.len and r.points.len == r.bad.len);
+        const p = r.points[i];
+        const failure = &r.failures[i];
+        const count = r.counts[i];
+        if (r.chunks[i] == null and r.cchunks[i] == null) return;
+        if (!r.solved[i]) return solveHost(p, failure);
+        if (r.cchunks[i]) |cc| {
+            const kept = p.fs.finishComplexChunk(p.omegas, 0, count, r.bad[i], cc.fresh, p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+                return;
+            };
+            if (!kept) solveHost(p, failure);
+        } else {
+            p.fs.finishLaneChunk(p.omegas, 0, count, r.bad[i], p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+            };
+        }
+    }
+};
 
 /// Every point's leading sweep. Dense engines and frequency-dependent
 /// device terms use their existing host solve. A driver/allocation/solve
@@ -204,7 +284,7 @@ fn runRound(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: [
     // Each point's chunk takes the lanes its host `solveBatch` would: the
     // complex lanes while they are on, else the stacked ones, so a device
     // replay and every host fallback are bitwise the scalar solve.
-    for (points, counts, chunks, cchunks, failures) |p, *count, *chunk, *cchunk, *failure| {
+    if (lane_fan.lent) |l| lane_fan.each(l.pool, l.threads, points.len, Rows.of(points, counts, chunks, cchunks, bad, solved, failures), Rows.begin) else for (points, counts, chunks, cchunks, failures) |p, *count, *chunk, *cchunk, *failure| {
         count.* = p.omegas.len;
         std.debug.assert(count.* > 0 and count.* <= FS.W);
         std.debug.assert(p.out.len == p.omegas.len * p.rhs.len);
@@ -243,7 +323,7 @@ fn runRound(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: [
                 solved[id] = true;
             };
     }
-    for (points, counts, chunks, cchunks, bad, solved, failures) |p, count, chunk, cchunk, mask, on_device, *failure| {
+    if (lane_fan.lent) |l| lane_fan.each(l.pool, l.threads, points.len, Rows.of(points, counts, chunks, cchunks, bad, solved, failures), Rows.finish) else for (points, counts, chunks, cchunks, bad, solved, failures) |p, count, chunk, cchunk, mask, on_device, *failure| {
         // A chunk the device did not solve has only laid its tape and run
         // no peel, so `solveBatch` replays exactly that tape and finishes
         // in scalar order.
@@ -414,4 +494,98 @@ fn gather(points: anytype, chunks: anytype, first: usize, used: []bool, ids: []u
         used[k] = true;
     }
     return n;
+}
+
+// Oracle: each point's own `solveBatch` on a fresh solver, one point at a
+// time (the serial host round). Under `lane_fan.lent` the host round of
+// `RoundDriver.solve`, and `runRound`'s per-point head and tail with no
+// device (every laid chunk finishes on the host), must give each point's
+// solutions bitwise, at 1 and 33 threads.
+test "G1: frequency rounds fanned over the pool are bitwise each point's solveBatch" {
+    const gpa = std.testing.allocator;
+    const worker = @import("../worker.zig");
+    const ThreadPool = @import("../exec_config.zig").ThreadPool;
+    // Above `FreqSolver`'s dense threshold (16), so the sparse strategy
+    // lays lane chunks and `Rows.finish` has tapes to finish.
+    const n: u32 = 20;
+    const nn = 2 * n;
+    const P = 5;
+    // A tridiagonal RC ladder whose values differ per point.
+    var col_ptr: [n + 1]u32 = undefined;
+    var row_idx: [3 * n]u32 = undefined;
+    var g: [P][3 * n]f64 = undefined;
+    var c: [P][3 * n]f64 = undefined;
+    var nz: usize = 0;
+    for (0..n) |j| {
+        col_ptr[j] = @intCast(nz);
+        for ([_]i64{ -1, 0, 1 }) |d| {
+            const i = @as(i64, @intCast(j)) + d;
+            if (i < 0 or i >= n) continue;
+            row_idx[nz] = @intCast(i);
+            for (0..P) |k| {
+                const kf: f64 = @floatFromInt(k);
+                g[k][nz] = if (d == 0) 2 + 0.1 * kf else @as(f64, -1);
+                c[k][nz] = if (d == 0) 1e-6 * (1 + kf) else @as(f64, -1e-7);
+            }
+            nz += 1;
+        }
+    }
+    col_ptr[n] = @intCast(nz);
+    const Make = struct {
+        fn solvers(a: std.mem.Allocator, cp: []const u32, ri: []const u32, gs: *const [P][3 * n]f64, cs: *const [P][3 * n]f64) ![P]FS {
+            var out: [P]FS = undefined;
+            for (&out, gs, cs, 0..) |*f, *gk, *ck, k| {
+                f.* = FS.fromPlanes(a, n, cp, ri, gk, ck) catch |err| {
+                    for (out[0..k]) |*done| done.deinit();
+                    return err;
+                };
+            }
+            return out;
+        }
+    };
+    const all = [_]f64{ 1e3, 1e6 };
+    const omegas = all[0..@min(all.len, FS.W)];
+    var rhs: [nn]f64 = @splat(0);
+    rhs[0] = 1;
+    rhs[n + 2] = 0.5;
+    const m = omegas.len * nn;
+    var want: [P][all.len * nn]f64 = undefined;
+    {
+        var fss = try Make.solvers(gpa, &col_ptr, row_idx[0..nz], &g, &c);
+        defer for (&fss) |*f| f.deinit();
+        for (&fss, &want) |*f, *w| try f.solveBatch(omegas, .{}, &rhs, w[0..m], false);
+    }
+    var threads: worker.Threads = .init(gpa, std.testing.io);
+    defer threads.deinit();
+    for ([_]usize{ 0, 64 }) |cpus| {
+        var pool: ThreadPool = .init(cpus);
+        const free = pool.free.load(.monotonic);
+        for ([_]bool{ false, true }) |steps| {
+            var fss = try Make.solvers(gpa, &col_ptr, row_idx[0..nz], &g, &c);
+            defer for (&fss) |*f| f.deinit();
+            var got: [P][all.len * nn]f64 = undefined;
+            var pts: [P]RoundPoint = undefined;
+            for (&pts, &fss, &got) |*pt, *f, *o| pt.* = .{ .fs = f, .omegas = omegas, .rhs = &rhs, .out = o[0..m], .adjoint = false };
+            var failures: [P]?SolveError = @splat(null);
+            if (steps) {
+                var counts: [P]usize = undefined;
+                var chunks: [P]?Chunk = @splat(null);
+                var cchunks: [P]?CChunk = @splat(null);
+                const bad: [P]u64 = @splat(0);
+                const solved: [P]bool = @splat(false);
+                const rows = Rows.of(&pts, &counts, &chunks, &cchunks, &bad, &solved, &failures);
+                lane_fan.each(&pool, &threads, P, rows, Rows.begin);
+                lane_fan.each(&pool, &threads, P, rows, Rows.finish);
+            } else {
+                lane_fan.lent = .{ .pool = &pool, .threads = &threads };
+                defer lane_fan.lent = null;
+                var driver = RoundDriver.init(gpa, .cpu);
+                defer driver.deinit();
+                _ = try driver.solve(&pts, &failures);
+            }
+            try std.testing.expectEqual(free, pool.free.load(.monotonic));
+            for (failures) |f| try std.testing.expect(f == null);
+            for (&want, &got) |*w, *o| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w[0..m]), std.mem.sliceAsBytes(o[0..m]));
+        }
+    }
 }

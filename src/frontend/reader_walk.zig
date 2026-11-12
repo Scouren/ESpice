@@ -10,12 +10,10 @@
 //! - `pub fn pathOf(r: *R, f: *F) Error![]const u8`
 //! - `pub fn readFunc(r: *R, f: *F, eq: bool) Error!void`
 //! - `pub fn paramText(r: *R, f: *F) Error![]const u8`
-//! - `pub fn checkBare(r: *R, text: []const u8) Error!void`
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -36,6 +34,7 @@ const CondCard = card_table.CondCard;
 const Branches = card_table.Branches;
 const cardOf = card_table.cardOf;
 const Frame = reader_frame.Frame;
+const Scope = reader_frame.Scope;
 const PortIndex = reader_frame.PortIndex;
 const port_scan_max = reader_frame.port_scan_max;
 const subckt_depth_max = reader_frame.subckt_depth_max;
@@ -54,11 +53,19 @@ pub fn Methods(comptime S: type) type {
             const arena = r.arena;
             // Open `.subckt` definitions, innermost last (§2.5, D1: they nest),
             // each with the defaults its header and `.param` lines give.
-            const Open = struct { id: u16, defaults: std.ArrayList(@typeInfo(@FieldType(Subckt, "defaults")).pointer.child) = .empty, ifs: u8 = 0 };
+            const Open = struct { id: u16, defaults: std.ArrayList(Default) = .empty, ifs: u8 = 0 };
             var opens: [subckt_depth_max]Open = undefined;
             var depth: usize = 0;
-            // Top-level `.if` conditions see the `.param` cards above them.
-            // Inside a subcircuit they are left to `expand`, per instance;
+            // A top-level `.if` condition reads each parameter at its last
+            // definition outside a conditional block, even one below it, as
+            // ngspice-45 does (measured with `ngspice -n -b`, the oracle in
+            // tests/netlist.zig). So an `.alter` block's `.param` (ESPice's
+            // `.alter`) moves a branch. `globals` holds
+            // that last text from the start and at each such card; a
+            // block's `.param` writes its own.
+            const last = try lastParams(r);
+            for (last.keys(), last.values()) |key, entry| try r.globals.put(arena, key, entry);
+            // Conditions inside a subcircuit are left to `expand`, per instance;
             // `sub_ifs` counts the open ones so a `.model` there is marked.
             // ponytail: a `.param` under a subcircuit's `.if` applies
             // unconditionally; scope it when a PDK needs it.
@@ -125,10 +132,9 @@ pub fn Methods(comptime S: type) type {
                 }
                 if (!live) continue;
                 switch (card) {
-                    // HSPICE: `.end` ends the run. ngspice turns it into a
-                    // comment and reads on, so a card after it still counts
-                    // (dev/research/ngspice-syntax.md §1.7).
-                    .end => if (r.dialect == .hspice) break,
+                    // ngspice turns `.end` into a comment and reads on, so a
+                    // card after it still counts (ngspice-syntax.md §1.7).
+                    .end => {},
                     .ends => {
                         if (depth == 0) return error.ParseError;
                         depth -= 1;
@@ -177,25 +183,14 @@ pub fn Methods(comptime S: type) type {
                     // analysis there is no part of it (§2.4.3) (#165).
                     .analysis => if (depth > 0) return r.unsupported(line, "analysis card inside a subcircuit") else try directives.append(arena, i),
                     .func => try r.readFunc(&f, false),
-                    .param => while (true) {
-                        const at = f.pos;
-                        const key = f.next() orelse break;
-                        if (!F.isWord(key)) return error.ParseError;
-                        // `.param f(x)=body` defines a function (§2.3, X4).
-                        if (f.nextByte() == '(') {
-                            f.pos = at;
-                            try r.readFunc(&f, true);
+                    .param => while (try nextParam(r, &f)) |p| {
+                        if (depth > 0) {
+                            try opens[depth - 1].defaults.append(arena, p);
                             continue;
                         }
-                        const eq = f.next() orelse return error.ParseError;
-                        if (eq[0] != '=') return error.ParseError;
-                        const text = try r.paramText(&f);
-                        if (depth > 0)
-                            try opens[depth - 1].defaults.append(arena, .{ .key = key, .text = text })
-                        else {
-                            try r.globals.put(arena, key, .{ .text = text });
-                            try r.global_keys.append(arena, key);
-                        }
+                        const kept = if (branches.depth == 0) last.get(p.key) else null;
+                        try r.globals.put(arena, p.key, kept orelse .{ .text = p.text });
+                        try r.global_keys.append(arena, p.key);
                     },
                     .model => try models.append(arena, if (depth > 0)
                         .{ .line = i, .cond = opens[depth - 1].ifs > 0, .owner = opens[depth - 1].id }
@@ -242,7 +237,8 @@ pub fn Methods(comptime S: type) type {
             r.in_card = false;
             defer r.in_card = was_in_card;
             if (frame.sub == null) try r.cond_texts.append(r.arena, f.rest());
-            return switch (try r.exprValue(f.rest(), frame, false)) {
+            const text = try loneEqualsDoubled(r.arena, f.rest());
+            return switch (try r.exprValue(text, frame, false)) {
                 .num => |n| n != 0,
                 else => error.ParseError,
             };
@@ -295,20 +291,86 @@ pub fn Methods(comptime S: type) type {
             defer r.scratch.reset(mark);
             const start = f.pos;
             f.pos = try expr.compile(S, r.arena, &r.scratch, f.line, f.pos);
-            try r.checkBare(f.line[start..f.pos]);
             return f.line[start..f.pos];
         }
 
-        /// HSPICE reads an unquoted value only as a number or as an
-        /// expression that starts with a letter and holds no blank
-        /// (`lines.hspice.bareValue`); anything else is refused by name
-        /// (#203). tests/frontend/lower.zig `strictValue` refuses the same.
-        pub fn checkBare(r: *R, text: []const u8) Error!void {
-            if (r.dialect != .hspice or lines.hspice.bareValue(text)) return;
-            // A quoted expression is no bare one.
-            const t = std.mem.trimStart(u8, text, " \t");
-            if (t.len > 0 and (t[0] == '"' or t[0] == '\'' or t[0] == '{')) return;
-            return r.unsupported(r.card, "an unquoted expression that does not start with a letter, or holds a blank (quote it)");
+        // ---- private ----
+
+        /// One `key=text` definition of a `.param` card.
+        const Default = @typeInfo(@FieldType(Subckt, "defaults")).pointer.child;
+
+        /// The next definition on `.param` card `f`, reading each
+        /// `f(x)=body` before it as a function (§2.3, X4); null at its end.
+        fn nextParam(r: *R, f: *F) Error!?Default {
+            while (true) {
+                const at = f.pos;
+                const key = f.next() orelse return null;
+                if (!F.isWord(key)) return error.ParseError;
+                if (f.nextByte() == '(') {
+                    f.pos = at;
+                    try r.readFunc(f, true);
+                    continue;
+                }
+                const eq = f.next() orelse return error.ParseError;
+                if (eq[0] != '=') return error.ParseError;
+                return .{ .key = key, .text = try r.paramText(f) };
+            }
+        }
+
+        /// The last definition of each top-level `.param` outside an
+        /// `.if` block, as `declarations` walks the lines: past `.data`,
+        /// `.variation` and `.control` bodies.
+        fn lastParams(r: *R) Error!Scope {
+            var last: Scope = .empty;
+            var subs: usize = 0;
+            var ifs: usize = 0;
+            var body = false;
+            var control = false;
+            for (r.lines.items) |line| {
+                if (line[0] != '.') continue;
+                r.card = line;
+                var f = F.init(line);
+                const head = f.next().?;
+                if (control) {
+                    control = !std.ascii.eqlIgnoreCase(head, ".endc");
+                    continue;
+                }
+                if (head.len < 2) continue;
+                switch (cardOf(head[1..]) orelse continue) {
+                    .subckt => subs += 1,
+                    .ends => subs -|= 1,
+                    .cond => |c| switch (c) {
+                        .@"if" => ifs += 1,
+                        .endif => ifs -|= 1,
+                        .elseif, .@"else" => {},
+                    },
+                    .data, .variation => body = true,
+                    .enddata, .end_variation => body = false,
+                    .control => control = true,
+                    .param => if (subs == 0 and ifs == 0 and !body) while (try nextParam(r, &f)) |p| {
+                        try last.put(r.arena, p.key, .{ .text = p.text });
+                    },
+                    else => {},
+                }
+            }
+            return last;
         }
     };
+}
+
+// ---- private ----
+
+/// `text` with each lone `=` doubled: numparam reads `=` and `==` as one
+/// equality operator (xpressn.c:709-710, 728-730, 819), and `.if
+/// (select2 = 2)` is an ngspice condition.
+fn loneEqualsDoubled(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '=') == null) return text;
+    var out: std.ArrayList(u8) = try .initCapacity(arena, 2 * text.len);
+    for (text, 0..) |c, i| {
+        out.appendAssumeCapacity(c);
+        const paired = (i > 0 and std.mem.indexOfScalar(u8, "=<>!", text[i - 1]) != null) or
+            (i + 1 < text.len and text[i + 1] == '=');
+        if (c == '=' and !paired) out.appendAssumeCapacity('=');
+    }
+    return out.items;
 }

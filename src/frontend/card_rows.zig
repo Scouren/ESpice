@@ -1,11 +1,10 @@
 //! The parsed deck's row types. In: nothing (definitions only). Out: the
 //! values, cards, sweeps, variations, live slots and deck tables every
 //! stage after the reader reads.
-//! Cites: dev/research/{ngspice,hspice,spectre}-syntax.md; HSPICE [SA]
+//! Cites: dev/research/ngspice-syntax.md; HSPICE [SA]
 //! Ch.25-29, [CR] (the HSPICE cards each type holds).
 //!
 //! Contents:
-//! - `pub const Dialect`
 //! - `pub const VertexId`
 //! - `pub const EdgeId`
 //! - `pub const Kind`
@@ -17,6 +16,7 @@
 //! - `pub fn number(v: Value) ?f64`
 //! - `pub fn numberAt(args: []const Value, i: usize) ?f64`
 //! - `pub fn nameAt(args: []const Value, i: usize) ?[]const u8`
+//! - `pub fn hasUic(args: []const Value) bool`
 //! - `pub const Group`
 //! - `pub fn name(g: Group) []const u8`
 //! - `pub fn args(g: Group) []const Value`
@@ -42,7 +42,7 @@
 //! - `pub const Slot`
 //! - `pub const Table`
 //! - `pub const Bins`
-//! - `pub const Analysis`
+//! - `pub const Analysis`, `Analysis.ngspicePss(a: Analysis) bool`
 //! - `pub const Config`
 //! - `pub const Ic`
 //! - `pub const ForeignKind`
@@ -55,8 +55,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -66,9 +64,6 @@ const core = @import("core");
 const Name = core.Name;
 const InternPool = core.InternPool;
 const assert = std.debug.assert;
-
-/// Input syntax: ngspice, HSPICE or Spectre.
-pub const Dialect = lines.Dialect;
 
 /// A net: a row of `Netlist.graph`'s vertex table.
 pub const VertexId = hypergraph.VertexId;
@@ -124,6 +119,17 @@ pub const Value = union(enum) {
             .name => |n| n,
             else => null,
         };
+    }
+
+    /// Whether an analysis card's `args` hold the word `uic`, in any case.
+    /// It trails the numbers rather than taking a position:
+    /// `.tran 1n 100n uic` and `.tran 1n 100n 0 1n uic` are both legal.
+    pub fn hasUic(args: []const Value) bool {
+        for (args) |a| switch (a) {
+            .name => |n| if (std.ascii.eqlIgnoreCase(n, "uic")) return true,
+            else => {},
+        };
+        return false;
     }
 };
 
@@ -361,8 +367,6 @@ pub const Analysis = struct {
     sweep: Sweep = .none,
     /// The card as written, for diagnostics.
     line: []const u8 = "",
-    /// The syntax the card is read in (`.tran` segments, for one).
-    dialect: Dialect = .ngspice,
     pos: u32 = none,
     neg: u32 = none,
     ports: [4]u32 = @splat(none),
@@ -372,9 +376,17 @@ pub const Analysis = struct {
     sn: bool = false,
     /// One output of a `.four` card that named several; each is its own card.
     split: bool = false,
+
+    /// True for ngspice's `.pss gfreq tstab oscnob psspoints harms sciter
+    /// steadycoeff [uic]` (inp2dot.c:662-701): seven or eight arguments,
+    /// the first no `v(...)` group. ESPice's own `.pss f [n]` and `.pss
+    /// v(node) f [n [settle]]` take at most four, so no card reads as both.
+    pub fn ngspicePss(a: Analysis) bool {
+        return a.kind == .pss and !a.sn and (a.args.len == 7 or a.args.len == 8) and a.args[0] != .group;
+    }
 };
 
-/// `.options` and single-value `.temp` cards, in deck order.
+/// `.options` and `.temp` cards, in deck order.
 pub const Config = struct {
     temp: bool,
     args: []const Value,
@@ -402,7 +414,6 @@ pub const SoaRating = struct { model: []const u8, key: []const u8, limit: f64 };
 pub const Deck = struct {
     /// The first line as written, original case.
     title: []const u8,
-    dialect: Dialect,
     analyses: []const Analysis,
     config: []const Config,
     ic: []const Ic,
@@ -415,8 +426,6 @@ pub const Deck = struct {
     /// HSPICE's `.probe lx7(m1)` and Spectre's `save m1:gm` ones (`isOpVar`),
     /// lowercased, `.save all` or not.
     opvar_saves: []const []const u8 = &.{},
-    /// HSPICE `.probe op`: every device's operating-point variables.
-    probe_op: bool = false,
     foreign: []const Foreign,
     /// `.options vpi="app.so"` paths as written (relative to the deck): VPI
     /// applications to load (LRM 12.33, #197).
@@ -449,7 +458,7 @@ pub const Deck = struct {
     /// HSPICE `.mosra` (the last one) and its `.appendmodel` bindings.
     mosra: ?Mosra = null,
     appendmodels: []const AppendModel = &.{},
-    /// ngspice dialect with `.option seed=N` and no Monte Carlo sweep: the
+    /// `.option seed=N` and no Monte Carlo sweep: the
     /// distribution calls are drawn once from that seed (`variants.drawOnce`)
     /// instead of folding to their nominal, as ngspice draws them every run.
     draw_seed: bool = false,

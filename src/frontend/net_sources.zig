@@ -5,7 +5,7 @@
 //! Contents:
 //! - `pub fn ngspiceWaveform(self: *const NetBuilder, dev: Device) !Device`
 //! - `pub fn pulseTrain(self: *const NetBuilder, name: []const u8, args: []const Value) ![]const Value`
-//! - `pub fn amArgs(self: *const NetBuilder, name: []const u8, args: []const Value) ![]const Value`
+//! - `pub fn amArgs(self: *const NetBuilder, args: []const Value) ![]const Value`
 //! - `pub fn bindSource(self: *const NetBuilder, comptime D: type, dev: Device) !struct { D.Model, D.Instance }`
 
 const std = @import("std");
@@ -41,14 +41,14 @@ const NetBuilder = net_builder.NetBuilder;
 
 /// `dev` with its waveform in the source models' argument order. PULSE's
 /// eighth argument is ngspice's pulse count (vsrcload.c:120-135), which
-/// becomes a PWL of that many pulses, and the ngspice dialect's
+/// becomes a PWL of that many pulses, and ngspice's
 /// `AM(VO VMO VMA FM FC TD PHASEM PHASEC)` (vsrcload.c:283-315) maps onto
 /// the models' HSPICE-order AM. Any other card comes back as it is.
 pub fn ngspiceWaveform(self: *const NetBuilder, dev: Device) !Device {
     const w = net_waves.waveAt(dev) orelse return dev;
     const args: []const Value = switch (w.kind) {
         .pulse => if (w.args.len < 8) return dev else try pulseTrain(self, dev.name, w.args),
-        .am => if (self.nl.deck.dialect == .hspice or w.args.len < 2) return dev else try amArgs(self, dev.name, w.args),
+        .am => if (w.args.len < 2) return dev else try amArgs(self, w.args),
         else => return dev, // else: only PULSE and AM have an order to fix
     };
     const kind: []const u8 = if (w.kind == .am or args.len == 7) @tagName(w.kind) else "pwl";
@@ -109,23 +109,20 @@ pub fn pulseTrain(self: *const NetBuilder, name: []const u8, args: []const Value
 
 /// The ngspice dialect's `AM(VO VMO VMA FM FC TD PHASEM PHASEC)`, value
 /// VO + (VMO + VMA sin(2 pi FM t' + PHASEM)) sin(2 pi FC t' + PHASEC) on
-/// t' = t - TD, as the models' `AM(VA VO MF FC TD PHASEC PHASES)`, value
-/// VA (VO + sin(2 pi MF t + PHASES)) sin(2 pi FC t + PHASEC): the delay
-/// moves into the phases, and VMA = 0 holds the envelope at sin(90).
-/// ponytail: a nonzero VO offset is refused; the models have no slot for it.
-pub fn amArgs(self: *const NetBuilder, name: []const u8, args: []const Value) ![]const Value {
+/// t' = t - TD and 0 at t' <= 0 (vsrcload.c:283-316, isrcload.c:256-289),
+/// as the models' `AM(VA VO MF FC TD PHASEC PHASES OFF)`, value
+/// OFF + VA (VO + sin(2 pi MF t + PHASES)) sin(2 pi FC t + PHASEC) past TD:
+/// the delay moves into the phases, VMA = 0 holds the envelope at sin(90),
+/// and ngspice's VO is OFF.
+pub fn amArgs(self: *const NetBuilder, args: []const Value) ![]const Value {
     var a = [8]f64{ 0, 0, 1, 5 / self.tran_stop, 500 / self.tran_stop, 0, 0, 0 };
     for (a[0..@min(args.len, 8)], args[0..@min(args.len, 8)]) |*x, v| x.* = v.number() orelse return error.UnresolvedParameter;
     const vo, const vmo, const vma, const fm, const fc, const td, const phasem, const phasec = a;
-    if (vo != 0) {
-        if (!@import("builtin").is_test) std.log.err("{s}: AM with a nonzero VO offset", .{name});
-        return error.UnsupportedCard;
-    }
-    const out = try self.arena.alloc(Value, 7);
+    const out = try self.arena.alloc(Value, 8);
     const ours = if (vma != 0)
-        [7]f64{ vma, vmo / vma, fm, fc, td, phasec - 360 * fc * td, phasem - 360 * fm * td }
+        [8]f64{ vma, vmo / vma, fm, fc, td, phasec - 360 * fc * td, phasem - 360 * fm * td, vo }
     else
-        [7]f64{ vmo, 0, 0, fc, td, phasec - 360 * fc * td, 90 };
+        [8]f64{ vmo, 0, 0, fc, td, phasec - 360 * fc * td, 90, vo };
     for (out, ours) |*o, x| o.* = .{ .num = x };
     return out;
 }
@@ -139,15 +136,25 @@ pub fn amArgs(self: *const NetBuilder, name: []const u8, args: []const Value) ![
 /// `resolvePulseDefaults`, so the -1 sentinels survive every legitimate
 /// write before the `.tran` card fills them.
 pub fn bindSource(self: *const NetBuilder, comptime D: type, dev: Device) !struct { D.Model, D.Instance } {
-    try net_waves.refuseUnknownWave(dev);
+    try net_waves.refuseUnknownKey(dev);
+    // A value that folds to no number (it reads the circuit or an
+    // undefined name) has no reader here; `sourceDc` would skip it and
+    // the source would hold 0. ngspice stops on it ("Expression err").
+    for (dev.positional) |p| switch (p) {
+        .expr => return error.UnresolvedParameter,
+        .group => |g| for (g.args()) |arg| if (arg == .expr) return error.UnresolvedParameter,
+        else => {}, // else: numbers and keywords
+    };
     var model: D.Model = .{};
     var instance: D.Instance = .{};
-    const dc = net_cards.sourceDc(dev);
-    _ = try net_builder.setParam(D, &model, &instance, "dc", dc orelse 0);
     net_waves.applySourceWaveform(&model, dev);
     net_waves.applySourceWaveform(&instance, dev);
     try net_cards.applyKv(&model, dev.kv);
     try net_cards.applyKv(&instance, dev.kv);
+    // After the keys: `dc=3` binds the field too, and the bare number
+    // straight after the nodes beats it (`sourceDc`).
+    const dc = net_cards.sourceDc(dev);
+    _ = try net_builder.setParam(D, &model, &instance, "dc", dc orelse 0);
     // The PWL suffixes `td=` and `r=` (vsrcpar.c VSRC_TD, VSRC_R).
     if (net_cards.kvNumber(dev.kv, "td")) |td| _ = try net_builder.setParam(D, &model, &instance, "pwl_td", td);
     if (net_cards.kvNumber(dev.kv, "r")) |r| if (net_waves.pwlArgs(dev)) |pts| {

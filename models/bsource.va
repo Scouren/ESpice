@@ -1,10 +1,10 @@
 // bsource: ngspice's B element (ASRC, asrc/asrcload.c). V(p,n) (or, with
 // BSRC_CURRENT defined, I(p,n) with no branch, as ngspice makes none
-// (asrcset.c:81-88); with BSRC_CHARGE, the charge whose ddt is I(p,n),
-// behind a behavioural VCCAP) equals an arbitrary
+// (asrcset.c:81-88)) equals an arbitrary
 // expression of node voltages, branch currents, time and temperature. The frontend compiles the card's expression
-// into a postfix tape held in the op_code/op_a/op_b/consts parameter arrays
-// (src/frontend/builder.zig compileTape); this module interprets it, and
+// into postfix tapes held in the op_code/op_a/op_b/consts parameter arrays
+// (src/frontend/bsrc_tape.zig), splitting one past these arrays into several
+// bsources chained through rows of their own; this module interprets it, and
 // VerA's forward-mode AD supplies the Jacobian through the runtime-indexed
 // stack, in place of ngspice's symbolic derivative trees.
 //
@@ -12,46 +12,83 @@
 // ground by the host. A control port may also be wired to a branch-current
 // row, so V(ck) then reads that current (the i() probe).
 //
-// Opcodes (keep in step with the builder's tape.Code):
+// Opcodes (keep in step with src/frontend/bsrc_tape.zig Code):
 //   0 num  push consts[a]        1 v    push V(c[a])      2 vd  push V(c[a])-V(c[b])
 //   3 neg  4 not  5 add  6 sub  7 mul  8 div  9 powi (a = exponent)
 //  10 powc (a = const index of the exponent)  11 pow  12 lt  13 gt  14 le
 //  15 ge  16 eq  17 ne  18 and  19 or  20 sel  21 sqrt  22 abs  23 min  24 max
 //  25 exp 26 ln  27 log10  28 sin  29 cos  30 tan  31 atan  32 tanh  33 floor
 //  34 ceil  35 time  36 temper  37 pwl (a = const index of the table, b = its
-//  point count; see below)
+//  point count; see below)  38 pwlx (37 with its end segments extended:
+//  ptfuncs.c PTpwl, a zero corner width)  39 nint  40 ddt (a = its slot;
+//  BSRC_DDT only)  41 sgn  42 cosh  43 pwr  44 sinh  45 asin  46 acos
+//  47 asinh  48 acosh  49 atanh
+//
+// ddt (BSRC_DDT, modules bsource_d and bsource_di): slot k's operand is a
+// charge on the internal row dk, against a 1 S conductance, so V(dk) is its
+// time derivative and op 40 reads it back. The host integrates the charge
+// with its own method and truncation-error check; in DC and at the first
+// transient point it is 0, as ptfuncs.c PTddt gives. AC and noise see
+// j*omega times the operand's derivative. ngspice's PTddt is a one-step
+// lagged difference, (x_n - x_n-1)/(t_n-1 - t_n-2), with a zero Jacobian
+// (inpptree.c:573), so it gives 0 in AC; this one is the integrator's
+// derivative at t_n.
 //
 // Expression semantics:
-// - powi multiplies its base repeatedly. For ngspice's default |x|^k
-//   semantics, the frontend inserts abs before this optimization; HSPICE's
-//   signed integer power uses it directly.
+// - powi multiplies its base repeatedly. For ngspice's |x|^k, the frontend
+//   inserts abs before it.
 // - sqrt/log of a negative argument and exp overflow follow IEEE (NaN/inf,
 //   caught by the solver's finiteness check) instead of ptfuncs.c's HUGE
-//   substitute. log(0) is PTlog's -1e99, finite, so Newton recovers from a
-//   0 V start. Division follows ngspice (PTdivide's 1e-32).
+//   substitute. Either way the point fails: ngspice's PTlog and PTlog10
+//   return HUGE below 0 (ptfuncs.c:289-306) and PTeval turns HUGE into
+//   E_PARMVAL (ifeval.c:124-128); ngspice 44.2 ends log(v(1)) at v(1) = -2
+//   "out of range for ln". log(0) is PTlog's -1e99, finite, so Newton
+//   recovers from a 0 V start. Division follows ngspice (PTdivide's 1e-32).
+// - asin and acos past |x| = 1, acosh below 1 and atanh at or past 1 are
+//   NaN or inf, and the point fails; so it does in ngspice-44.2, stopped
+//   by the slope's PTsqrt, the value's HUGE or Newton on a NaN (measured;
+//   atanh(-1) alone prints -inf there). On the edge (asin, acos at
+//   |x| = 1, acosh at 1) ngspice's slope is PTdivide's 1/1e-32, where
+//   VerA's zGraft (lib/std/kernels/math.zig) drops the infinite one to 0.
+//   A clamped argument, asin(min(v(x), 1)), has a zero slope either way;
+//   an unclamped probe sitting on 1 reads asin = pi/2 here, where
+//   ngspice-44.2's op prints 0 under its 1e32 slope (measured).
 // - min, max and abs keep ngspice's tie rules: a tie goes to a, abs keeps -0.
+// - nint rounds a half to the even integer, as PTnint's nearbyint does, with
+//   a zero derivative (inpptree.c:547); nint(-0.4) is +0 where nearbyint
+//   gives -0.
 //
 // Temperature (asrcload.c): the value is scaled by 1 + tc1*dT + tc2*dT^2,
-// dT = (T + dtemp) - 300.15 K, inverted when reciproctc != 0.
+// dT = (T + dtemp) - 300.15 K, inverted when reciproctc != 0. T is the
+// instance temp, in degC (asrcpar.c:49-52), when given, and dtemp is then
+// 0 (asrctemp.c:23-33); else the circuit temperature.
 `include "disciplines.vams"
 `include "constants.vams"
 
-`ifdef BSRC_CHARGE
-module bsource_q(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
-`elsif BSRC_CURRENT
+`ifdef BSRC_CURRENT
+`ifdef BSRC_DDT
+module bsource_di(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
+`else
 module bsource_i(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
+`endif
+`elsif BSRC_DDT
+module bsource_d(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
 `else
 module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
 `endif
     inout p, n, c0, c1, c2, c3, c4, c5, c6, c7;
     electrical p, n, c0, c1, c2, c3, c4, c5, c6, c7;
+`ifdef BSRC_DDT
+    // The ddt slots' rows (see the header).
+    electrical d0, d1, d2, d3;
+`endif
     branch (p, n) br;
 
     parameter real tc1 = 0.0;
     parameter real tc2 = 0.0;
     parameter real dtemp = 0.0;
-    // Device temperature in K; <= 0 means the circuit temperature.
-    parameter real temp = -1.0e3;
+    // Device temperature in degC; given, it replaces the circuit's and dtemp.
+    parameter real temp = 27.0;
     parameter integer reciproctc = 0;
     parameter integer n_ops = 0 from [0:64];
     parameter integer op_code[0:63] = '{64{0}};
@@ -68,11 +105,19 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
         // the bottom). The 1152-byte memset was 3.5% of a B-source-heavy run.
         (* vera_scratch *) real vc[0:7];
         (* vera_scratch = "uninit" *) real st[0:15];
-        real a, b, r, f, tdev, dt, factor;
+`ifdef BSRC_DDT
+        (* vera_scratch *) real vd[0:3];
+        (* vera_scratch *) real dq[0:3];
+`endif
+        real a, b, r, f, dt, factor;
         integer k, sp, j, np, at;
         real d, xi, yi, lower, upper, seg_lo, seg_hi, u, w;
         vc[0] = V(c0); vc[1] = V(c1); vc[2] = V(c2); vc[3] = V(c3);
         vc[4] = V(c4); vc[5] = V(c5); vc[6] = V(c6); vc[7] = V(c7);
+`ifdef BSRC_DDT
+        // An unused slot's charge stays 0, so its row holds 0 V.
+        vd[0] = V(d0); vd[1] = V(d1); vd[2] = V(d2); vd[3] = V(d3);
+`endif
         sp = 0;
         for (k = 0; k < n_ops; k = k + 1) begin
             case (op_code[k])
@@ -85,7 +130,7 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                     sp = sp - 2;
                     if (st[sp - 1] != 0.0) st[sp - 1] = st[sp]; else st[sp - 1] = st[sp + 1];
                 end
-                5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24: begin
+                5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 43: begin
                     sp = sp - 1;
                     a = st[sp - 1];
                     b = st[sp];
@@ -107,6 +152,9 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                         17: r = (a == b) ? 0.0 : 1.0;
                         18: r = (a != 0.0 && b != 0.0) ? 1.0 : 0.0;
                         19: r = (a != 0.0 || b != 0.0) ? 1.0 : 0.0;
+                        // ptfuncs.c:125-135 PTpwr, sign(a)*|a|^b (its
+                        // PSPICE-mode fudge at 0 aside).
+                        43: r = (a < 0.0) ? -pow(-a, b) : pow(a, b);
                         23: if (a <= b) r = a; else r = b;
                         default: if (b <= a) r = a; else r = b;
                     endcase
@@ -133,6 +181,25 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                         // start at 0 V recovers (#77).
                         26: r = (a == 0.0) ? -1e99 : ln(a);
                         27: r = (a == 0.0) ? -1e99 : ln(a) * 0.4342944819032518;
+                        // ptfuncs.c:31-34 PTsgn, with a zero derivative
+                        // (inpptree.c:404-406).
+                        41: r = (a > 0.0) ? 1.0 : ((a < 0.0) ? -1.0 : 0.0);
+                        // ptfuncs.c:261-264 PTcosh.
+                        42: r = cosh(a);
+                        // C's sinh, asin, acos, asinh, acosh and atanh, as
+                        // ptfuncs.c PTsinh (:310), PTasin (:162), PTacos
+                        // (:150), PTasinh (:168), PTacosh (:156) and PTatanh
+                        // (:180); their slopes are inpptree.c's (:500, :427,
+                        // :408, :436, :417, :453), the edges in the header.
+                        // Deliberate divergence: an unclamped asin or acos of
+                        // +-1 reads its value (+-pi/2; 0 or pi) with slope 0,
+                        // where ngspice-44.2's op reads 0 with slope +-1e32.
+                        44: r = sinh(a);
+                        45: r = asin(a);
+                        46: r = acos(a);
+                        47: r = asinh(a);
+                        48: r = acosh(a);
+                        49: r = atanh(a);
                         28: r = sin(a);
                         29: r = cos(a);
                         30: r = sin(a) / cos(a);
@@ -140,15 +207,28 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                         32: r = tanh(a);
                         33: r = floor(a);
                         34: r = ceil(a);
+                        39: begin
+                            r = floor(a);
+                            if (a - r > 0.5 || (a - r == 0.5 && r - 2.0 * floor(0.5 * r) != 0.0)) r = r + 1.0;
+                        end
+`ifdef BSRC_DDT
+                        // The integrator's derivative, so AC reads j*omega
+                        // times the operand's; ngspice's PTddt gives 0 there
+                        // (zero Jacobian, inpptree.c:573). See the header.
+                        40: begin
+                            dq[op_a[k]] = a;
+                            r = vd[op_a[k]];
+                        end
+`endif
                         // A smoothed piecewise-linear transfer through the
                         // table at consts[a]: the corner width, then op_b[k]
-                        // (x, y) pairs, x ascending. The ends hold their y.
+                        // (x, y) pairs, x ascending. The ends hold their y
+                        // (37), or extend their segment (38, width 0).
                         // Each corner is a parabola over |x - x_i| < d_i
                         // (XSPICE cm_smooth_corner): d_i = width times the
-                        // shorter neighbouring segment for width > 0
-                        // (ngspice TABLE: cm_pwl, input_domain = 0.1), or
-                        // -width for width < 0 (HSPICE PWL(1) DELTA). The
-                        // corner is picked at the midpoints, as cm_pwl does.
+                        // shorter neighbouring segment (ngspice TABLE:
+                        // cm_pwl, input_domain = 0.1). The corner is picked
+                        // at the midpoints, as cm_pwl does.
                         default: begin
                             at = op_a[k];
                             np = op_b[k];
@@ -160,13 +240,15 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                             else lower = (yi - consts[at + 2 * j]) / (xi - consts[at + 2 * j - 1]);
                             if (j + 1 == np) upper = 0.0;
                             else upper = (consts[at + 4 + 2 * j] - yi) / (consts[at + 3 + 2 * j] - xi);
+                            // 38: the end segments go on past the table.
+                            if (op_code[k] == 38 && j == 0) lower = upper;
+                            if (op_code[k] == 38 && j + 1 == np) upper = lower;
                             // The virtual end points mirror the neighbouring segment.
                             if (j == 0) seg_lo = consts[at + 3] - xi;
                             else seg_lo = xi - consts[at + 2 * j - 1];
                             if (j + 1 == np) seg_hi = seg_lo;
                             else seg_hi = consts[at + 3 + 2 * j] - xi;
-                            if (consts[at] > 0.0) d = consts[at] * min(seg_lo, seg_hi);
-                            else d = -consts[at];
+                            d = consts[at] * min(seg_lo, seg_hi);
                             u = a - xi;
                             if (u < -d) r = yi + lower * u;
                             else if (u >= d) r = yi + upper * u;
@@ -182,16 +264,21 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
             endcase
         end
         f = (sp <= 0) ? 0.0 : st[0];
-        tdev = (temp <= 0.0) ? $temperature : temp;
-        dt = (tdev + dtemp) - 300.15;
+        if ($param_given(temp)) dt = temp + `P_CELSIUS0 - 300.15;
+        else dt = ($temperature + dtemp) - 300.15;
         factor = 1.0 + tc1 * dt + tc2 * dt * dt;
         if (reciproctc != 0) factor = 1.0 / factor;
-`ifdef BSRC_CHARGE
-        I(br) <+ ddt(f * factor);
-`elsif BSRC_CURRENT
+`ifdef BSRC_CURRENT
         I(br) <+ f * factor;
 `else
         V(br) <+ f * factor;
+`endif
+`ifdef BSRC_DDT
+        // Slot k: V(dk) = ddt(dq[k]) (see the header).
+        I(d0) <+ V(d0) - ddt(dq[0]);
+        I(d1) <+ V(d1) - ddt(dq[1]);
+        I(d2) <+ V(d2) - ddt(dq[2]);
+        I(d3) <+ V(d3) - ddt(dq[3]);
 `endif
     end
 endmodule

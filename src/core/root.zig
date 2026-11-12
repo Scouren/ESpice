@@ -8,13 +8,13 @@
 //!
 //! Contents:
 //! - `pub const gpa: std.mem.Allocator`
-//! - namespaces: `numerics`, `query`, `validate`, `lm`, `bisect`, `eigen`, `sss`, `form`, `testing`
-//! - deck (`deck.zig`): `Deck`, `Ic`, `AcOverride`, `Variants`, `QueryBindings`,
+//! - namespaces: `numerics`, `query`, `validate`, `lm`, `bisect`, `eigen`, `sss`, `form`, `testing`, `perf`
+//! - deck (`deck.zig`): `Deck`, `Ic`, `AcOverride`, `NoiseGap`, `Temper`, `Variants`, `QueryBindings`,
 //!   `SaveOp`, `Mosra`, `MosraModel`, `Stim`, `Soa`, `SoaLimit`, `OpVar`
 //! - measures (`measure_card.zig`): `Measure`, `MeasureClause`, `GoalBound`,
 //!   `MeasureFunc`, `Check`, `MeasureOp`, `MeasureRef`, `measure_unset`,
 //!   `measure_last`, `measure_no_at`
-//! - results (`result.zig`): `Result`, `Measured`, `Emir`, `EmirTerminal`, `Schema`, `QuerySchema`
+//! - results (`result.zig`): `Result`, `Step`, `Measured`, `Emir`, `EmirTerminal`, `Schema`, `QuerySchema`
 //! - names (`intern.zig`): `InternPool`, `Name`
 //! - ids (`ids.zig`): `DeviceType`, `GROUND`
 
@@ -46,6 +46,8 @@ pub const sss = @import("sss.zig");
 pub const form = @import("form.zig");
 /// Test support: the allocator every allocation-failure sweep runs over.
 pub const testing = @import("testing.zig");
+/// The performance levers under evaluation (`ESPICE_PERF`).
+pub const perf = @import("perf.zig");
 
 /// The process-wide general-purpose allocator. SmpAllocator does not build
 /// single-threaded (the wasm playground), so there it is the page allocator,
@@ -55,6 +57,8 @@ pub const gpa: std.mem.Allocator = if (builtin.single_threaded) std.heap.page_al
 pub const Deck = deck.Deck;
 pub const Ic = deck.Ic;
 pub const AcOverride = deck.AcOverride;
+pub const NoiseGap = deck.NoiseGap;
+pub const Temper = deck.Temper;
 pub const Variants = deck.Variants;
 pub const QueryBindings = deck.QueryBindings;
 pub const SaveOp = deck.SaveOp;
@@ -77,6 +81,7 @@ pub const measure_last = measure_card.measure_last;
 pub const measure_no_at = measure_card.measure_no_at;
 
 pub const Result = result.Result;
+pub const Step = result.Step;
 pub const Measured = result.Measured;
 pub const Emir = result.Emir;
 pub const EmirTerminal = result.EmirTerminal;
@@ -99,6 +104,7 @@ test {
     _ = eigen;
     _ = sss;
     _ = form;
+    _ = perf;
     _ = query;
     _ = @import("query/card_names.zig");
     _ = @import("query/periodic.zig");

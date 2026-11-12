@@ -28,6 +28,8 @@ const tran = @import("tran/tran.zig");
 const gpu_devices = @import("gpu/devices.zig");
 const exec_config = @import("exec_config.zig");
 const dispatch = @import("dispatch.zig");
+const lane_fan = @import("lane_fan.zig");
+const worker = @import("worker.zig");
 const executor = @import("executor.zig");
 const Executor = executor.Executor;
 const QueryError = executor.QueryError;
@@ -84,15 +86,28 @@ pub fn executeBatch(self: *Executor) QueryError!types.Result {
         return outcomes[0];
     }
     switch (self.job) {
-        // Every laned analysis past the OP but `.tran` (its `uic` start,
-        // below): each lane runs from its own circuit and context, and
-        // publishes as it would alone.
+        // Every laned analysis past the OP but `.tran` (below): each lane
+        // runs from its own circuit and context, and publishes as it
+        // would alone.
         inline .dc, .pss => |opts, tag| {
             const M = module(tag);
+            // A `uic` `.pss` has no operating point: its start is the
+            // `.ic` x, as `runQuery` and the GPU batch seed it.
+            for (live[0..n_live]) |k| if (members[k].job.uic()) members[k].seedUic() catch |err| {
+                for (live[0..n_live]) |j| outcomes[j] = err;
+                return outcomes[0];
+            };
             var ctxs: [lane_width]types.RunCtx = undefined;
             laneCtxs(members[0..g], live[0..n_live], &ctxs);
             var swept: [lane_width]M.LaneOutcome = undefined;
-            if (n_live != 0) M.runLanes(lane_width, ctxs[0..n_live], opts, swept[0..n_live]);
+            if (n_live != 0) {
+                if (comptime tag == .dc) {
+                    // Each lane its own segment of a split sweep (`Dc.lane`).
+                    var each: [lane_width]M.Options = undefined;
+                    for (live[0..n_live], each[0..n_live]) |k, *o| o.* = members[k].job.dc;
+                    M.runLanes(lane_width, ctxs[0..n_live], each[0..n_live], swept[0..n_live]);
+                } else M.runLanes(lane_width, ctxs[0..n_live], opts, swept[0..n_live]);
+            }
             for (live[0..n_live], swept[0..n_live]) |k, o|
                 outcomes[k] = members[k].settleLabeled(o);
             return outcomes[0];
@@ -211,6 +226,13 @@ pub fn runGpuWave(self: *Executor, members: []const *Executor, outcomes: []Query
     if (self.job == .op) return self.runGpuOps(members, live[0..n_live], outcomes);
     const ctxs = try a.alloc(types.RunCtx, n_live);
     laneCtxs(members, live[0..n_live], ctxs);
+    // G1 stage 1: the lane drivers may fan per-member host work over the
+    // pool (`lane_fan.lent`): the HB Newton and the live frequency rounds.
+    const g1 = self.config.knobs.perf.g1;
+    if (g1) lane_fan.lent = .{ .pool = self.config.thread_pool, .threads = self.config.threads };
+    defer if (g1) {
+        lane_fan.lent = null;
+    };
     switch (self.job) {
         inline .tran, .pss, .hb, .lstb, .dc => |opts, tag| {
             const M = module(tag);
@@ -221,8 +243,12 @@ pub fn runGpuWave(self: *Executor, members: []const *Executor, outcomes: []Query
                 else if (comptime tag == .tran)
                     // Every usable device takes a slice (multi-GPU stage 1).
                     @import("gpu/multi.zig").runLanes(M, self.allocator, self.config.threads, ctxs, opts, ran)
-                else
-                    M.runGpuLanes(ctxs, opts, ran);
+                else if (comptime tag == .dc) {
+                    // Each lane its own segment of a split sweep (`Dc.lane`).
+                    const each = try a.alloc(M.Options, n_live);
+                    for (live[0..n_live], each) |k, *o| o.* = members[k].job.dc;
+                    M.runGpuLanes(ctxs, each, ran);
+                } else M.runGpuLanes(ctxs, opts, ran);
             }
             for (live[0..n_live], ran) |k, o|
                 outcomes[k] = members[k].settleLabeled(o);
@@ -338,13 +364,16 @@ pub fn executeGpuFreqBatch(self: *Executor) QueryError!types.Result {
     if (computed) {
         for (points[0..n], point_ids[0..n]) |p, k| ctxs[k].?.freq_pre = p.out;
     }
+    // G1 stage 1: the replays run on the pool first; every member still
+    // settles below, in member order.
+    const ran = if (self.config.knobs.perf.g1 and computed) try fanReplays(self, members, ctxs) else null;
     for (members, ctxs, 0..) |e, *ctx, k| {
         if (ctx.*) |*c| {
             if (c.freq_pre.len == 0) {
                 outcomes[k] = e.finishAlone();
                 continue;
             }
-            outcomes[k] = e.settleLabeled(run(c, e.job));
+            outcomes[k] = e.settleLabeled(if (ran) |r| r[k] else run(c, e.job));
         }
     }
     return outcomes[0];
@@ -434,6 +463,50 @@ fn runFreqLanes(members: []const *Executor, live: []const usize, outcomes: []Que
         const e = members[k];
         outcomes[k] = e.settleLabeled(run(&ctxs[l], e.job));
     }
+}
+
+/// G1 stage 1: `executeGpuFreqBatch`'s replays, `run` of every member that
+/// holds a precomputed sweep, fanned over the pool (`lane_fan.each`); each
+/// outcome at its member's index, unsettled, so the serial loop settles
+/// them in order. Members are independent: a replay reads and writes only
+/// its own `RunCtx` (its circuit, `x_op`, `freq_pre`, result arena and
+/// stream); the deck and a prerequisite's result are read-only; scratch
+/// comes from the thread-safe allocator concurrent queries already share,
+/// and the shared `ws_pool` locks. Its circuit has no GPU context, ParEval
+/// or device LU attached (`runQuery` never ran). The one shared mutable
+/// thing, the leader's progress callback, becomes a cancel poll
+/// (`pollCancel`), so no helper thread parks the leader's worker. Members
+/// without a sweep run `finishAlone` (GPU placement, display output, pool
+/// borrowing) and stay serial.
+fn fanReplays(self: *Executor, members: []const *Executor, ctxs: []?types.RunCtx) ![]QueryError!types.Result {
+    assert(members.len == ctxs.len);
+    const ran = try self.work.allocator().alloc(QueryError!types.Result, members.len);
+    @memset(ran, error.QueryCancelled);
+    for (members, ctxs) |e, ctx| if (ctx) |c| if (c.freq_pre.len != 0) {
+        e.circuit.progress = .{ .ctx = &self.controller, .yield_fn = pollCancel };
+    };
+    const Fan = struct {
+        members: []const *Executor,
+        ctxs: []?types.RunCtx,
+        ran: []QueryError!types.Result,
+        fn replay(f: @This(), k: usize) void {
+            if (f.ctxs[k]) |*c| if (c.freq_pre.len != 0) {
+                f.ran[k] = run(c, f.members[k].job);
+            };
+        }
+    };
+    lane_fan.each(self.config.thread_pool, self.config.threads, members.len, Fan{ .members = members, .ctxs = ctxs, .ran = ran }, Fan.replay);
+    assert(ran.len == members.len);
+    return ran;
+}
+
+/// A fanned replay's progress callback: polls the leader's cancel flag and
+/// never parks, since a park from a helper thread would post the leader's
+/// quantum signal while its own thread still runs.
+fn pollCancel(raw: *anyopaque, _: worker.Event) error{QueryCancelled}!void {
+    // SAFETY: `fanReplays` hands out the leader's `controller` as `raw`.
+    const c: *const @FieldType(Executor, "controller") = @ptrCast(@alignCast(raw));
+    if (c.cancel_requested.load(.monotonic)) return error.QueryCancelled;
 }
 
 /// Each live member's `RunCtx`, into `ctxs[0..live.len]`, its sim state set

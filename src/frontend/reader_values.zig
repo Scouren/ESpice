@@ -7,11 +7,11 @@
 //! - `pub fn readValue(r: *R, f: *F, frame: *const Frame, subst_names: bool, geometry: bool) Error!Value`
 //! - `pub fn valueAt(r: *R, t: []const u8, f: *F, frame: *const Frame, subst_names: bool, geometry: bool) Error!Value`
 //! - `pub fn kvValue(r: *R, f: *F, frame: *const Frame, geometry: bool) Error!Value`
-//! - `pub fn literalValue(r: *const R, f: *F) Error!?f64`
+//! - `pub fn literalValue(f: *F) Error!?f64`
 //! - `pub fn junkNumber(w: []const u8) bool`
 //! - `pub fn numberByte(c: u8) bool`
 //! - `pub fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void`
-//! - `pub fn operatorLed(r: *const R, t: []const u8) bool`
+//! - `pub fn operatorLed(t: []const u8) bool`
 //! - `pub fn nameValue(r: *R, name: []const u8, frame: *const Frame, geometry: bool) Error!Value`
 //! - `pub fn exprValue(r: *R, text: []const u8, frame: *const Frame, geometry: bool) Error!Value`
 //! - `pub fn fold(r: *R, from: usize, frame: *const Frame, geometry: bool) Error!Value`
@@ -21,7 +21,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -80,15 +79,6 @@ pub fn Methods(comptime S: type) type {
                     if (a[0] == ',') continue;
                     try items.append(r.arena, if (probe and F.isWord(a)) .{ .name = a } else try r.valueAt(a, f, frame, subst_names, geometry));
                 }
-                // HSPICE writes SFFM(VO VA FC MDI FS) [CR SFFM]; the source
-                // models read ngspice 44's (VO VA FM MDI FC). An omitted MDI
-                // is 0 and an omitted FS the models' -1, their 5/TSTOP.
-                const args = items.items[1..];
-                if (r.dialect == .hspice and args.len > 2 and std.ascii.eqlIgnoreCase(t, "sffm")) {
-                    if (args.len == 3) try items.append(r.arena, .{ .num = 0 });
-                    if (items.items.len == 5) try items.append(r.arena, .{ .num = -1 });
-                    std.mem.swap(Value, &items.items[3], &items.items[5]);
-                }
                 return .{ .group = .{ .items = items.items } };
             }
             if (S.parseNum(t)) |n| return .{ .num = n };
@@ -100,15 +90,11 @@ pub fn Methods(comptime S: type) type {
         pub fn kvValue(r: *R, f: *F, frame: *const Frame, geometry: bool) Error!Value {
             const rest = f.rest();
             if (rest.len == 0) return error.ParseError;
-            // HSPICE reads a brace as a name byte, so `{...}` is a word there
-            // and goes to the bare-value rules (#203).
             if ((rest[0] == '{' and !F.isWord(rest)) or rest[0] == '\'') return r.readValue(f, frame, true, geometry);
-            if (try r.literalValue(f)) |n| return .{ .num = n };
+            if (try literalValue(f)) |n| return .{ .num = n };
             const mark = r.scratch.mark();
             defer r.scratch.reset(mark);
-            const start = f.pos;
             f.pos = try expr.compile(S, r.arena, &r.scratch, f.line, f.pos);
-            try r.checkBare(f.line[start..f.pos]);
             const ops = r.scratch.ops.items[mark.ops..];
             if (ops.len == 1 and ops[0].code == .num) return .{ .num = r.scratch.consts.items[ops[0].a] };
             if (ops.len == 1 and ops[0].code == .ident) return r.nameValue(r.scratch.names.items[ops[0].a], frame, geometry);
@@ -119,12 +105,12 @@ pub fn Methods(comptime S: type) type {
         /// which needs no compile, or ngspice's `r=10%3`, read as 10
         /// (`junkNumber`, #200): `f` moves past it. Null, `f` unmoved, for
         /// anything else. The line's text alone decides it, never a scope.
-        pub fn literalValue(r: *const R, f: *F) Error!?f64 {
+        pub fn literalValue(f: *F) Error!?f64 {
             const rest = f.rest();
             if (rest.len == 0 or !(std.ascii.isDigit(rest[0]) or rest[0] == '.')) return null;
             const save = f.pos;
             const w = f.next().?;
-            const lone = expr.numberLen(w) == w.len or (r.dialect == .ngspice and junkNumber(w));
+            const lone = expr.numberLen(w) == w.len or junkNumber(w);
             if (lone and !expr.isOperator(f.nextByte() orelse ' ')) return S.parseNum(w) orelse return error.ParseError;
             f.pos = save;
             return null;
@@ -153,23 +139,16 @@ pub fn Methods(comptime S: type) type {
         /// ngspice fails a device card whose value or model field starts
         /// with an operator byte (`R1 a b 10 %3`: "unknown parameter");
         /// ESPice refuses it by name instead of reading a name `%3` (#200).
-        /// In HSPICE, which has no `%` or `\` operator, a field led by one
-        /// is refused the same way (#203). Node fields are names and stay
+        /// Node fields are names and stay
         /// read, as do X cards and dot cards. tests/frontend/lower.zig
         /// `element` refuses the same fields.
         pub fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void {
-            if (r.operatorLed(t)) return r.unsupported(line, "an operator where a name or value belongs");
+            if (operatorLed(t)) return r.unsupported(line, "an operator where a name or value belongs");
         }
 
         /// Whether `refuseOperatorField` refuses field `t`.
-        pub fn operatorLed(r: *const R, t: []const u8) bool {
-            if (!F.isWord(t)) return false;
-            const leads: []const u8 = switch (r.dialect) {
-                .ngspice => "%\\*/^|&?",
-                .hspice => "%\\",
-                .spectre => "",
-            };
-            return std.mem.indexOfScalar(u8, leads, t[0]) != null;
+        pub fn operatorLed(t: []const u8) bool {
+            return F.isWord(t) and std.mem.indexOfScalar(u8, "%\\*/^|&?", t[0]) != null;
         }
 
         /// A bare name: substituted when a scope defines it.

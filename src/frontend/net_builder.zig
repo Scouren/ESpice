@@ -14,8 +14,10 @@
 //! - `pub const Published`
 //! - `pub fn publish(self: *NetBuilder, arena: std.mem.Allocator, circuit: *const Circuit, perm: ?[]const u32) !Published`
 //! - `pub fn build(self: *NetBuilder) !void`
+//! - `pub fn failed(self: *const NetBuilder, dev: Device, err: anytype) @TypeOf(err)`
 //! - `pub fn loadedType(lib: *const Library, dev: Device) ?DeviceType`
 //! - `pub fn setParam(comptime D: type, model: *D.Model, instance: *D.Instance, comptime field: []const u8, value: f64) !bool`
+//! - `pub fn subject(self: *const NetBuilder, buf: []u8, dev: Device, err: anyerror) ?[]const u8`
 
 const std = @import("std");
 const core = @import("core");
@@ -73,8 +75,7 @@ pub const NetBuilder = struct {
     /// One row per V card.
     v: std.MultiArrayList(VCard) = .empty,
     /// One row per V card with a `portnum` (vsrcdefs.h:104-105), in card
-    /// order: `num` is the 1-based `.sp` index. A P card's port node is n+
-    /// in front of its z0, and a mixed-mode one's branch is its + leg's.
+    /// order: `num` is the 1-based `.sp` index.
     /// Its own table, not a `VCard` column, as almost no V card is a port.
     ports: std.ArrayList(struct { num: u16, port: requests.Port }) = .empty,
     /// Branch-current probes other than V and L cards. ngspice gives every
@@ -85,16 +86,27 @@ pub const NetBuilder = struct {
     /// `R2 2 0 5K ac=15k`: an AC-only resistance (ngspice restemp.c:112-118),
     /// keyed by card because instance ordinals only exist after the freeze.
     ac_res: std.MultiArrayList(struct { name: []const u8, value: f64 }) = .empty,
+    /// Model cards that set a noise-only key ESPice does not model at a
+    /// value that is not inert (`core.NoiseGap`), in card order: published
+    /// as `Deck.noise_gaps`, which refuses `.noise` and nothing else.
+    /// `net_devices.boundCard` appends, once per model row.
+    noise_gaps: std.ArrayList(core.NoiseGap) = .empty,
     /// One row per I card. An I source has no branch row, so a `.tf` driven
     /// from one excites the node pair.
     i: std.MultiArrayList(struct { name: []const u8, pos: u32, neg: u32 }) = .empty,
-    /// One row per source with an `AC` spec; all rows drive one rhs (ngspice
-    /// CKTacLoad, acan.c:471-490). A row subtracts at `pos` and adds at `neg`
+    /// One row per V and I card, a zero phasor when it has no `AC` spec; all
+    /// rows drive one rhs (ngspice CKTacLoad, acan.c:471-490). A row subtracts at `pos` and adds at `neg`
     /// under Circuit.rhs's residual sign: an I card is (n+, n-), a V card only
     /// drives its branch row (vsrcacld.c:175), so (GROUND, branch).
-    ac: std.MultiArrayList(struct { pos: u32, neg: u32, re: f64, im: f64 }) = .empty,
-    /// One row per L card; `value` is the inductance, for a K card's M = k*sqrt(L1*L2).
-    l: std.MultiArrayList(struct { name: []const u8, branch: u32, value: f64 }) = .empty,
+    ac: std.MultiArrayList(requests.Sens.AcSource) = .empty,
+    /// One row per L card; `value` is the inductance, for a K card's M = k*sqrt(L1*L2),
+    /// and `model` the bound inductor, whose temperature inputs that M follows.
+    l: std.MultiArrayList(struct {
+        name: []const u8,
+        branch: u32,
+        value: f64,
+        model: if (@hasDecl(devices.inductor, "Model")) devices.inductor.Model else void,
+    }) = .empty,
     /// C and L `ic=` (ngspice CAPinitCond, INDinitCond) as rows for a `uic`
     /// start: a C's n+ row (n- negated when n+ is ground), an L's branch row.
     dev_ic: std.ArrayList(core.Ic) = .empty,
@@ -175,8 +187,9 @@ pub const NetBuilder = struct {
         var sensors: std.StringHashMapUnmanaged(u32) = .empty;
         for ("fhw") |letter| for (nl.bucket(letter)) |e| {
             const d = nl.device(e);
-            // An HSPICE W card is a transmission line, and an HDL card is not deferred.
-            if (letter == 'w' and nl.deck.dialect == .hspice) continue;
+            // A W card with `key=value` fields is an RLGC line
+            // (card_table.isDataElement), and an HDL card is not deferred.
+            if (letter == 'w' and d.kv.len != 0) continue;
             if (loadedType(b.lib, d) != null) continue;
             const name = Value.nameAt(d.positional, 0) orelse continue;
             const entry = try sensors.getOrPut(arena, name);
@@ -276,9 +289,6 @@ pub const NetBuilder = struct {
             for ([_]*u32{ &port.node, &port.neg, &port.branch }) |row| {
                 if (row.* < p.len) row.* = p[row.*];
             }
-            if (port.balanced) |*leg| for ([_]*u32{ &leg.node, &leg.branch }) |row| {
-                if (row.* < p.len) row.* = p[row.*];
-            };
         };
 
         // Probes: branch currents first, then every named node. ngspice gives every
@@ -323,6 +333,15 @@ pub const NetBuilder = struct {
                 .v_distof1 = try arena.dupe([2]f64, self.v.items(.distof1)),
                 .v_distof2 = try arena.dupe([2]f64, self.v.items(.distof2)),
                 .ports = try net_publish.portList(self, arena),
+                .ac_sources = ac: {
+                    const out = try arena.alloc(requests.Sens.AcSource, self.ac.len);
+                    for (out, 0..) |*row, k| {
+                        row.* = self.ac.get(k);
+                        // The card name outlives the parse arena, as `copyNames`'s do.
+                        row.name = try arena.dupe(u8, row.name);
+                    }
+                    break :ac out;
+                },
             },
             .probes = probe_buf[0..n_probes],
             .probe_labels = label_buf[0..n_probes],
@@ -342,11 +361,24 @@ pub const NetBuilder = struct {
     /// (VoltageSourceLoop) and a node only current sources reach
     /// (CurrentSourceCutset); a capacitor-only node sets `needs_tran_op`.
     pub fn build(self: *NetBuilder) !void {
-        for ("vlifhwkabcdegjmnopqrstuxyz") |c| for (self.nl.bucket(c)) |e| try net_card.addDevice(self, self.nl.device(e));
+        for ("vlifhwkabcdegjmnopqrstuxyz") |c| for (self.nl.bucket(c)) |e| {
+            const dev = self.nl.device(e);
+            net_card.addDevice(self, dev) catch |err| return self.failed(dev, err);
+        };
         try net_branches.resolveDeferred(self);
         try net_topology.topoCheck(self);
         try self.tagSubcircuitNodes();
         try net_dyn.addDynDevices(self);
+    }
+
+    /// Returns `err`, card `dev`'s failure, after logging the subject the
+    /// error cannot carry (`subject`); every other error logs where it
+    /// rises. The one diagnostic the card loops share.
+    pub fn failed(self: *const NetBuilder, dev: Device, err: anytype) @TypeOf(err) {
+        if (@import("builtin").is_test) return err;
+        var buf: [512]u8 = undefined;
+        if (subject(self, &buf, dev, err)) |what| std.log.err("{s}: {s}: {s}", .{ dev.name, @errorName(err), what });
+        return err;
     }
 };
 
@@ -379,4 +411,48 @@ pub fn setParam(comptime D: type, model: *D.Model, instance: *D.Instance, compti
     return true;
 }
 
+/// What card `dev` failed on with `err`, written to `buf`:
+/// `UnresolvedParameter`'s values that are no number (`key=value`, a
+/// positional `'value'`, a source's arguments, an unfolded expression as
+/// `<expression>`; the model's name is skipped), `UnknownControlSource`'s V
+/// card, `KinducUnknownInductor`'s first L card the deck lacks. Null for
+/// any other error, or a subject past `buf`.
+pub fn subject(self: *const NetBuilder, buf: []u8, dev: Device, err: anyerror) ?[]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    switch (err) {
+        error.UnknownControlSource => w.print("no V card '{s}' to sense", .{Value.nameAt(dev.positional, 0) orelse return null}) catch return null,
+        error.KinducUnknownInductor => {
+            const missing = for (dev.positional[0..@min(2, dev.positional.len)]) |p| {
+                if (p == .name and net_branches.lRow(self, p.name) == null) break p.name;
+            } else return null;
+            w.print("no L card '{s}' to couple", .{missing}) catch return null;
+        },
+        error.UnresolvedParameter => {
+            w.writeAll("not a number:") catch return null;
+            for (dev.kv) |item| if (item.value != .num) printValue(&w, item.key, item.value) catch return null;
+            const model = if (dev.model) |m| m.name else "";
+            for (dev.positional) |p| switch (p) {
+                .num => {},
+                .name => |n| if (!std.mem.eql(u8, n, model)) printValue(&w, "", p) catch return null,
+                .expr => printValue(&w, "", p) catch return null,
+                .group => |g| for (g.args()) |arg| if (arg != .num) printValue(&w, "", arg) catch return null,
+            };
+        },
+        else => return null,
+    }
+    return w.buffered();
+}
+
 // ---- private ----
+
+/// ` key=value`, or ` value` for a positional one: a name quoted, an
+/// unfolded expression as `<expression>`, a group by its name.
+fn printValue(w: *std.Io.Writer, key: []const u8, v: Value) std.Io.Writer.Error!void {
+    if (key.len > 0) try w.print(" {s}=", .{key}) else try w.writeByte(' ');
+    switch (v) {
+        .num => |n| try w.print("{d}", .{n}),
+        .name => |n| try w.print("'{s}'", .{n}),
+        .expr => try w.writeAll("<expression>"),
+        .group => |g| try w.print("{s}(...)", .{g.name()}),
+    }
+}

@@ -1,7 +1,7 @@
 //! Analysis cards and deck options to resolved queries. In: the deck's
 //! analysis and config cards, nets already circuit rows, and the
 //! construction bindings source and card names resolve against. Out: the
-//! query list, fanned out over the deck's variants and `.temp` list. Each
+//! query list, fanned out over the deck's variants. Each
 //! card is read by analysis_card.zig; options by analysis_options.zig.
 //! Cites: ngspice cktsopt.c, cktntask.c, traninit.c, dctran.c, distoan.c,
 //! noisean.c, spiceif.c, inpgval.c; HSPICE [CR, SA, RF], at the code that
@@ -76,15 +76,13 @@ pub const Fanout = struct {
 /// Queries for `cards` (nets already circuit rows), in card order, allocated
 /// in `arena`. `.noise` also yields its integrated plot, `.lstb` its
 /// margins, `.disto` its two harmonic vectors (three intermodulation
-/// vectors with F2); a single-value `.temp` yields none. An output `v(...)`
+/// vectors with F2), ngspice's `.pss` its spectrum. An output `v(...)`
 /// names one or two nodes in the deck; `appended` cards must name exactly
 /// one, else `UnsupportedAnalysisOutput`. `fanout` copies them over the
-/// deck's variants, and an HSPICE `.temp` list copies everything once per
-/// temperature. Errors are `buildJob`'s, logged with the card that raised
-/// them, and `InvalidAnalysisArguments` for a card whose query
-/// `core.validate` refuses on a circuit of `n_rows` unknowns, an HSPICE
-/// `.hbac`-family card with no `.hb` tone to take, or a `.temp` list value
-/// that is not a temperature above -273.15 degC (not logged);
+/// deck's variants. Errors are `buildJob`'s, logged with the card that
+/// raised them, and `InvalidAnalysisArguments` for a card whose query
+/// `core.validate` refuses on a circuit of `n_rows` unknowns or an HSPICE
+/// `.hbac`-family card with no `.hb` tone to take (not logged);
 /// `OutOfMemory` also covers a fan-out count too large for `usize`.
 pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, appended: bool, sources: core.QueryBindings, card_refs: []const requests.CardRef, deck_opts: analysis_options.DeckOptions, fanout: Fanout) ![]const Job {
     for (cards) |c| {
@@ -111,13 +109,13 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
         },
         .tran => if (ctx.tran == null) {
             if (analysis_card.buildJob(c, sources, card_refs, ctx)) |job| {
-                var tran = job.?;
+                var tran = job;
                 analysis_options.applyDeckOptions(&tran, deck_opts);
                 ctx.tran = tran.tran;
             } else |_| {}
         },
         .pss => if (c.sn and ctx.sn_f0 == null) {
-            if (analysis_card.buildJob(c, sources, card_refs, ctx)) |job| ctx.sn_f0 = 1 / job.?.pss.period else |_| {}
+            if (analysis_card.buildJob(c, sources, card_refs, ctx)) |job| ctx.sn_f0 = 1 / job.pss.period else |_| {}
         },
         .op => fan = @max(fan, c.args.len),
         .tran_noise => fan = @max(fan, analysis_time.tranNoiseSamples(c.args)),
@@ -127,7 +125,6 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
         },
         else => {},
     };
-    const temps = @max(deck_opts.temp_list.len, 1);
     var per_card: usize = fan;
     for (fanout.cards) |span| per_card = @max(per_card, fan * (span.count + 1));
     // The nominal jobs are built before they are copied over the rows, so
@@ -136,7 +133,7 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
     // `.trannoise SAMPLES=` and the variant counts are deck input, so the
     // product can overflow before the allocator ever sees it.
     var len: usize = cards.len;
-    for ([_]usize{ per_card, temps + 1, rows }) |f| len = std.math.mul(usize, len, f) catch return error.OutOfMemory;
+    for ([_]usize{ per_card, rows }) |f| len = std.math.mul(usize, len, f) catch return error.OutOfMemory;
     const jobs = try arena.alloc(Job, len);
     var n: usize = 0;
     // HSPICE's `.hbac`, `.hbxf`, `.hbnoise` and `.phasenoise` take the tone
@@ -144,7 +141,7 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
     // `.hbosc` card unless the card gives its own.
     var hb: ?requests.Hb = null;
     for (cards) |c| if (c.kind == .hb) {
-        hb = ((analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)).?).hb;
+        hb = (analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)).hb;
     };
     var xf_sources: ?[]const requests.XfSource = null;
     for (cards, 0..) |c, ci| {
@@ -158,7 +155,7 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
             continue;
         }
         const first = n;
-        var job = (analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)) orelse continue;
+        var job = analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err);
         switch (job) {
             inline .hbac, .hbxf, .hbnoise, .hblin => |*o, kind| if (o.f0 == 0) {
                 const tone = hb orelse return cardError(c.line, error.InvalidAnalysisArguments);
@@ -239,6 +236,14 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
         }
         jobs[n] = job;
         n += 1;
+        // ngspice's `.pss` writes its period, then its spectrum (ngspice-45
+        // dcpss.c:993-1046), which reads the period query's rows
+        // (`Session.linkReaders`): one shooting, two plots.
+        if (job == .pss and job.pss.harms != 0) {
+            jobs[n - 1].pss.harms = 0;
+            jobs[n] = job;
+            n += 1;
+        }
         // `.lstb` also reports its margins.
         if (job == .lstb) {
             job.lstb.margins = true;
@@ -266,26 +271,7 @@ pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, a
     }
     n = copyVariants(jobs, n, fanout.global);
     if (deck_opts.sample) |s| sampleNoise(jobs[0..n], s);
-    if (temps == 1) return jobs[0..n];
-    // An HSPICE `.temp` list runs every query once per temperature [CR .TEMP].
-    const base = n;
-    n = 0;
-    for (deck_opts.temp_list) |t| {
-        const temp = switch (t) {
-            .num => |v| v,
-            else => return error.InvalidAnalysisArguments,
-        };
-        if (!(temp > -273.15) or !std.math.isFinite(temp)) return error.InvalidAnalysisArguments;
-        for (jobs[0..base]) |job| {
-            var copy = job;
-            switch (copy) {
-                inline else => |*opts| opts.tol.temp_c = temp,
-            }
-            jobs[base + n] = copy;
-            n += 1;
-        }
-    }
-    return jobs[base..][0..n];
+    return jobs[0..n];
 }
 
 // ---- private ----
@@ -377,16 +363,12 @@ test copyVariants {
 
 test "deckOptions: a NaN RUNLVL fails, and the last .temp card wins" {
     const nan = comptime std.math.nan(f64);
-    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", nan }) }}, .hspice));
-    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", 7 }) }}, .hspice));
-    const list_then_one = try analysis_options.deckOptions(&.{ .{ .temp = true, .args = argv(.{ 0, 50 }) }, .{ .temp = true, .args = argv(.{85}) } }, .hspice);
-    try testing.expectEqual(@as(usize, 0), list_then_one.temp_list.len);
-    try testing.expectEqual(@as(?f64, 85), list_then_one.temp_c);
-    const one_then_list = try analysis_options.deckOptions(&.{ .{ .temp = true, .args = argv(.{85}) }, .{ .temp = true, .args = argv(.{ 0, 50 }) } }, .ngspice);
-    try testing.expectEqual(@as(usize, 2), one_then_list.temp_list.len);
-    try testing.expectEqual(@as(?f64, null), one_then_list.temp_c);
+    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", nan }) }}));
+    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", 7 }) }}));
+    const two = try analysis_options.deckOptions(&.{ .{ .temp = true, .args = argv(.{0}) }, .{ .temp = true, .args = argv(.{85}) } });
+    try testing.expectEqual(@as(?f64, 85), two.temp_c);
     // Unknown and over-long option names are skipped, not fatal.
-    _ = try analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "a_very_long_option_name", 1, "bogus", 2 }) }}, .ngspice);
+    _ = try analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "a_very_long_option_name", 1, "bogus", 2 }) }});
 }
 
 test queries {
@@ -396,12 +378,6 @@ test queries {
     const none: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
     const op: netlist.Analysis = .{ .kind = .op, .args = &.{} };
     try testing.expectEqual(@as(usize, 0), (try queries(a, &.{}, 16, false, none, &.{}, .{}, .{})).len);
-    // A `.temp` list runs every job once per temperature.
-    const temps = try queries(a, &.{op}, 16, false, none, &.{}, .{ .temp_list = argv(.{ -40, 125 }) }, .{});
-    try testing.expectEqual(@as(usize, 2), temps.len);
-    try testing.expectEqual(@as(?f64, -40), temps[0].op.tol.temp_c);
-    try testing.expectEqual(@as(?f64, 125), temps[1].op.tol.temp_c);
-    try testing.expectError(error.InvalidAnalysisArguments, queries(a, &.{op}, 16, false, none, &.{}, .{ .temp_list = argv(.{ 0, -300 }) }, .{}));
     // HSPICE `.op 0 1u`: the operating point, then a snapshot at 1 us.
     const times = try queries(a, &.{.{ .kind = .op, .args = argv(.{ 0, 1e-6 }) }}, 16, false, none, &.{}, .{}, .{});
     try testing.expectEqual(@as(usize, 2), times.len);

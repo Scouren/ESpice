@@ -1,7 +1,7 @@
-//! Physical lines, the layer under every dialect's logical lines. In: a
+//! Physical lines, the layer under ngspice's logical lines. In: a
 //! deck's bytes. Out: lowercased bytes with their newline count, one
 //! physical line at a time, and the joined text of a continued statement.
-//! Cites: none (house line layer; the dialect rules live in lines_*.zig).
+//! Cites: none (house line layer; the card rules live in lines_ngspice.zig).
 //!
 //! Contents:
 //! - `pub fn normalize(dst: []u8, src: []const u8) usize`
@@ -44,7 +44,6 @@ pub fn join(arena: Allocator, joined: *?std.ArrayList(u8), head: []const u8, sep
 }
 
 /// The next physical line without its `\r`, advancing `rest`.
-// ponytail: all dialects share physical lines; comment and continuation rules stay local.
 pub fn nextPhysicalLine(rest: *[]const u8) ?[]const u8 {
     const src = rest.*;
     if (src.len == 0) return null;

@@ -8,7 +8,7 @@
 //! - `pub fn Type(comptime id: DeviceId) type`
 //! - `pub const letter_map: std.StaticStringMap(DeviceId)`
 //! - `pub const module_map: std.StaticStringMap(DeviceId)`
-//! - `pub const resistor, capacitor, inductor, kinduc, vsource, isource, cccs, ccvs, vcvs, bsource, bsource_i, bsource_q, cswitch, tline, lossy_tline, ltra, vcvs_laplace, vccs_laplace, vcvs_pole, vccs_pole, vcvs_delay, vccs_delay, txl, coupled_ltra, coupled_ltra3, coupled_ltra4, wline_1, wline_2, wline_3, wline_4, sparam_1, sparam_2, sparam_3, sparam_4: type`
+//! - `pub const resistor, capacitor, inductor, kinduc, vsource, isource, cccs, ccvs, vcvs, bsource, bsource_i, bsource_d, bsource_di, cswitch, tline, lossy_tline, ltra, vcvs_laplace, vccs_laplace, vcvs_pole, vccs_pole, vcvs_delay, vccs_delay, txl, coupled_ltra, coupled_ltra3, coupled_ltra4, wline_1, wline_2, wline_3, wline_4, sparam_1, sparam_2, sparam_3, sparam_4: type`
 //! - `pub const absent_model: []const u8` (on a `Type` with no catalog model)
 //! - `pub fn mosfetDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
 //! - `pub fn bjtDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
@@ -39,7 +39,6 @@ pub const DeviceId = enum {
     ccvs,
     bsource,
     bsource_i,
-    bsource_q,
     vswitch,
     cswitch,
     tline,
@@ -47,6 +46,9 @@ pub const DeviceId = enum {
     txl,
     coupled_tlines,
     diode,
+    /// The self-heated diode (diode.va under SELFHEATING); the builder swaps
+    /// it in for a diode card ngspice heats (`resolveDeviceId`).
+    diode_t,
     // M card levels.
     mos1,
     mos2,
@@ -196,14 +198,16 @@ pub const isource = DeviceId.Type(.isource);
 pub const cccs = DeviceId.Type(.cccs);
 /// H cards.
 pub const ccvs = DeviceId.Type(.ccvs);
-/// Plain E cards and a mixed-mode P card's legs.
+/// Plain E cards.
 pub const vcvs = DeviceId.Type(.vcvs);
 /// V-mode B cards.
 pub const bsource = DeviceId.Type(.bsource);
 /// I-mode B cards.
 pub const bsource_i = DeviceId.Type(.bsource_i);
-/// Charge-mode (`q=`) B cards.
-pub const bsource_q = DeviceId.Type(.bsource_q);
+/// V-mode B cards whose expression reads `ddt()`.
+pub const bsource_d = device.byName("bsource_d");
+/// I-mode B cards whose expression reads `ddt()`.
+pub const bsource_di = device.byName("bsource_di");
 /// ngspice W cards (current-controlled switch).
 pub const cswitch = DeviceId.Type(.cswitch);
 /// T cards, and lossless LC O cards.

@@ -65,6 +65,7 @@ pub fn pssJob(a: netlist.Analysis) !Job {
     const node_neg = a.neg;
     try analysis_args.singleEnded(node_neg);
     if (a.sn) return .{ .pss = try shootingNewton(args) };
+    if (a.ngspicePss()) return .{ .pss = try ngspiceOscillator(args, node_id) };
     // `.pss v(osc) f [n [settle]]` (HSPICE `.snosc`) solves an
     // oscillator: f is the first guess and osc the phase node.
     const osc = args.len != 0 and args[0] == .group;
@@ -150,8 +151,8 @@ pub fn hblinJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_
     const args = a.args;
     // HSPICE RF `.hblin <sweep> [NOISECALC=0|1] [FILENAME= DATAFORMAT=
     // MIXEDMODE2PORT=ss]` [CR .HBLIN] at the `.hb` card's tone, over
-    // the deck's P elements. The file keywords are checked and
-    // unused; mixed mode is refused.
+    // the deck's portnum V sources. The file keywords are checked and
+    // unused; every port is single-ended, so another mode is refused.
     const grid = try analysis_args.acGrid(ctx.arena, args, 0);
     var noise = false;
     var i: usize = grid.end;
@@ -166,9 +167,6 @@ pub fn hblinJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_
         } else if (!std.mem.eql(u8, key, "filename") and !std.mem.eql(u8, key, "dataformat")) return error.InvalidAnalysisArguments;
     }
     if (sources.ports.len == 0) return error.MissingAnalysisCard;
-    // ponytail: mixed-mode P cards only in `.lin`; `.hblin` would
-    // need the leg drives in every band.
-    for (sources.ports) |p| if (p.balanced != null) return error.UnsupportedAnalysisOutput;
     return .{ .hblin = .{ .f0 = 0, .sweep = grid.sweep, .ports = sources.ports, .noise = noise } };
 }
 
@@ -234,13 +232,16 @@ pub fn pacJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job {
     return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
 }
 
-/// The `sp` card.
+/// The `sp` card. ngspice's `.sp <sweep> [donoise]` reads its fifth word as
+/// an integer and turns the noise columns on only at 1 (inp2dot.c:1074-1076,
+/// spsetp.c:80).
 pub fn spJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_args.CardContext) !Job {
     const args = a.args;
     if (analysis_args.cardIs(a.line, "net")) return .{ .sp = try net(a, sources, ctx) };
-    if (analysis_args.cardIs(a.line, "lin")) return .{ .sp = .{ .sweep = ctx.ac orelse return error.MissingAnalysisCard, .ports = sources.ports, .lin = try lin(args, sources.ports) } };
-    try analysis_args.arity(args, 4, 4);
-    return .{ .sp = .{ .sweep = try analysis_args.frequencySweep(args, 0), .ports = sources.ports } };
+    if (analysis_args.cardIs(a.line, "lin")) return .{ .sp = .{ .sweep = ctx.ac orelse return error.MissingAnalysisCard, .ports = sources.ports, .lin = try lin(args) } };
+    try analysis_args.arity(args, 4, 5);
+    const noise = args.len == 5 and try analysis_args.number(args, 4) == 1;
+    return .{ .sp = .{ .sweep = try analysis_args.frequencySweep(args, 0), .ports = sources.ports, .noise = noise } };
 }
 
 // ---- private ----
@@ -294,12 +295,12 @@ fn net(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_args.Card
 /// [CR .LIN] over the `.ac` sweep. S is always computed. noisecalc=2 (the
 /// N-port correlation matrix) publishes the two-port parameters only.
 /// mixedmode2port names port 1's and port 2's mode in the two-port
-/// measurements: `s` for a single-ended port, `d` or `c` for a balanced
-/// one; any other pairing is InvalidAnalysisArguments.
+/// measurements; every port is single-ended, so any value but `ss` is
+/// InvalidAnalysisArguments.
 /// `format=touchstone|touchstone2` also writes a Touchstone 1.0 file named
 /// by `filename=`; the other formats (`selem`, `citi`) and the listing
 /// keywords are checked for a value and unused.
-fn lin(args: []const Value, ports: []const requests.Port) !requests.Sp.Lin {
+fn lin(args: []const Value) !requests.Sp.Lin {
     const Key = enum { sparcalc, noisecalc, gdcalc, mixedmode2port, format, filename, dataformat, modelname, freqdigit, spardigit, listfreq, listcount, listfloor, listsources };
     var o: requests.Sp.Lin = .{};
     var i: usize = 0;
@@ -314,19 +315,7 @@ fn lin(args: []const Value, ports: []const requests.Port) !requests.Sp.Lin {
                 if (key == .noisecalc) o.noise = v != 0;
                 if (key == .gdcalc) o.group_delay = v != 0;
             },
-            .mixedmode2port => {
-                const mode = nameAt(args, i + 1) orelse return error.InvalidAnalysisArguments;
-                if (mode.len != 2) return error.InvalidAnalysisArguments;
-                for (mode, 0..) |c, k| {
-                    const balanced = k < ports.len and ports[k].balanced != null;
-                    switch (std.ascii.toLower(c)) {
-                        's' => if (balanced) return error.InvalidAnalysisArguments,
-                        'd', 'c' => if (!balanced) return error.InvalidAnalysisArguments,
-                        else => return error.InvalidAnalysisArguments,
-                    }
-                    o.common[k] = std.ascii.toLower(c) == 'c';
-                }
-            },
+            .mixedmode2port => if (!std.ascii.eqlIgnoreCase(nameAt(args, i + 1) orelse "", "ss")) return error.InvalidAnalysisArguments,
             .format => {
                 const f = nameAt(args, i + 1) orelse return error.InvalidAnalysisArguments;
                 o.touchstone = std.ascii.startsWithIgnoreCase(f, "touchstone");
@@ -419,6 +408,46 @@ fn shootingNewton(args: []const Value) !requests.Pss {
         pss.n_samples = @intFromFloat(steps);
     }
     return pss;
+}
+
+/// ngspice's `.pss gfreq tstab oscnob psspoints harms sciter steadycoeff
+/// [uic]` (inp2dot.c:662-701), always an oscillator, as ESPice's
+/// autonomous shooting: gfreq is the period's first guess, tstab the
+/// settling transient counted in whole guess periods, psspoints the
+/// samples, uic that transient's start from the `.ic` values
+/// (psssetp.c:38-40). oscnob is the phase node (`osc`) when it names a net.
+/// ngspice's shooting never reads it (dcpss.c:3516) and INPtermInsert makes
+/// a node of any name (inp2dot.c:676-678), so an oscnob naming no net, or
+/// ground, leaves the solve to pick its phase node (`phase_node`). harms is
+/// the spectrum's row count (`Pss.harms`; the card's queries publish it
+/// after the period). sciter caps the shooting: ngspice tests the period
+/// residual sciter + 1 times (ngspice-45 dcpss.c:874, 908), so ESPice takes
+/// at most sciter + 1 shooting steps; where ngspice then publishes its best
+/// unconverged cycle (dcpss.c:919-941), ESPice's oscillator refuses
+/// (`NoPeriodicSteadyState`). steadycoeff is `Pss.steady_coeff`, tested
+/// with ESPice's own `shooting_tol`.
+fn ngspiceOscillator(args: []const Value, osc: u32) !requests.Pss {
+    const gfreq = try analysis_args.positive(args, 0);
+    const tstab = try analysis_args.number(args, 1);
+    const settle = @round(tstab * gfreq);
+    if (!(settle >= 0 and settle <= std.math.maxInt(u16))) return error.InvalidAnalysisArguments;
+    const uic = args.len == 8;
+    if (uic and !analysis_args.isKey(args, 7, "uic")) return error.InvalidAnalysisArguments;
+    // An integer >= 0: ngspice's sciter 0 tests once.
+    const sciter = try analysis_args.number(args, 5);
+    if (!(sciter >= 0 and sciter == @trunc(sciter) and sciter < std.math.maxInt(u16))) return error.InvalidAnalysisArguments;
+    const named = osc != analysis_args.NO_NODE and osc != GROUND;
+    return .{
+        .period = 1 / gfreq,
+        .osc_node = if (named) osc else GROUND,
+        .phase_node = if (named) .given else .largest_swing,
+        .osc_settle_periods = @intFromFloat(settle),
+        .n_samples = try analysis_args.count(u32, args, 3, 256),
+        .uic = uic,
+        .harms = try analysis_args.count(u16, args, 4, 0),
+        .max_shooting_iter = @as(u16, @intFromFloat(sciter)) + 1,
+        .steady_coeff = try analysis_args.positive(args, 6),
+    };
 }
 
 /// A comptime argument list: strings become names, numbers numbers.

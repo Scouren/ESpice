@@ -3,13 +3,23 @@
 //! order or a fresh, recorded evaluation out. Opt-in (`Hooks.set_bypass`):
 //! it moves values within the Newton tolerance. Cites SPICE's bypass test
 //! (the unknowns and the predicted current both within tolerance) and the
-//! hand-kept model list `traits.bypass_models`.
+//! hand-kept model list `traits.bypass_models`. The C4 lever
+//! (`BypassTol.c4`, docs/perf_research/04-levers-cpu.md) judges the hit
+//! rate per window of transient steps and re-arms a batch it turned off,
+//! and replays a step's first iterate for a model that does not read the
+//! iteration (VerA's `sim_reads`), and keys a recording on the row minus
+//! the fields that reach only a charge value (`traits.chargeOnlyFields`);
+//! off, the shipped bypass bit for bit. `BypassTol.hold` (`c4h`,
+//! measurement only) keeps a C4 batch on whatever its windows show. `BypassTol.stats` counts each
+//! batch's evaluations by outcome and prints them when the batch frees its
+//! bypass (`bypass-stats:`).
 //!
 //! Contents:
 //! - `pub fn Bypass(comptime D: type) type`: the per-batch record (`tol`,
 //!   `ref`, `meta`, `inst`, `cells`, `vals`, `rows`, `cols`, `hits`,
-//!   `misses`, `off`) with `bypassable`, `rec_cap`, `review`, `setBypass`,
-//!   `freeBypass`, `evalBypass`
+//!   `misses`, `off`, `rearm_in`, `offs`, `census`) with `Census`,
+//!   `bypassable`, `c4_only`, `rec_cap`, `review`, `countPlain`,
+//!   `setBypass`, `freeBypass`, `evalBypass`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -60,6 +70,33 @@ pub fn Bypass(comptime D: type) type {
         /// Set once the hit rate proved too low to pay for recording: the
         /// batch evaluates plainly for the rest of the run.
         off: bool = false,
+        /// C4 only: reviews left before a batch that was turned off probes
+        /// again; 0 while on.
+        rearm_in: u32 = 0,
+        /// C4 only: how many times a window turned the batch off; each
+        /// turn-off doubles the next backoff, so a model whose hits never
+        /// pay is re-armed O(log(reviews)) times, not once per backoff.
+        offs: u8 = 0,
+        /// `BypassTol.stats` only: counts per `Census` tag, summed over
+        /// ParEval's lanes.
+        census: [n_census]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0)),
+
+        /// What `census` counts. `evals`: every instance evaluation the
+        /// bypass saw, first iterates included; a miss that is neither a
+        /// byte nor a tolerance miss (a limiter correction, no recording, a
+        /// class or plane change) is the rest of `evals`. A hit's cost, for
+        /// C4's break-even rate from a profile: `replay_writes`, the plane
+        /// entries the replays wrote (residual, G and C), and
+        /// `charge_reads`, the charge evaluations they ran.
+        /// `plain`: instance evaluations of the batch while its bypass was
+        /// off (`countPlain`, per pass), so `evals + plain` is every
+        /// evaluation the batch made with a bypass allocated. `windows`:
+        /// C4 windows judged; `under_5th` and `under_14th`: of those, the
+        /// ones with hits under one in five (the review's rule) and under
+        /// one in fourteen, counted whether or not the window turned the
+        /// batch off.
+        pub const Census = enum(u8) { evals, replays, byte_misses, tol_misses, first_replays, windows_off, rearmed, replay_writes, charge_reads, plain, windows, under_5th, under_14th };
+        const n_census = @typeInfo(Census).@"enum".field_names.len;
 
         const Bp = @This();
         const Batch = DeviceBatch(D);
@@ -76,8 +113,11 @@ pub fn Bypass(comptime D: type) type {
             !traits.hasSpiceBreaks(D) and !traits.skipsTimerState(D) and
             !@hasDecl(D, "advanceIteration") and !@hasDecl(D, "checkConvergence") and
             !(@hasDecl(D, "mutable_eval") and D.mutable_eval and !traits.statusOnlyMutable(D)) and
-            !(@hasDecl(D, "constant") and D.constant.g) and @hasDecl(D, "u_kinds") and
-            @sizeOf(D.Instance) <= 4096 and traits.bypass_models.has(traits.baseName(D));
+            !(@hasDecl(D, "constant") and D.constant.g) and (@hasDecl(D, "u_kinds") or c4_only) and
+            @sizeOf(D.Instance) <= 4096 and (traits.bypass_models.has(traits.baseName(D)) or c4_only);
+        /// Whether D bypasses with the C4 lever on only
+        /// (`traits.bypass_models_c4`): with it off the batch never arms.
+        pub const c4_only = traits.bypass_models_c4.has(traits.baseName(D));
 
         /// Upper bounds on one instance's recorded writes in a Newton pass:
         /// one residual per written row, its row's pattern entries, and the
@@ -103,6 +143,54 @@ pub fn Bypass(comptime D: type) type {
         const cells_len = rec_cap.res + rec_cap.jac + rec_cap.qjac;
         const rows_len = rec_cap.res + rec_cap.jac;
         const res_rows = layout.writtenRows(D, "jac_rows");
+        /// C4: whether a step's first iterate may replay and record. A model
+        /// that reads `$simparam("iteration")` (the Meyer MOS levels) branches
+        /// on it, and the class does not key on it.
+        const replays_first = !contract.simReads(D).iteration;
+
+        // C4's review (`reviewWindow`). Provisional, all three.
+        // ponytail: one in five is a guess; the measurement that fits it is
+        // the break-even hit rate, a miss's cost with the bypass on (the
+        // recording) over a plain evaluation's cost, per model. The window
+        // and the backoff fit from how many steps a latent phase lasts after
+        // an active one on bench_ngspice_mosamp and the BSIM4 1k decks.
+        /// Evaluations per instance one window judges.
+        const window_evals: u64 = 4;
+        /// A window turns the batch off when hits * this < evaluations.
+        const break_even_den: u64 = 5;
+        /// Reviews (solves) an off batch waits before it probes again the
+        /// first time; the wait doubles at each later turn-off.
+        const backoff_reviews: u32 = 64;
+        /// Doublings past which the wait stays put: 64 << 25 = 2^31 fits u32.
+        const max_doublings: u8 = 25;
+
+        /// C4's key: the byte spans of `D.Instance` outside
+        /// `traits.chargeOnlyFields(D)`, ascending; null when that list is
+        /// empty and the whole row keys.
+        const key_spans: ?[]const [2]usize = blk: {
+            const names = traits.chargeOnlyFields(D);
+            if (names.len == 0) break :blk null;
+            @setEvalBranchQuota(20_000 + 100 * @sizeOf(D.Instance));
+            var skip: [@sizeOf(D.Instance)]bool = @splat(false);
+            for (names) |name| {
+                if (!@hasField(D.Instance, name)) @compileError(@typeName(D) ++ ".Instance has no field " ++ name ++ " (traits.charge_only)");
+                const at = @offsetOf(D.Instance, name);
+                for (at..at + @sizeOf(@FieldType(D.Instance, name))) |i| skip[i] = true;
+            }
+            var spans: []const [2]usize = &.{};
+            var i: usize = 0;
+            while (i < skip.len) {
+                if (skip[i]) {
+                    i += 1;
+                    continue;
+                }
+                const start = i;
+                while (i < skip.len and !skip[i]) i += 1;
+                spans = spans ++ [_][2]usize{.{ start, i }};
+            }
+            const final = spans[0..spans.len].*;
+            break :blk &final;
+        };
 
         comptime {
             // Local rows and columns ride in u8, a segment length in u16.
@@ -114,12 +202,24 @@ pub fn Bypass(comptime D: type) type {
         /// batch replays under one in five: it pays the recording for
         /// nothing (a BSIM4 whose instance bytes move every step: 3%; a CMOS
         /// chain: 85%).
+        /// With the C4 lever on, `reviewWindow` decides instead.
         pub fn review(bp: *Bp, count: u32) void {
+            if (bp.tol.c4) return reviewWindow(bp, count);
             if (bp.off) return;
             const h = bp.hits.load(.monotonic);
             const total = h + bp.misses.load(.monotonic);
             if (total < 4 * @as(u64, count)) return;
-            if (h * 5 < total) bp.off = true;
+            if (h * 5 < total) {
+                bp.off = true;
+                if (bp.tol.stats) bp.tally(.windows_off, 1);
+            }
+        }
+
+        /// Counts `n` instance evaluations the batch made plainly while its
+        /// bypass was off (`Census.plain`); statistics only.
+        pub inline fn countPlain(bp: *Bp, n: usize) void {
+            assert(bp.off);
+            if (bp.tol.stats) bp.tally(.plain, n);
         }
 
         /// `Hooks.set_bypass`: sets the tolerances, clearing every
@@ -128,6 +228,7 @@ pub fn Bypass(comptime D: type) type {
         pub fn setBypass(ctx: *anyopaque, tol: ?abi.BypassTol) void {
             const self = Batch.of(ctx);
             if (comptime !bypassable) return;
+            if (comptime c4_only) if (tol == null or !tol.?.c4) return freeBypass(self);
             if (self.bypass) |bp| {
                 bp.tol = tol orelse return freeBypass(self);
                 if (!bp.off) @memset(bp.meta, .{});
@@ -139,6 +240,7 @@ pub fn Bypass(comptime D: type) type {
         /// Frees the batch's bypass records, if any.
         pub fn freeBypass(self: *Batch) void {
             const bp = self.bypass orelse return;
+            if (bp.tol.stats) bp.printCensus();
             staging_gpa.free(bp.cols);
             staging_gpa.free(bp.rows);
             staging_gpa.free(bp.vals);
@@ -156,13 +258,33 @@ pub fn Bypass(comptime D: type) type {
         /// Each plane cell's writes replay in their recorded order, so it
         /// sums as a fresh evaluation with those values would.
         pub fn evalBypass(self: *Batch, bp: *Bp, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool, pl: *const Planes, comptime staged: bool) void {
+            // One test per call. The shipped loop is `evalLoop(.., false)`;
+            // C4 and the census share a second instantiation.
+            if (bp.tol.c4 or bp.tol.stats) return evalLoop(self, bp, sink, first, last, sim, limiting, pl, staged, true);
+            evalLoop(self, bp, sink, first, last, sim, limiting, pl, staged, false);
+        }
+
+        // ---- private ----
+
+        /// `evalBypass`'s loop. `ext` false is the shipped bypass; true
+        /// reads `tol.c4` (first iterate, counting, key) and `tol.stats`
+        /// (the census), each a bool the instance loop tests.
+        inline fn evalLoop(self: *Batch, bp: *Bp, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool, pl: *const Planes, comptime staged: bool, comptime ext: bool) void {
             assert(first <= last);
             assert(last <= self.count);
             const SinkT = @typeInfo(@TypeOf(sink)).pointer.child;
+            const c4 = ext and bp.tol.c4;
+            const stats = ext and bp.tol.stats;
+            var cen: [n_census]usize = @splat(0);
+            defer if (stats) for (&bp.census, cen) |*g, v| {
+                _ = g.fetchAdd(v, .monotonic);
+            };
+            if (stats) cen[@backingInt(Census.evals)] += last - first;
+            const first_iter = sim.iteration <= 1;
             // The first iterate neither replays nor records (Meyer models
             // branch on it), so a later iterate's recording reaches the next
-            // timepoint.
-            if (sim.iteration <= 1) return self.evalSplit(sink, first, last, sim, limiting);
+            // timepoint. C4: unless the model never reads the iteration.
+            if (first_iter and !(c4 and replays_first)) return self.evalSplit(sink, first, last, sim, limiting);
             // Which planes the recorded pointers address.
             var key = std.hash.Wyhash.init(@intFromBool(staged));
             key.update(std.mem.asBytes(&[_]usize{ @intFromPtr(pl.g_vals.ptr), @intFromPtr(pl.c_vals.ptr), @intFromPtr(pl.rhs.ptr), @intFromPtr(pl.q_vec.ptr) }));
@@ -171,10 +293,14 @@ pub fn Bypass(comptime D: type) type {
             const lim_writes = comptime if (has_limit) layout.limitWritesOf(D) else 0;
             var hits: usize = 0;
             var misses: usize = 0;
-            defer {
+            // C4 counts from the first transient step: a static solve (dt 0,
+            // the transient's operating point included) moves every instance
+            // and says nothing about the latency to come.
+            const counted = !c4 or sim.dt > 0;
+            defer if (counted) {
                 _ = bp.hits.fetchAdd(hits, .monotonic);
                 _ = bp.misses.fetchAdd(misses, .monotonic);
-            }
+            };
             var id = first;
             while (id < last) : (id += 1) {
                 var lx: [n_u]f64 = undefined;
@@ -192,17 +318,27 @@ pub fn Bypass(comptime D: type) type {
                 const ref = bp.ref[@as(usize, id) * n_u ..][0..n_u];
                 const inst_now = std.mem.asBytes(&self.instances[id]);
                 const inst_rec = bp.inst[@as(usize, id) * @sizeOf(D.Instance) ..][0..@sizeOf(D.Instance)];
-                if (!corr and m.class == class and m.plane == plane_key and std.mem.eql(u8, inst_now, inst_rec) and
-                    replay(bp, id, m.*, &lx, ref, SinkT.stores))
-                {
+                const eligible = !corr and m.class == class and m.plane == plane_key;
+                const keyed = eligible and keyEql(c4, inst_now, inst_rec);
+                if (keyed and replay(bp, id, m.*, &lx, ref, SinkT.stores)) {
                     // Charges and the tape are re-read exactly (values only):
                     // a Meyer model's C is not dq/dx, and the transient
                     // multiplies a charge error by 2/dt.
                     if (comptime has_q) stamp.evalQRange(D, dual.RealFor(@hasDecl(D, "collapse")), sink, id, id + 1, sim, null);
                     hits += 1;
+                    if (stats) {
+                        cen[@backingInt(Census.replays)] += 1;
+                        cen[@backingInt(Census.first_replays)] += @intFromBool(first_iter);
+                        cen[@backingInt(Census.replay_writes)] += @as(usize, m.n_res) + m.n_jac + m.n_qjac;
+                        cen[@backingInt(Census.charge_reads)] += @intFromBool(has_q);
+                    }
                     continue;
                 }
                 misses += 1;
+                if (stats) {
+                    if (keyed) cen[@backingInt(Census.tol_misses)] += 1;
+                    if (eligible and !keyed) cen[@backingInt(Census.byte_misses)] += 1;
+                }
                 // Full evaluation, recorded, keyed on the bytes it read.
                 @memcpy(inst_rec, inst_now);
                 var rec: RecordSink(SinkT, rec_cap, &res_rows) = .{
@@ -226,7 +362,70 @@ pub fn Bypass(comptime D: type) type {
             assert(id == last);
         }
 
-        // ---- private ----
+        /// Whether a recording's instance bytes key `now`: the whole row,
+        /// or with `c4` the row minus `key_spans`' complement, the fields
+        /// that reach only a charge value (a hit re-reads the charges).
+        inline fn keyEql(c4: bool, now: []const u8, rec: []const u8) bool {
+            assert(now.len == rec.len);
+            if (key_spans) |spans| if (c4) {
+                inline for (spans) |sp| {
+                    if (!std.mem.eql(u8, now[sp[0]..sp[1]], rec[sp[0]..sp[1]])) return false;
+                }
+                return true;
+            };
+            return std.mem.eql(u8, now, rec);
+        }
+
+        fn tally(bp: *Bp, tag: Census, n: usize) void {
+            _ = bp.census[@backingInt(tag)].fetchAdd(n, .monotonic);
+        }
+
+        fn printCensus(bp: *const Bp) void {
+            var c: [n_census]usize = undefined;
+            for (&c, &bp.census) |*o, *v| o.* = v.load(.monotonic);
+            assert(c[@backingInt(Census.replays)] <= c[@backingInt(Census.evals)]);
+            std.debug.print("bypass-stats: model={s} evals={d} replays={d} byte_misses={d} tol_misses={d} first_replays={d} windows_off={d} rearmed={d} replay_writes={d} charge_reads={d} plain={d} windows={d} under_5th={d} under_14th={d}\n", .{ traits.baseName(D), c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12] });
+        }
+
+        /// C4's review: judges each window of `window_evals` evaluations per
+        /// instance on its own and starts the next from zero; a window under
+        /// the break-even rate turns the batch off for `backoff_reviews`
+        /// reviews, doubled at each turn-off after the first, after which it
+        /// records afresh. Serial, between solves.
+        fn reviewWindow(bp: *Bp, count: u32) void {
+            assert(bp.tol.c4);
+            assert(bp.meta.len == count);
+            if (bp.off) {
+                bp.rearm_in -|= 1;
+                if (bp.rearm_in == 0) {
+                    bp.off = false;
+                    if (bp.tol.stats) bp.tally(.rearmed, 1);
+                    // A write_params or a new query while off left the
+                    // recordings unkeyed on the Model rows they read.
+                    @memset(bp.meta, .{});
+                }
+                return;
+            }
+            const h = bp.hits.load(.monotonic);
+            const total = h + bp.misses.load(.monotonic);
+            if (total < window_evals * @as(u64, count)) return;
+            bp.hits.store(0, .monotonic);
+            bp.misses.store(0, .monotonic);
+            if (bp.tol.stats) {
+                bp.tally(.windows, 1);
+                bp.tally(.under_5th, @intFromBool(h * 5 < total));
+                bp.tally(.under_14th, @intFromBool(h * 14 < total));
+            }
+            // `hold` (`c4h`): measurement only, the window is judged and
+            // forgotten but the batch stays on.
+            if (h * break_even_den < total and !bp.tol.hold) {
+                bp.off = true;
+                bp.rearm_in = backoff_reviews << @intCast(@min(bp.offs, max_doublings));
+                bp.offs +|= 1;
+                if (bp.tol.stats) bp.tally(.windows_off, 1);
+            }
+            assert(bp.off == (bp.rearm_in > 0));
+        }
 
         fn create(count: u32, tol: abi.BypassTol) !*Bp {
             const bp = try staging_gpa.create(Bp);
@@ -274,7 +473,7 @@ pub fn Bypass(comptime D: type) type {
             var d: [n_u]f64 = undefined;
             inline for (0..n_u) |u| {
                 const tol = bp.tol.reltol * @max(@abs(lx[u]), @abs(ref[u])) +
-                    (if (comptime D.u_kinds[u] == .voltage) bp.tol.vntol else bp.tol.abstol);
+                    (if (comptime isVoltage(u)) bp.tol.vntol else bp.tol.abstol);
                 d[u] = lx[u] - ref[u];
                 // An infinite `d` passes an infinite `tol`; the dense
                 // product this replaced turned it into a NaN and refused.
@@ -301,6 +500,13 @@ pub fn Bypass(comptime D: type) type {
             const qs = rows_len;
             for (cells[qs..][0..m.n_qjac], vals[qs..][0..m.n_qjac]) |p, v| put(p, v, stores);
             return true;
+        }
+
+        /// Whether unknown `u` is a node potential. VerA omits `u_kinds`
+        /// when every unknown is one (no branch flow).
+        fn isVoltage(comptime u: usize) bool {
+            if (comptime !@hasDecl(D, "u_kinds")) return true;
+            return D.u_kinds[u] == .voltage;
         }
 
         inline fn put(p: *f64, v: f64, comptime stores: bool) void {

@@ -34,7 +34,7 @@
 //!   `loadCheck`, `pooled`, `configure`, `attachGpu`, `gpuContext`,
 //!   `detachGpu`, `checkpoint`, `bindPlanes`, `ownPlanes`, `qTapeLen`,
 //!   `markCurrentRowsOf`, `snapshotQTape`, `eval`, `clearPlanes`, `evalQ`,
-//!   `linearize`, `linearizeAc`, `acDyn`, `addAcDynDense`, `evalNewton`,
+//!   `linearize`, `linearizeAc`, `acDyn`, `addAcDynDense`, `evalNewton`, `evalNewtonGCWith`,
 //!   `evalNewtonGC`, `newtonGC`, `computeBaseline`, `rebuildBaseline`,
 //!   `gcAt`, `combineGC`, `denseG`, `denseC`, `findSlot`, `nodeName`
 //! - `pub const init = circuit_life.freeze`
@@ -63,6 +63,8 @@ const circuit_devices = @import("circuit_devices.zig");
 const circuit_params = @import("circuit_params.zig");
 const Planes = abi.Planes;
 const ParEval = par_eval.ParEval;
+const Companion = @import("tran/integrator.zig").Companion;
+const LaneLoan = @import("exec_config.zig").LaneLoan;
 
 /// The facade's developer switches (`knobs.zig`).
 pub const Knobs = knobs.Knobs;
@@ -148,6 +150,9 @@ pub const Circuit = struct {
     /// q under the committed state before recording it, or the next step
     /// opens on a residual a dq that doubles every time dt halves.
     has_state_q: bool,
+    /// Every stamp is independent of x (`device.Circuit.linear`); the Newton
+    /// workspace reads it for the C3 lever.
+    linear: bool = false,
     /// `g_base`/`c_base` hold the constant-Jacobian contribution and
     /// `evalNewton` seeds from them.
     has_baseline: bool,
@@ -166,6 +171,10 @@ pub const Circuit = struct {
     /// The template's shared column-order slot (`device.Circuit.column_order`),
     /// borrowed; the pattern is the template's.
     column_order: ?*Prepared.ColumnOrder = null,
+    /// Lever C8: the column order this query's dependency ended on when C8
+    /// kept a reorder there (`direct.Solver.keptOrder`), owned; `workspace`
+    /// adopts it. Empty with the lever off.
+    c8_order: []u32 = &.{},
     /// CSC slot of each frequency-dependent small-signal entry, the trash
     /// slot for a ground one (`Prepared.ac_dyn_slots`); `acDyn` fills their
     /// terms. Borrowed topology.
@@ -190,12 +199,29 @@ pub const Circuit = struct {
     /// 2.3), and the alpha that eval formed it at.
     gc: gpu_mod.GcServed = .full,
     gc_alpha: f64 = 0,
+    /// C7: the attached ParEval's `a_vals` hold G + `gc_alpha` C of the last
+    /// `evalNewtonGC`, ground pin included. `newtonGC` hands them out once;
+    /// every host stamp and device eval under `reduce_a` clears it. Read
+    /// only under `reduce_a`, so the shipped path never stores it.
+    par_a: bool = false,
+    /// C7: the attached ParEval forms A and the companion rows in its
+    /// reduce (`formsA`, no GPU context). Set by whoever attaches both;
+    /// the companion hook reads it once per assemble.
+    reduce_a: bool = false,
+    /// C6 step 1 (#253): lanes borrowed for the LU alone, returned past the
+    /// width the solver's admission uses (`settleLaneLoan`), then null.
+    /// Executor-owned, borrowed.
+    lane_loan: ?*LaneLoan = null,
     /// Executor-owned display output; null when no batch has `Hooks.say`.
     /// Borrowed: set it to null before freeing it.
     display: ?*Display = null,
     /// The temperature `setCircuitTemp` last installed, in degrees Celsius;
     /// the devices' own 27 until then. A sweep restores it from here.
     temp_c: f32 = 27,
+    /// The deck's parameters that follow `temp_c` (`Deck.temper`), which
+    /// `setCircuitTemp` rewrites. Borrowed from the deck; the executor sets
+    /// it on every circuit it materializes.
+    temper: ?@import("core").Temper = null,
     /// The analysis state every device call receives (`setSimState`), with
     /// the Newton iteration `beginSolve`/`advanceIteration` count.
     sim: abi.SimState = .{},
@@ -313,6 +339,7 @@ pub const Circuit = struct {
     /// the device. Null without a device LU; see `GpuLu.solve` for true and
     /// false.
     pub fn deviceSolve(self: *Circuit, slv: *direct.Solver, vals: []f64, dx: []f64) ?bool {
+        if (self.lane_loan != null) circuit_devices.settleLaneLoan(self, slv);
         const lu = self.lu orelse return null;
         if (self.gc == .device) if (self.gpuContext()) |g| return g.gcSolve(lu, slv, vals, self.rhs[0..self.n], dx, self.gc_alpha);
         return lu.solve(slv, vals, self.rhs[0..self.n], dx);
@@ -334,6 +361,12 @@ pub const Circuit = struct {
                 ws.deinit(self.gpa);
                 return e;
             };
+            if (self.c8_order.len != 0) ws.slv.adoptOrder(self.c8_order) catch |e| {
+                ws.deinit(self.gpa);
+                return e;
+            };
+            // A pooled workspace last served another circuit.
+            ws.linear = self.linear;
             self.ws = ws;
             return &self.ws.?;
         };
@@ -342,6 +375,8 @@ pub const Circuit = struct {
         errdefer ws.deinit(self.gpa);
 
         if (shared == null) if (self.column_order) |o| if (ws.slv.q.len == self.n) try o.share(ws.slv.q);
+        if (self.c8_order.len != 0) try ws.slv.adoptOrder(self.c8_order);
+        ws.linear = self.linear;
         self.ws = ws;
         return &self.ws.?;
     }
@@ -470,7 +505,7 @@ pub const Circuit = struct {
         self.lin.valid = false;
         self.gc = .full;
         if (self.gpuContext()) |g| return self.evalGpu(g, x, t, false);
-        self.stamp(x, t, .full);
+        self.stamp(x, t, .full, null);
     }
 
     /// Clears the planes `mode` writes, or seeds g/c from the baseline for
@@ -511,7 +546,7 @@ pub const Circuit = struct {
             if (g.evalQ(x, t, self.sim)) return self.bindPlanes(g.planes());
             return self.evalGpu(g, x, t, true);
         }
-        self.stamp(x, t, .charge);
+        self.stamp(x, t, .charge, null);
     }
 
     /// Ensures the planes hold the linearization at `x_op`, reusing them when
@@ -596,7 +631,9 @@ pub const Circuit = struct {
     /// (02 2.3), which then comes down in place of g and c, or stays on the
     /// device for the device LU (`deviceSolve`). The planes' g and c then
     /// hold only the diagonal until the next eval.
+    /// Under `reduce_a` (C7) ParEval's reduce forms A in the same pass.
     pub fn evalNewtonGC(self: *Circuit, x: []const f64, t: f64, alpha: f64) void {
+        if (self.reduce_a) return self.evalNewtonGCWith(x, t, alpha, null);
         if (self.gpuContext()) |g| if (self.gcDevice()) |device| {
             self.lin.valid = false;
             self.gc = g.evalGc(x, t, self.sim, .{ .alpha = alpha, .device = device }, self.diag_slots[0..self.n], self.nnz);
@@ -609,14 +646,34 @@ pub const Circuit = struct {
         self.evalNewton(x, t);
     }
 
+    /// `evalNewtonGC` under `reduce_a` (C7), with `comp`'s companion term
+    /// added to every rhs row as `companionAt` adds it after the stamp,
+    /// bitwise: rows 1 and up in the reduce, row 0 after the ground pin.
+    pub fn evalNewtonGCWith(self: *Circuit, x: []const f64, t: f64, alpha: f64, comp: ?Companion) void {
+        assert(self.reduce_a and self.gpuContext() == null);
+        assert(comp == null or self.has_charge);
+        self.lin.valid = false;
+        self.gc = .full;
+        const form: par_eval.FormA = .{ .alpha = alpha, .comp = comp };
+        if (self.has_baseline) self.stamp(x, t, .newton, form) else self.stamp(x, t, .full, form);
+    }
+
     /// Returns the Newton matrix G + alpha C after `evalNewtonGC` at the same
     /// alpha: `combineGC` into `out`, the A the device brought down, or, for
     /// the device LU, `out` with only the diagonal written, which
-    /// `deviceSolve` completes.
+    /// `deviceSolve` completes. Under C7 the first call after a threaded
+    /// `evalNewtonGC` returns the A ParEval formed (`nnz` entries, owned by
+    /// ParEval, bitwise `combineGC`'s); a later call combines into `out`.
     pub fn newtonGC(self: *Circuit, alpha: f64, out: []f64) []f64 {
         if (self.gc != .full) if (self.gpuContext()) |g| {
             assert(@as(u64, @bitCast(alpha)) == @as(u64, @bitCast(self.gc_alpha)));
             return g.gcVals(self.gc, alpha, out, self.diag_slots[0..self.n], self.nnz);
+        };
+        // C7: once, since the caller may write into what it gets. `par_a`
+        // speaks only under `reduce_a`: a clear outside it is skipped.
+        if (self.reduce_a and self.par_a) if (self.par_eval) |p| {
+            self.par_a = false;
+            if (@as(u64, @bitCast(alpha)) == @as(u64, @bitCast(self.gc_alpha))) return p.a_vals[0..self.nnz];
         };
         self.combineGC(alpha, out);
         return out;
@@ -725,6 +782,7 @@ pub const Circuit = struct {
     /// the host stamp after a driver fault `g` has already reported. The
     /// planes follow the buffer the device wrote, which a prefetch moves.
     fn evalGpu(self: *Circuit, g: *GpuContext, x: []const f64, t: f64, charge: bool) void {
+        if (self.reduce_a) self.par_a = false;
         const ok = g.eval(x, t, self.sim, charge);
         self.bindPlanes(g.planes());
         if (ok) self.groundStamp(x) else self.evalNewtonCpu(x, t);
@@ -732,18 +790,31 @@ pub const Circuit = struct {
 
     /// Host stamp: clear, run every batch serially or threaded, then add the
     /// ground pin (which `.charge` does not touch). ParEval sets every cell
-    /// itself, baseline included, so it skips the clear.
-    fn stamp(self: *Circuit, x: []const f64, t: f64, comptime mode: par_eval.Mode) void {
+    /// itself, baseline included, so it skips the clear. `form` (C7,
+    /// ParEval armed only) has the reduce form A and the companion rows too;
+    /// the ground pin's cell and row are finished here after the pin, as
+    /// `gcAt` and `companionAt` round them.
+    fn stamp(self: *Circuit, x: []const f64, t: f64, comptime mode: par_eval.Mode, form: ?par_eval.FormA) void {
         const pl = self.ownPlanes();
+        if (self.reduce_a) self.par_a = false;
         if (self.par_eval) |p| {
             self.q_fresh = false;
             const base: ParEval.Base = if (mode == .newton) .{ .g = self.g_base, .c = if (self.has_charge) self.c_base else &.{} } else .{};
-            p.run(self.batches, pl, base, x, t, mode);
+            p.run(self.batches, pl, base, x, t, mode, form);
         } else {
+            assert(form == null);
             self.clearPlanes(mode);
             for (self.batches) |b| par_eval.stampRange(b, &pl, 0, b.count, x, t, mode);
         }
         if (mode != .charge) self.groundStamp(x);
+        if (form) |f| {
+            assert(self.reduce_a);
+            const d0 = self.diag_slots[0];
+            self.par_eval.?.a_vals[d0] = self.gcAt(f.alpha, d0);
+            self.gc_alpha = f.alpha;
+            self.par_a = true;
+            if (f.comp) |c| if (self.n > 0) c.applyRows(self.rhs, self.q_vec, 0, 1);
+        }
     }
 
     /// Whether `evalNewtonGC` may hand A to the device, and whether the
@@ -763,7 +834,7 @@ pub const Circuit = struct {
 
     /// Host half of `evalNewton`, also the GPU context's fault fallback.
     fn evalNewtonCpu(self: *Circuit, x: []const f64, t: f64) void {
-        if (self.has_baseline) self.stamp(x, t, .newton) else self.stamp(x, t, .full);
+        if (self.has_baseline) self.stamp(x, t, .newton, null) else self.stamp(x, t, .full, null);
     }
 
     fn denseFrom(self: *const Circuit, vals: []const f64, out: []f64) void {

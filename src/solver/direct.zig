@@ -25,6 +25,8 @@
 //!   - `pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) InitError!Self`
 //!   - `pub fn initOrdered(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs, order: ?[]const u32) InitError!Self`
 //!   - `pub fn reset(self: *Self, bbd: ?num.BbdInfo) Allocator.Error!void`
+//!   - `pub fn keptOrder(self: *const Self) ?[]const u32`
+//!   - `pub fn adoptOrder(self: *Self, order: []const u32) Allocator.Error!void`
 //!   - `pub fn sparse(self: *Self) ?*SparseLu`
 //!   - `pub fn deinit(self: *Self) void`
 //!   - `pub fn factor(self: *Self, vals: []const f64, execution: num.Execution) FactorError!void`
@@ -42,8 +44,10 @@ const order_mod = @import("order.zig");
 const bbd_mod = @import("bbd.zig");
 const lu_kernels = @import("kernels/lu.zig");
 const subtree = @import("subtree.zig");
+const lu_reorder = @import("lu_reorder.zig");
 const lu_census = @import("lu_census.zig");
 const num = @import("core").numerics;
+const Levers = @import("core").perf.Levers;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -80,6 +84,9 @@ pub const Knobs = struct {
     par: ?bool = null,
     /// `ESPICE_LU_PAR_STATS`: print the multicore refactor's admission.
     par_stats: bool = false,
+    /// `ESPICE_PERF`: the levers under evaluation; all off is the shipped
+    /// path.
+    perf: Levers = .{},
 };
 
 /// Every way building a solver fails; nothing is left allocated after it.
@@ -126,6 +133,9 @@ pub const Solver = struct {
     knobs: Knobs,
     /// Owned column ordering handed to the LU; empty until the LU exists.
     q: []u32 = &.{},
+    /// Lever C8's reorder history of `q` (`lu_reorder.zig`); empty with
+    /// the lever off.
+    c8: lu_reorder.State = .{},
     /// Values of the last factorization, for the unchanged-matrix bypass.
     vcopy: []f64 = &.{},
     /// Bumped whenever `vcopy` changes, by `factor` or by a device factor,
@@ -139,6 +149,11 @@ pub const Solver = struct {
     sub: ?subtree.Plan = null,
     /// Pivot epoch the cost model last judged.
     par_epoch: u32 = 0,
+    /// Lanes the last judged epoch's refactor runs on: `lu_threads` for the
+    /// multicore refactor, the subtree plan's width, else 1. 0 until
+    /// `refactorLu` judges an epoch. The executor returns borrowed lanes
+    /// past it (#253, `circuit_devices.settleLaneLoan`).
+    admitted_lanes: u32 = 0,
     /// A device factored `vcopy` and the LU still holds older values. The
     /// next host use refactors from `vcopy` first (bitwise the device's).
     host_stale: bool = false,
@@ -206,6 +221,7 @@ pub const Solver = struct {
         self.params = .{};
         self.gen +%= 1;
         self.dropPlans();
+        self.c8.onReset(self.q);
         if (self.sparse()) |lu| {
             lu.factored = false;
             self.par_epoch = lu.pattern_epoch;
@@ -226,6 +242,25 @@ pub const Solver = struct {
         assert(self.engine == self.init_engine);
     }
 
+    /// Lever C8: the column order the general LU is on when C8 kept a
+    /// reorder, so a query that starts from this one can `adoptOrder` it;
+    /// null otherwise, and always with the lever off. Borrowed: valid
+    /// until the next `factor`, `reset` or `deinit`.
+    pub fn keptOrder(self: *const Self) ?[]const u32 {
+        return self.c8.kept(self.q);
+    }
+
+    /// Lever C8: starts a fresh or just-reset solver on `order`, another
+    /// solver's `keptOrder` on this pattern, and arms one trial of the
+    /// original order against it on the first full factor (the original
+    /// wins ties). A no-op when `order` is the original or a structured
+    /// engine is live. OutOfMemory leaves the solver as it was. Asserts
+    /// the lever, no factor since init or reset, and n entries.
+    pub fn adoptOrder(self: *Self, order: []const u32) Allocator.Error!void {
+        assert(self.knobs.perf.c8 and !self.factored);
+        if (self.engine == .lu) try self.c8.adopt(self.gpa, self.q, order);
+    }
+
     /// The general LU, or null while a structured engine is live.
     pub fn sparse(self: *Self) ?*SparseLu {
         return switch (self.engine) {
@@ -243,6 +278,7 @@ pub const Solver = struct {
             .bbd => |*eng| eng.deinit(),
         }
         self.gpa.free(self.q);
+        self.c8.deinit(self.gpa);
         self.gpa.free(self.vcopy);
         self.gpa.free(self.refine_buf);
         self.gpa.free(self.probe);
@@ -344,6 +380,7 @@ pub const Solver = struct {
         assert(ws.used == 0);
         var lu = try SparseLu.init(gpa, n, self.col_ptr, self.q);
         lu.stats = self.knobs.stats;
+        lu.runs_on = self.knobs.perf.c1 or self.knobs.perf.g2;
         lu.diag_fill = diag_fill;
         return lu;
     }
@@ -433,6 +470,7 @@ pub const Solver = struct {
             self.factored = false;
         }
         try lu.factor(self.gpa, self.col_ptr, self.row_idx, vals, pivot_tol);
+        if (self.knobs.perf.c8) _ = try lu_reorder.decide(&self.c8, lu, self.gpa, self.q, self.col_ptr, self.row_idx, vals, pivot_tol);
         self.factored = true;
     }
 
@@ -514,7 +552,7 @@ pub const Solver = struct {
             self.dropPlans();
             // Out of memory for the tables: stay serial this epoch.
             if (parWorthIt(lu, self.knobs)) {
-                self.par = lu_kernels.HostRefactor.init(self.gpa, lu, self.col_ptr, growth) catch null;
+                self.par = lu_kernels.HostRefactor.initOpts(self.gpa, lu, self.col_ptr, growth, .{ .runs = self.knobs.perf.c1 and lu.runs.admitted, .tile = self.knobs.perf.n1 }) catch null;
             } else {
                 // Thin factors: lanes over independent subtrees when the
                 // model prices them at least `min_speedup` faster.
@@ -524,6 +562,7 @@ pub const Solver = struct {
                     if (instrument) lu_census.benchSubtree(p, lu, self.col_ptr, vals, growth, io, &maxMultiplier);
                 } else std.debug.print("lu-subtree: n={d} declined\n", .{lu.n});
             }
+            self.admitted_lanes = if (self.par != null) threads else if (self.sub) |p| p.width else 1;
         }
         if (self.par) |*p| {
             lu.replay_mult = null; // its copy-out writes L behind `lu`'s back

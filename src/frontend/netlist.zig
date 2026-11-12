@@ -4,14 +4,15 @@
 //! re-reads its subcircuit's lines under a frame), then analysis nets. Values
 //! are rows of flat tables; an expression that does not fold stays postfix.
 //!
+//! Reads one dialect, ngspice's plus ESPice's own cards; every other
+//! dialect arrives translated by SpiceRack (src/spicerack.zig).
 //! Cites ngspice (inpcom.c, inp.c recifeval, subckt.c modtranslate,
-//! INPgetModBin) for the ngspice dialect, the HSPICE manuals ([SA], [CR])
-//! for the HSPICE cards, and dev/research/{ngspice,hspice,spectre}-syntax.md
-//! (§ and rule ids) for the grammar; tests/frontend/grammar/ngspice.peg, hspice.peg
-//! and spectre.peg are its oracle.
+//! INPgetModBin) for the cards, the HSPICE manuals ([SA], [CR]) for the
+//! cards ESPice took from HSPICE, and dev/research/ngspice-syntax.md (§ and
+//! rule ids) for the grammar; tests/frontend/grammar/ngspice.peg is its
+//! oracle.
 //!
 //! Contents:
-//! - `pub const Dialect` (card_rows.zig)
 //! - `pub const VertexId` (card_rows.zig)
 //! - `pub const EdgeId` (card_rows.zig)
 //! - `pub const Kind` (card_rows.zig)
@@ -49,28 +50,27 @@
 //! - `pub const AppendModel` (card_rows.zig)
 //! - `pub const Netlist` (netlist_view.zig)
 //! - `pub const siteKey` (netlist_view.zig)
-//! - `pub const isGround` (netlist_view.zig)
 //! - `pub const isGroundName` (netlist_view.zig)
 //! - `pub const nameIndex` (netlist_view.zig)
 //! - `pub const isOpVar` (netlist_view.zig)
 //! - `pub const ParseOptions` (reader_frame.zig)
-//! - `pub const lines, spectre_rewrite, source, expr`
-//! - `pub fn parse(arena: Allocator, src: []const u8, dialect: Dialect) Error!Netlist`
-//! - `pub fn parseWith(arena: Allocator, src: []const u8, dialect: Dialect, opts: ParseOptions) Error!Netlist`
-//! - `pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist`
+//! - `pub const lines, source, expr, temper_slots`
+//! - `pub fn parse(arena: Allocator, src: []const u8) Error!Netlist`
+//! - `pub fn parseWith(arena: Allocator, src: []const u8, opts: ParseOptions) Error!Netlist`
+//! - `pub fn parseLive(arena: Allocator, src: []const u8, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist`
 //! - `pub fn parseAnalyses(arena: Allocator, text: []const u8, lookup: anytype) (Error || error{UnsupportedDirectiveMutation})![]Analysis`
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-/// Logical lines and fields per dialect, re-exported for the frontend tests.
+/// Logical lines and fields, re-exported for the frontend tests.
 pub const lines = @import("lines.zig");
-/// The Spectre statement rewrite, re-exported for the grammar oracle.
-pub const spectre_rewrite = @import("spectre.zig");
 /// Deck loading and include expansion, re-exported for the frontend tests.
 pub const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 /// The postfix `Value.expr` spans index, re-exported for the builder.
 pub const expr = @import("expr.zig");
+/// The values that read `temper`, re-exported for `prepare`.
+pub const temper_slots = @import("temper_slots.zig");
 const measure = @import("measure.zig");
 const pattern = @import("pattern.zig");
 const core = @import("core");
@@ -96,14 +96,13 @@ const reader_measures = @import("reader_measures.zig");
 const reader_nets = @import("reader_nets.zig");
 const reader_devices = @import("reader_devices.zig");
 const reader_behavioural = @import("reader_behavioural.zig");
+const reader_rcl = @import("reader_rcl.zig");
 const reader_replay = @import("reader_replay.zig");
 const appendAnalysis = reader_frame.appendAnalysis;
 const cardOf = card_table.cardOf;
 const isSn = card_table.isSn;
 const resolve = reader_frame.resolve;
 
-/// Input syntax: ngspice, HSPICE or Spectre.
-pub const Dialect = card_rows.Dialect;
 /// A net: a row of `Netlist.graph`'s vertex table.
 pub const VertexId = card_rows.VertexId;
 /// A device: a row of `Netlist.graph`'s edge table, in card order.
@@ -156,7 +155,7 @@ pub const Variation = card_rows.Variation;
 pub const Live = card_rows.Live;
 /// An analysis card. `pos`/`neg` are the output `v(a[,b])` nets, `ports` the (card_rows.zig).
 pub const Analysis = card_rows.Analysis;
-/// `.options` and single-value `.temp` cards, in deck order.
+/// `.options` and `.temp` cards, in deck order.
 pub const Config = card_rows.Config;
 /// One `.ic v(net)=value` entry on a net some card names.
 pub const Ic = card_rows.Ic;
@@ -178,9 +177,7 @@ pub const AppendModel = card_rows.AppendModel;
 pub const Netlist = netlist_view.Netlist;
 /// A site key: `owner` mixed with `salt` (splitmix64 finalizer). Stable (netlist_view.zig).
 pub const siteKey = netlist_view.siteKey;
-/// True for a name that is ground in `dialect`: only `0` in Spectre, where (netlist_view.zig).
-pub const isGround = netlist_view.isGround;
-/// True for `0`, `gnd` and `ground`, case-insensitively: ground in the (netlist_view.zig).
+/// True for `0`, `gnd` and `ground`, case-insensitively (netlist_view.zig).
 pub const isGroundName = netlist_view.isGroundName;
 /// Index of the first card name in `names` equal to `target`, byte for (netlist_view.zig).
 pub const nameIndex = netlist_view.nameIndex;
@@ -189,17 +186,17 @@ pub const isOpVar = netlist_view.isOpVar;
 /// How a parse reads its device cards (#230) (reader_frame.zig).
 pub const ParseOptions = reader_frame.ParseOptions;
 
-/// Parses `src` in `dialect` into `arena`. The result borrows `src` (paths
+/// Parses the ngspice deck `src` into `arena`. The result borrows `src` (paths
 /// and the title keep their original case) and the arena, which should be
 /// an arena: nothing is freed piecewise. Fails per `Error`; partial
 /// results stay in the arena.
-pub fn parse(arena: Allocator, src: []const u8, dialect: Dialect) Error!Netlist {
-    return parseWith(arena, src, dialect, .{});
+pub fn parse(arena: Allocator, src: []const u8) Error!Netlist {
+    return parseWith(arena, src, .{});
 }
 
 /// `parse`, reading device cards per `opts`.
-pub fn parseWith(arena: Allocator, src: []const u8, dialect: Dialect, opts: ParseOptions) Error!Netlist {
-    return parseLive(arena, src, dialect, &.{}, opts) catch |err| switch (err) {
+pub fn parseWith(arena: Allocator, src: []const u8, opts: ParseOptions) Error!Netlist {
+    return parseLive(arena, src, &.{}, opts) catch |err| switch (err) {
         error.UnknownParameter => unreachable,
         else => |e| return e,
     };
@@ -208,20 +205,18 @@ pub fn parseWith(arena: Allocator, src: []const u8, dialect: Dialect, opts: Pars
 /// `parseWith`, with the global `.param` names in `live` kept live as a
 /// swept name is (`Netlist.tunable`), so a later `setLive` can move them.
 /// `UnknownParameter` for a name no global `.param` defines.
-pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
-    return switch (dialect) {
-        inline else => |d| Reader(lines.Syntax(d)).run(arena, src, d, live, opts),
-    };
+pub fn parseLive(arena: Allocator, src: []const u8, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
+    return Reader(lines.ngspice).run(arena, src, live, opts);
 }
 
 /// Parses analysis cards appended to a built circuit, resolving nets through
 /// `lookup.node(name) u32`, which sees lowercased names. Any other line, and
-/// a single-value `.temp`, is refused with `UnsupportedDirectiveMutation`.
+/// a `.temp`, is refused with `UnsupportedDirectiveMutation`.
 /// The cards and their strings live in `arena`.
 pub fn parseAnalyses(arena: Allocator, text: []const u8, lookup: anytype) (Error || error{UnsupportedDirectiveMutation})![]Analysis {
     const lower = try arena.alloc(u8, text.len);
     _ = lines.normalize(lower, text);
-    var r: Reader(lines.ngspice) = try .init(arena, text, lower, .ngspice);
+    var r: Reader(lines.ngspice) = try .init(arena, text, lower);
     r.global_scopes = .{&r.globals};
     var src: lines.ngspice.Lines = .{ .rest = lower, .arena = arena };
     var out: std.ArrayList(Analysis) = .empty;
@@ -232,8 +227,8 @@ pub fn parseAnalyses(arena: Allocator, text: []const u8, lookup: anytype) (Error
         const card = cardOf(f.next().?[1..]) orelse return error.UnsupportedDirectiveMutation;
         if (card != .analysis) return error.UnsupportedDirectiveMutation;
         const args = try r.readArgs(&f);
-        // A single `.temp` is deck configuration, fixed at build.
-        if (card.analysis == .temp and args.len == 1) return error.UnsupportedDirectiveMutation;
+        // A `.temp` is deck configuration, fixed at build.
+        if (card.analysis == .temp) return error.UnsupportedDirectiveMutation;
         const first = out.items.len;
         // As readDirective reads a deck's card: its SWEEP tail and the line as written (#64).
         const swept = try r.readSweep(card.analysis, args);
@@ -248,7 +243,7 @@ pub fn parseAnalyses(arena: Allocator, text: []const u8, lookup: anytype) (Error
 test "measure values: empty text is a ParseError, not an index past the end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var r: Reader(lines.ngspice) = try .init(arena.allocator(), "", "", .ngspice);
+    var r: Reader(lines.ngspice) = try .init(arena.allocator(), "", "");
     r.global_scopes = .{&r.globals};
     try std.testing.expectError(error.ParseError, r.measureValue(""));
     try std.testing.expectEqual(@as(f64, 2e-3), try r.measureValue("2m"));
@@ -259,6 +254,7 @@ test {
     _ = lines;
     _ = source;
     _ = expr;
+    _ = temper_slots;
     _ = hypergraph;
     _ = card_rows;
     _ = netlist_view;
@@ -278,10 +274,10 @@ test {
     _ = reader_nets;
     _ = reader_devices;
     _ = reader_behavioural;
+    _ = reader_rcl;
     _ = reader_replay;
     _ = measure;
     _ = pattern;
-    _ = spectre_rewrite;
     _ = @import("vec.zig");
     _ = @import("tests/netlist.zig");
     _ = @import("tests/fuzz.zig");

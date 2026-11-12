@@ -2,12 +2,10 @@
 //! Out: the opcode and built-in tables every expression stage reads:
 //! `Code`, `Fn`, `Op`, the compile `Scratch`, and the built-in name maps.
 //! Cites: dev/research/ngspice-syntax.md §2.2 and ngspice xpressn.c for
-//! numparam's operators and built-ins; Star-Hspice Table 10-1 for the
-//! HSPICE dialect's sqrt, log and pow (#39).
+//! numparam's operators and built-ins.
 //!
 //! Contents:
 //! - `pub const Error = error{ OutOfMemory, ParseError }`
-//! - `pub const CompileError = Error || error{UnsupportedCard}`
 //! - `pub const none: u32`
 //! - `pub const Code = enum(u8)`
 //! - `pub const Fn = enum(u8)`
@@ -17,9 +15,9 @@
 //! - `pub fn mark(s: Scratch) Mark`
 //! - `pub fn reset(s: *Scratch, m: Mark) void`
 //! - `pub const fns: std.StaticStringMap(Fn)`
-//! - `pub const hspice_fns: std.StaticStringMap(Fn)`
 //! - `pub fn isDistributionName(name: []const u8) bool`
 //! - `pub fn isDistribution(f: Fn) bool`
+//! - `pub fn bsourceFn(f: Fn) ?Fn`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -29,10 +27,6 @@ const assert = std.debug.assert;
 /// roll it back with `Scratch.mark` and `Scratch.reset`. `fold` and `eval`
 /// fail only with `OutOfMemory`.
 pub const Error = error{ OutOfMemory, ParseError };
-/// `compile`'s errors: `UnsupportedCard` for `%` or `\` used as an operator,
-/// or a unary `!`, in a dialect without it (`S.remainder_ops`,
-/// `S.unary_not`, #203).
-pub const CompileError = Error || error{UnsupportedCard};
 /// Absent operand.
 pub const none = std.math.maxInt(u32);
 
@@ -74,19 +68,27 @@ pub const Code = enum(u8) {
     /// a: `Fn`, b: argument count.
     call,
     /// A call to a function outside `Fn`, as compiled: a is its name (an
-    /// index into `Scratch.names`), b the argument count. netlist.zig
-    /// `subst` inlines a `.func` it names and turns any other into a
-    /// `call` of `Fn.other`, so final ops never hold one.
+    /// index into `Scratch.names`), b the argument count. reader_subst.zig
+    /// `inline_` expands a `.func` it names and refuses any other, so
+    /// final ops never hold one.
     ucall,
 };
 
-/// Built-in functions; `other` is any name the table does not know. The
-/// statistical distributions `agauss`, `gauss`, `unif`, `aunif` and HSPICE's
-/// `limit(nom, var)` fold to their nominal, the first argument; a Monte Carlo
-/// trial draws them instead (`eval`). `table(x, d, x1, y1, ...)` is the
-/// smoothed transfer of an E/G TABLE or PWL(1) card, built only by the
-/// B-source tape (models/bsource.va opcode 37).
-pub const Fn = enum(u8) { sqrt, abs, min, max, pow, pwr, exp, ln, log, log10, sin, cos, tan, atan, floor, ceil, ternary, tanh, sqr, int, nint, sgn, sinh, cosh, asin, acos, asinh, acosh, atanh, agauss, gauss, unif, aunif, limit, table, other, hsqrt, hlog, hlog10, hpow };
+/// Built-in functions; a name the tables do not know compiles to `ucall`.
+/// The statistical distributions `agauss`, `gauss`, `unif`, `aunif` and
+/// numparam's `limit(nom, var)` fold to their nominal, the first argument; a
+/// Monte Carlo trial draws them instead (`eval`). `pow` is C's pow, as
+/// numparam's (xpressn.c XFU_POW), and `pwr` is |a|^b (XFU_PWR). The B
+/// parser reads its own `pow` as |a|^b and its `pwr` as sign(a)·|a|^b
+/// (`bpwr`), which `bsourceFn` maps to. `arctan` is numparam's name for
+/// `atan`, which the B parser lacks. `table(x, d, x1, y1, ...)`, an even
+/// argument count, is the smoothed transfer of an E/G TABLE card (`TABLE`
+/// in `fns`); `table(x, x1, y1, ...)`, an odd count, is the B-source
+/// `pwl`, which ngspice runs as ptfuncs.c PTpwl. Both run only on the
+/// B-source tape (models/bsource.va opcodes 37, 38). `ddt(x)` is the
+/// B-source time derivative (inpptree.c:177), which never folds
+/// (models/bsource.va opcode 40).
+pub const Fn = enum(u8) { sqrt, abs, min, max, pow, pwr, exp, ln, log, log10, sin, cos, tan, atan, floor, ceil, ternary, tanh, sqr, int, nint, sgn, sinh, cosh, asin, acos, asinh, acosh, atanh, agauss, gauss, unif, aunif, limit, table, ddt, bpwr, arctan };
 
 /// One postfix op.
 pub const Op = struct { code: Code, a: u32 = 0, b: u32 = 0 };
@@ -125,35 +127,24 @@ pub const Scratch = struct {
     }
 };
 
-/// Built-in names, lower case, to their `Fn`.
+/// Built-in names to their `Fn`: each one ngspice-44.2's numparam or B
+/// parser reads, but `TABLE`. Deck text reaches the compiler lower case
+/// (physical_lines.zig `normalize`), so no deck spells `TABLE`: only
+/// reader_behavioural.zig writes it, for an E/G TABLE card, and a deck's
+/// own `table(` is an unknown function, as ngspice-44.2 reads it.
 pub const fns = std.StaticStringMap(Fn).initComptime(.{
-    .{ "sqrt", .sqrt },           .{ "abs", .abs },     .{ "min", .min },       .{ "max", .max },
-    .{ "pow", .pow },             .{ "pwr", .pwr },     .{ "exp", .exp },       .{ "ln", .ln },
-    .{ "log", .log },             .{ "log10", .log10 }, .{ "sin", .sin },       .{ "cos", .cos },
-    .{ "tan", .tan },             .{ "atan", .atan },   .{ "floor", .floor },   .{ "ceil", .ceil },
-    .{ "ternary", .ternary },     .{ "tanh", .tanh },   .{ "agauss", .agauss }, .{ "gauss", .gauss },
-    .{ "unif", .unif },           .{ "aunif", .aunif }, .{ "limit", .limit },   .{ "table", .table },
+    .{ "sqrt", .sqrt },   .{ "abs", .abs },       .{ "min", .min },       .{ "max", .max },
+    .{ "pow", .pow },     .{ "pwr", .pwr },       .{ "exp", .exp },       .{ "ln", .ln },
+    .{ "log", .log },     .{ "log10", .log10 },   .{ "sin", .sin },       .{ "cos", .cos },
+    .{ "tan", .tan },     .{ "atan", .atan },     .{ "floor", .floor },   .{ "ceil", .ceil },
+    .{ "tanh", .tanh },   .{ "agauss", .agauss }, .{ "gauss", .gauss },   .{ "unif", .unif },
+    .{ "aunif", .aunif }, .{ "limit", .limit },   .{ "TABLE", .table },
     // numparam's other built-ins (ngspice-syntax.md §2.2, xpressn.c fmathS).
-    .{ "sqr", .sqr },             .{ "int", .int },     .{ "nint", .nint },     .{ "sgn", .sgn },
-    .{ "sinh", .sinh },           .{ "cosh", .cosh },   .{ "asin", .asin },     .{ "acos", .acos },
-    .{ "asinh", .asinh },         .{ "acosh", .acosh }, .{ "atanh", .atanh },   .{ "arctan", .atan },
-    .{ "ternary_fcn", .ternary },
+      .{ "sqr", .sqr },
+    .{ "int", .int },     .{ "nint", .nint },     .{ "sgn", .sgn },       .{ "sinh", .sinh },
+    .{ "cosh", .cosh },   .{ "asin", .asin },     .{ "acos", .acos },     .{ "asinh", .asinh },
+    .{ "acosh", .acosh }, .{ "atanh", .atanh },   .{ "arctan", .arctan }, .{ "ternary_fcn", .ternary },
 });
-
-/// The HSPICE dialect's meanings [Star-Hspice Table 10-1]: sqrt(-x) is
-/// -sqrt(x), log and log10 of -x are -log(x), and pow uses the integer
-/// part of its exponent (#39).
-pub const hspice_fns = blk: {
-    const overrides = .{ .{ "sqrt", .hsqrt }, .{ "log", .hlog }, .{ "log10", .hlog10 }, .{ "pow", .hpow } };
-    var kvs: [fns.keys().len]struct { []const u8, Fn } = undefined;
-    for (fns.keys(), fns.values(), &kvs) |k, v, *out| {
-        out.* = .{ k, v };
-        for (overrides) |o| if (std.mem.eql(u8, k, o[0])) {
-            out.* = .{ k, o[1] };
-        };
-    }
-    break :blk std.StaticStringMap(Fn).initComptime(kvs);
-};
 
 /// True when `name` (lower case) calls a function a Monte Carlo trial draws.
 pub fn isDistributionName(name: []const u8) bool {
@@ -167,4 +158,42 @@ pub fn isDistribution(f: Fn) bool {
         .agauss, .gauss, .unif, .aunif, .limit => true,
         else => false,
     };
+}
+
+/// What the B parser means by the name numparam reads as `f`: its `pow`
+/// is ptfuncs.c PTpower's |a|^b, numparam's `pwr`, and its `pwr` is
+/// PTpwr's sign(a)·|a|^b. ngspice-44.2 reads them so in a B card, an E or
+/// G VALUE and the `.func` bodies they call, and numparam's in a `.param`
+/// even where a B card reads it (src/tests/expressions.zig, measured).
+/// Null for numparam's `sqr`, `int` and `arctan`, which the B parser
+/// lacks: ngspice-44.2 stops on each there, constant or not, "no such
+/// function" (src/tests/unknown_functions.zig).
+pub fn bsourceFn(f: Fn) ?Fn {
+    return switch (f) {
+        .pow => .pwr,
+        .pwr => .bpwr,
+        .sqr, .int, .arctan => null,
+        else => f,
+    };
+}
+
+test "every built-in name a deck can spell is one ngspice-44.2 reads" {
+    // Oracle: numparam's fmathS (xpressn.c:91-95) and the B parser's funcs
+    // (inpptree.c:138-177), as src/tests/unknown_functions.zig copies them
+    // from ngspice's source. A name only ESPice reads runs a deck ngspice
+    // stops on. Red before: `table` and `ternary` were names here, which
+    // ngspice-44.2 refuses ("no such function", "Undefined parameter").
+    const ngspice = std.StaticStringMap(void).initComptime(.{
+        .{"sqr"},   .{"sqrt"}, .{"sin"},    .{"cos"},  .{"exp"},         .{"ln"},    .{"arctan"}, .{"abs"},
+        .{"pow"},   .{"pwr"},  .{"max"},    .{"min"},  .{"int"},         .{"log"},   .{"log10"},  .{"sinh"},
+        .{"cosh"},  .{"tanh"}, .{"agauss"}, .{"sgn"},  .{"ternary_fcn"}, .{"gauss"}, .{"unif"},   .{"aunif"},
+        .{"limit"}, .{"ceil"}, .{"floor"},  .{"asin"}, .{"acos"},        .{"atan"},  .{"asinh"},  .{"acosh"},
+        .{"atanh"}, .{"tan"},  .{"nint"},   .{"u"},    .{"uramp"},       .{"u2"},    .{"pwl"},    .{"eq0"},
+        .{"ne0"},   .{"gt0"},  .{"lt0"},    .{"ge0"},  .{"le0"},         .{"ddt"},
+    });
+    const gpa = std.testing.allocator;
+    var extra: std.ArrayList(u8) = .empty;
+    defer extra.deinit(gpa);
+    for (fns.keys()) |name| if (!ngspice.has(name)) try extra.print(gpa, "{s}\n", .{name});
+    try std.testing.expectEqualStrings("TABLE\n", extra.items);
 }

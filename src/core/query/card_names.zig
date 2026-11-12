@@ -8,6 +8,7 @@
 //! - `pub const CardNames = struct`, `CardNames.empty`
 //! - `CardNames.init(arena: Allocator, cards: []const CardRef) Allocator.Error!CardNames`
 //! - `CardNames.get(self: CardNames, t: DeviceType, index: u32) ?[]const u8`
+//! - `CardNames.internal(self: CardNames, t: DeviceType, index: u32) bool`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -73,6 +74,15 @@ pub const CardNames = struct {
         const name = self.names[@intCast(row)];
         return if (name.len == 0) null else name;
     }
+
+    /// Whether instance `index` of type `t` is an internal add, such as a
+    /// portnum V's z0 resistor: the table names cards, but not this one.
+    /// Such an instance publishes no row of its own (`.noise` contributions,
+    /// `.sens`), as ngspice keeps it inside its device. An empty table, which
+    /// a hand-built query carries, knows no names, so nothing is internal.
+    pub fn internal(self: CardNames, t: DeviceType, index: u32) bool {
+        return self.names.len != 0 and self.get(t, index) == null;
+    }
 };
 
 // ---- private ----
@@ -98,6 +108,22 @@ test "CardNames keys on type and index together" {
     try t.expectEqual(null, names.get(.unset, 0));
     try t.expectEqual(null, CardNames.empty.get(r, 0));
     try t.expectEqual(null, (try CardNames.init(arena.allocator(), &.{})).get(r, 0));
+}
+
+test "CardNames.internal: an instance a naming table leaves out, never one of an empty table" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const r: DeviceType = @fromBackingInt(0);
+    const v: DeviceType = @fromBackingInt(1);
+    // A portnum V's z0 is resistor 0, added before R1 (V cards go first):
+    // a gap at index 0, and past the table's last resistor.
+    const names = try CardNames.init(arena.allocator(), &.{ .{ .type = v, .index = 0, .name = "v1" }, .{ .type = r, .index = 1, .name = "r1" } });
+    try t.expect(names.internal(r, 0));
+    try t.expect(!names.internal(r, 1));
+    try t.expect(names.internal(r, 2));
+    try t.expect(!names.internal(v, 0));
+    try t.expect(!CardNames.empty.internal(r, 0));
 }
 
 test "CardNames answers as the linear scan does over a shuffled table" {

@@ -102,6 +102,7 @@ pub fn init(r: *Run, ctx: *const root.RunCtx, opts: Options) !void {
     else
         try Waveform.initStream(scratch, n_probes, ctx.stream.?);
     errdefer wf.deinit();
+    if (kept and opts.point.steps) wf.steps = .empty;
     var tangents = if (kept and opts.tangents.len != 0) try Tangents.init(ctx, opts, n_probes, scratch) else null;
     errdefer if (tangents) |*tg| tg.deinit(scratch);
     if (tangents) |*tg| if (watched and opts.point.early_stop) {
@@ -172,6 +173,7 @@ pub fn take(r: *Run, sim_ok: bool) !root.Result {
         };
     }
     const emir: @import("core").Emir = if (r.emir) |*e| try e.publish(a, ctx.circuit) else .{};
+    const steps: []const tran_types.Step = if (r.wf.steps) |s| s.items else &.{};
     const tg = if (r.tangents) |*tg| tg else {
         const res: root.Result = .{
             .plotname = plotname,
@@ -181,6 +183,7 @@ pub fn take(r: *Run, sim_ok: bool) !root.Result {
             .data = r.wf.data(),
             .measured = if (r.streamed) try r.stream.?.measured(a) else &.{},
             .emir = emir,
+            .steps = steps,
         };
         r.published = r.kept;
         return res;
@@ -198,5 +201,6 @@ pub fn take(r: *Run, sim_ok: bool) !root.Result {
         .data = r.wf.data(),
         .tangents = blocks,
         .emir = emir,
+        .steps = steps,
     };
 }

@@ -11,7 +11,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");

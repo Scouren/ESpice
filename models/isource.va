@@ -120,7 +120,7 @@ module isource(p, n);
     parameter real sffm_phasem =  0.0;  // deg  7th arg: carrier phase (see above)
     parameter real sffm_phasec =  0.0;  //      8th arg: unused by isrcload.c
 
-    // ---- AM(IA IO MF FC TD PHASEC PHASES) -----------------------------------
+    // ---- AM(IA IO MF FC TD PHASEC PHASES OFF) -------------------------------
     parameter real am_va     = 0.0;  // A    amplitude
     parameter real am_vo     = 0.0;  //      envelope offset (dimensionless)
     parameter real am_mf     = 0.0;  // Hz   modulating frequency
@@ -128,6 +128,7 @@ module isource(p, n);
     parameter real am_td     = 0.0;  // s    delay
     parameter real am_phasec = 0.0;  // deg  carrier phase
     parameter real am_phases = 0.0;  // deg  modulation phase
+    parameter real am_off    = 0.0;  // A    output offset past TD (ngspice's VO)
 
     real t, out;
     real p_tr, p_tf, p_pw, p_per, t_rel, t_mod;
@@ -252,13 +253,16 @@ module isource(p, n);
                     * exp(min(-sin_theta * t_sin, 80.0));
 
         end else if (waveform == 3) begin
-            // ---- EXP: two independent one-sided exponentials superposed on
-            // I1 (not exclusive, so TD2 < TD1 stays continuous).
+            // ---- EXP, isrcload.c:177-204: I1 up to and at TD1 (195-196),
+            // then the rise, plus the fall once past TD2 too. TD2 < TD1
+            // holds I1 to TD1 and steps there, as ngspice does.
             t_e1 = t - exp_td1;
             t_e2 = t - exp_td2;
             out = exp_v1;
-            if (t_e1 > 0.0) out = out + (exp_v2 - exp_v1) * (1.0 - exp(min(-t_e1 / max(exp_tau1, 1.0e-15), 80.0)));
-            if (t_e2 > 0.0) out = out + (exp_v1 - exp_v2) * (1.0 - exp(min(-t_e2 / max(exp_tau2, 1.0e-15), 80.0)));
+            if (t_e1 > 0.0) begin
+                out = out + (exp_v2 - exp_v1) * (1.0 - exp(min(-t_e1 / max(exp_tau1, 1.0e-15), 80.0)));
+                if (t_e2 > 0.0) out = out + (exp_v1 - exp_v2) * (1.0 - exp(min(-t_e2 / max(exp_tau2, 1.0e-15), 80.0)));
+            end
 
         end else if (waveform == 4) begin
             // ---- PWL: an empty table is the DC value (already in `out`).
@@ -316,13 +320,14 @@ module isource(p, n);
                 + fm_mdi * sin(`M_TWO_PI * sffm_fm * t + sffm_td * `M_PI / 180.0));
 
         end else if (waveform == 6) begin
-            // ---- AM: IA * (IO + sin(2*pi*MF*t + PHASES)) * sin(2*pi*FC*t + PHASEC),
-            // and 0 before TD (IO is a dimensionless envelope offset, not an
-            // output offset).
-            if (t >= am_td) begin
+            // ---- AM: OFF + IA * (IO + sin(2*pi*MF*t + PHASES)) * sin(2*pi*FC*t + PHASEC),
+            // and 0 up to and at TD (IO is a dimensionless envelope offset,
+            // OFF the output offset). ngspice is 0 at t - TD <= 0, its VO
+            // included (isrcload.c:280-286), so 0 at t = 0 even when TD = 0.
+            if (t > am_td) begin
                 am_env = am_vo + sin(`M_TWO_PI * am_mf * t + am_phases * `M_PI / 180.0);
                 am_car = sin(`M_TWO_PI * am_fc * t + am_phasec * `M_PI / 180.0);
-                out = am_va * am_env * am_car;
+                out = am_off + am_va * am_env * am_car;
             end else
                 out = 0.0;
         end

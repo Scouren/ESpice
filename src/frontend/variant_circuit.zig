@@ -69,7 +69,7 @@ pub const Kept = struct {
 /// `nl`'s live values as they stand. Caller owns the circuit and releases
 /// it with `deinit`; `scratch` holds the construction tables.
 pub fn circuitOf(lib: *const device.Library, gpa: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netlist) !device.Circuit {
-    const deck_opts = try analyses.deckOptions(nl.deck.config, nl.deck.dialect);
+    const deck_opts = try analyses.deckOptions(nl.deck.config);
     var b = try builder.Builder.init(gpa, lib);
     var compiled = false;
     errdefer if (!compiled) b.deinit();

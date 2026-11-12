@@ -242,8 +242,8 @@ fn setField(bit: *Bit, field: Field, value: []const u8) Error!void {
         },
         .vth => bit.vth = try number(value),
         .vref => bit.ref = value,
-        .out, .outz => if ((lines.hspice.parseNum(value) orelse return error.InvalidVector) != 0) return error.InvalidVector,
-        .triz => if (lines.hspice.parseNum(value) == null) return error.InvalidVector,
+        .out, .outz => if ((lines.ngspice.parseNum(value) orelse return error.InvalidVector) != 0) return error.InvalidVector,
+        .triz => if (lines.ngspice.parseNum(value) == null) return error.InvalidVector,
     }
 }
 

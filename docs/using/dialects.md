@@ -1,71 +1,79 @@
 # Dialects
 
-ESPice reads three netlist dialects. Without `--tokenizer` the CLI picks one
-from markers in the deck's own file, ngspice when none is present (see
-[`--tokenizer`](cli.md#options)); name one to be sure:
+ESPice reads one netlist dialect, ngspice's, with the HSPICE cards listed
+below that no ngspice spelling collides with. A deck in any other dialect
+(HSPICE, Spectre, LTspice, Xyce or VACASK) runs as SpiceRack's ngspice
+translation of it: the CLI hands it to `spice2rack` first and reads only
+what comes back. Without `--tokenizer` the CLI picks the dialect from
+markers in the deck's own file, ngspice when none is present (see
+[`--tokenizer`](cli.md#options)). A marker is a spelling ESPice's own
+reader refuses, and ngspice 44.2 too: Spectre's `simulator lang=` or `r1
+(a b) resistor` form, or HSPICE's `.dcvolt`, `.temperature`, `.dc ...
+START=` or a `P` card's `PORT=`. So a deck that runs as written is never
+translated, and the stderr note names the line and spelling that sent a
+deck to SpiceRack. Name the dialect to be sure:
 
 ```sh
 espice deck.sp                        # detected; ngspice without markers
-espice --tokenizer=hspice deck.sp     # or hs
+espice --tokenizer=hspice deck.sp     # or hs: translated by spice2rack
 espice --tokenizer=spectre deck.scs   # or scs
+espice --tokenizer=ngspice deck.sp    # read as written, never translated
 ```
 
-The dialect is a property of the whole run: an `.include`d file is read in
-the same dialect as the deck that includes it (a Spectre `include` picks
-Spectre or SPICE mode per file, below). All three share one card
-table, so most of the language is the same; the dialect changes how lines
-are split and a handful of meanings.
+## Other dialects: SpiceRack
 
-## At a glance
+For a deck in another dialect the CLI runs
 
-| | ngspice | HSPICE | Spectre |
-|---|---|---|---|
-| First line | title | title | title |
-| Case | ignored | ignored | kept |
-| Statements | SPICE cards | SPICE cards | Spectre statements; SPICE cards after `simulator lang=spice` |
-| Line comment | `*`, `#`, `$` or `;` at line start, or a line holding only a `//` comment | `*` or `$` at line start | `*` in the first column, or a `//` line |
-| Inline comment | `;` or `//` anywhere; `$` after a blank or comma | `$` after a blank, a comma or a number | `//` |
-| Continuation | `+` on the next line; `\\` at line end joins with no blank | `+` on the next line; ` \` at line end, or `\\` to join with no blank | `+` on the next line, or `\` at line end |
-| Quotes | `'...'` and `"..."` keep comment characters | `'...'` and `"..."` keep `$` | `"..."` strings |
-| Expressions | `{...}`, `'...'` or a bare parameter name | `'...'`, a bare parameter name, or after `key=` an unquoted one that starts with a letter and holds no blank (`w=l*2`); braces are name bytes, as in HSPICE, so `{...}` is no expression, and a behavioural (`VOL=`, `TABLE`) or `.meas` card holding one is refused | bare (`r=2*a`) |
-| `M` / `m` suffix | milli, either case | milli, either case | `M` mega, `m` milli |
-| `x` suffix | none | mega | none |
-| Includes, `.alter` | `.include`, `.lib`, `.alter` | `.include`, `.lib`, `.alter` | `include "f" [section=s]`; no `.alter` |
-| Default TNOM, circuit temperature | 27 °C, 27 °C | 25 °C, run at TNOM | 27 °C, 27 °C |
+```sh
+spice2rack --dialect <d> --to espice --kit -o <dir> <deck>
+```
 
-The ngspice and HSPICE suffix tables are `t g meg k m mil u n p f a`
-(case-insensitive), and `d` works as an exponent (`1d-3`). HSPICE forbids
-an exponent and a suffix in one number, so an HSPICE deck that writes
-`1e-6u` is refused; ngspice reads it as 1e-12. Spectre's are case-sensitive: `P` (peta), `T`, `G`,
-`M` (mega), `K` or `k`, `m` (milli), `u`, `n`, `p`, `f`, `a` (atto), and
-`%` or `c` for 10^-2.
+into a fresh directory under `$TMPDIR` (else `/tmp`). The kit holds the
+translated deck and a translated copy of every file it reaches, in their
+relative layout, with every `.include` and `.lib` path rewritten to an
+absolute path into the kit (an absolute PDK path is mirrored under it).
+ESPice reads the entry SpiceRack prints, so each include resolves to its
+copy and never to a file of the same name in the working directory, and
+deletes the directory when the deck ends. Output paths (`-r`, `.stim`
+files, `--measures=FILE`) stay relative to the working directory.
 
-## ngspice
+The binary is `--spicerack=PATH`, else `$ESPICE_SPICERACK`, else
+`spice2rack` on `PATH`. SpiceRack is installed separately: the flake does
+not ship it until a SpiceRack release with `--to espice --kit` is pinned.
 
-The default dialect follows ngspice 45, including the conveniences the
-open PDKs (sky130, GF180, IHP SG13G2) are written against:
+SpiceRack's notes pass through on stderr as it wrote them, and two lines
+there keep its time apart from ESPice's:
 
-- `.endl` closes the open `.lib` section whatever name follows it.
-- `.if` / `.elseif` / `.else` / `.endif` keep the first branch whose
-  condition is nonzero.
-- `.model <name> psp103va` (the OSDI module name) selects the built-in PSP
-  103.
-- An R card whose braced value reads `v(`, `i(`, `time`, `temper` or
-  `hertz` becomes a behavioural B source, as ngspice's `inp_compat` does.
-- `x^y`, `x**y` and `pow(x, y)` use |x|^y in both `.param` expressions
-  and B sources, including integer exponents, as ngspice 45 does by default.
-  `pwr(x, y)` folds to |x|^y for constant arguments; a B source using
-  `pwr` with a probe is currently refused.
-- `.option seed=N` without a Monte Carlo sweep draws the statistical
-  functions once from the seed, instead of folding them to their nominal.
-- Unknown `.option` names are ignored with one warning each.
+```text
+espice: spicerack translated <deck> (<d> -> ngspice, <n> files) in <s> s
+espice: finished <deck> in <s> s, plus <s> s in spicerack
+```
 
-The sky130 PDK decks run as written.
+A deck SpiceRack refuses or cannot translate stops with `SpiceRackFailed`,
+`SpiceRackNotFound` or `SpiceRackNoEntry` (see
+[Diagnostics](diagnostics.md)); it is never read as ngspice instead. A deck
+in another dialect is read from a file: one through a pipe or FIFO is
+refused with `SpiceRackNeedsFile`, as spice2rack would read it empty.
+spice2rack gets the deck's real path, so `espice --tokenizer=hspice
+/dev/stdin < deck.sp` translates `deck.sp` itself, includes and all.
 
-## HSPICE
+Every difference between ngspice and another dialect is SpiceRack's to
+translate: HSPICE's TNOM of 25 °C, `.temp` lists, multi-segment `.tran`,
+untyped `.measure` cards and TARG's inherited `TD`, its `P` port, its
+include search order and `.option search`, its signed
+`sqrt`, `log`, `log10` and `pow`, the `x` (mega) suffix, the `SFFM` and
+`AM` argument orders, `$` comments and ` \` continuations, and its other
+spellings of ngspice cards (`.temperature`, `.dcvolt` and bare `.ic` /
+`.nodeset` pairs, `.dc src START= STOP= STEP=`, `.noise v(out) src` and
+`.pz v(out) src` without a grid or ports, and the option names `gmindc`,
+`absv`, `relv`, `absi` and `method=bdf`); Spectre's
+statements, its case-sensitive names and `name:param` operating-point
+variables. The library reads ngspice only: the C API refuses any other
+`dialect` with `UnsupportedDialect` ([The C API](../embed/c-api.md)), and
+the Zig `Options` has none.
 
-A small HSPICE deck: parameters used bare, `PULSE` without parentheses, an
-untyped `.measure` and an `.alter` run:
+A small HSPICE deck, with parameters used bare, `PULSE` without
+parentheses, an untyped `.measure` and an `.alter` run:
 
 ```text
 --8<-- "examples/hspice_alter.sp"
@@ -89,28 +97,47 @@ RC step response in the HSPICE dialect: 3 devices
 ```
 
 The `.alter` run doubles R, and the 50 % crossing moves from RC ln 2 =
-1.39 ns to 2.77 ns.
+1.39 ns to 2.77 ns. A Spectre netlist runs the same way:
 
-`--tokenizer=hspice` changes the line syntax (above) and these meanings:
+```text
+--8<-- "examples/spectre_rc.scs"
+```
 
-| Input | HSPICE dialect | ngspice dialect |
-|---|---|---|
-| no `.option tnom`, no `.temp` | TNOM 25 °C, circuit at TNOM | 27 °C both |
-| `.temp t1 t2 t3 ...` | every analysis once per temperature, plots named `<plot> (temp=t)` | three numbers: a DC temperature sweep |
-| `.tran s1 t1 s2 t2 ...` | one run to the last stop | `tstep tstop tstart tmax` |
-| untyped `.measure name func ...` | measures the last `.tran`, `.ac` or `.dc` card | rejected |
-| TARG without `TD=` in `.measure` | inherits TRIG's `TD` | `TD=0` |
-| `.save [TYPE=NODESET\|IC] [FILE=] [LEVEL=] [TIME=]` | writes the operating point as `.nodeset` (or `.ic`) cards | output vector selection |
-| `SFFM(vo va fc mdi fs)` | HSPICE's argument order | ngspice's `(vo va fm mdi fc)` |
-| `AM(...)` | `(va vo mf fc td)` | ngspice's `(vo vmo vma fm fc td phasem phasec)` |
-| `sqrt(-x)`, `log(-x)`, `log10(-x)`, `pow(x, y)` | `-sqrt(x)`, `-log(x)`, `-log10(x)`, x to the integer part of y | NaN, NaN, NaN, \|x\|^y |
-| `P` element | a port: a V card numbered for `.lin` (`P1 in 0 port=1 z0=50`) | a coupled transmission line (CPL) |
-| `S` element | an S-parameter block from Touchstone or CITI data | voltage-controlled switch |
-| `W` element | a W-element lossy line from an RLGC file or table | current-controlled switch |
-| `B`, `U` elements | refused (IBIS buffers, lumped lines) | B source, URC line |
+```sh
+espice --tokenizer=spectre spectre_rc.scs
+```
 
-HSPICE features that ESPice reads in every dialect, because none of them
-collides with an ngspice spelling:
+## ngspice
+
+The dialect follows ngspice 45, including the conveniences the open PDKs
+(sky130, GF180, IHP SG13G2) are written against:
+
+- `.endl` closes the open `.lib` section whatever name follows it.
+- `.if` / `.elseif` / `.else` / `.endif` keep the first branch whose
+  condition is nonzero.
+- `.model <name> psp103va` (the OSDI module name) selects the built-in PSP
+  103.
+- An R card whose braced value reads `v(`, `i(`, `time`, `temper` or
+  `hertz` becomes a behavioural B source, as ngspice's `inp_compat` does.
+- `x^y` and `x**y` are |x|^y everywhere, integer exponents included.
+  `pow(x, y)` is C's pow in a `.param` or a value (`pow(-2,3)` is -8, and
+  a card that reads a negative base to a fractional power fails the deck)
+  and |x|^y in a B, E or G expression; `pwr(x, y)` is |x|^y in a `.param`
+  or a value and sign(x)·|x|^y in a B, E or G expression. A `.param` keeps its meaning where a B source
+  reads it, and a `.func` body takes its caller's, as in ngspice 44.2 and
+  45 (measured).
+- `.option seed=N` without a Monte Carlo sweep draws the statistical
+  functions once from the seed, instead of folding them to their nominal.
+- Unknown `.option` names are ignored with one warning each.
+
+The sky130 PDK decks run as written. The suffix table is `t g meg k m mil
+u n p f a` (case-insensitive), and `d` works as an exponent (`1d-3`).
+
+## HSPICE cards ESPice reads as written
+
+These HSPICE features are part of ESPice's own dialect, because none of
+them collides with an ngspice spelling. The CLI reads a deck that uses
+them as written; `--tokenizer=hspice` sends it through SpiceRack instead.
 
 - **Runs and sweeps:** `.alter` blocks (cumulative, one run each, plots
   named `(alter=n)`); `.data` tables with `SWEEP DATA=name`; `SWEEP
@@ -121,7 +148,7 @@ collides with an ngspice spelling:
   `.net`, `.sn`/`.snac`/`.snxf`/`.snnoise`/`.snosc`, `.hb TONES= NHARMS=`,
   `.hbosc`, `.hbac`, `.hbxf`, `.hbnoise`, `.hblin`, `.phasenoise`,
   `.acphasenoise`, `.ptdnoise`, `.lstb`, `.dcmatch`, `.acmatch`,
-  `.dcsens`, `.trannoise`, `.pz v(out) src`, `.noise v(out) src [inter]`.
+  `.dcsens`, `.trannoise`.
 - **Measurements:** `INTEGRAL`, `DERIVATIVE`, `ERR`, `ERR1`-`ERR3`, `PARAM=`,
   `TRAN_CONT`/`AC_CONT`/`DC_CONT`, `EM_AVG`, `par('expr')`, values that name
   earlier results, `TD=TRIG`, and measures of FFT, LSTB, DCMATCH, ACMATCH,
@@ -134,58 +161,15 @@ collides with an ngspice spelling:
   `.dout`, `.biaschk`, `.power`, `.stim`.
 - **Statistics:** `agauss`, `gauss`, `aunif`, `unif`, `limit`; `DEV` and
   `LOT` tolerances on `.model` values; the `.variation` block.
-- **Other:** `.load` (inline a saved `.ic`/`.nodeset` file), `.option
-  search='dir'`, `.connect`, `.global`, `.mosra` and `.appendmodel`
-  (reliability aging), `.sample`, `.option runlvl|accurate|fast`,
-  `gmindc`, `absv`, `relv`, `absi`, `method=bdf`.
+- **Other:** `.load` (inline a saved `.ic`/`.nodeset` file), `.save
+  TYPE=IC|NODESET [FILE=] [LEVEL=] [TIME=]` (write the operating point:
+  a `.save` with one of these keys, as ngspice's vector list never has
+  one), `.connect`, `.global`, `.mosra` and `.appendmodel`
+  (reliability aging), `.sample`, `.option runlvl|accurate|fast`.
 
-## Spectre
-
-`--tokenizer=spectre` reads Spectre netlists: the first line is the title
-and case is kept (`R1` and `r1` are different elements). ESPice reads each
-Spectre statement as the SPICE card it stands for, so a Spectre deck and its
-SPICE counterpart build the same circuit. It reads:
-
-- instances, `name (nodes) master key=value ...` (parentheses optional),
-  of the primitives (`resistor`, `capacitor`, `inductor`, `vsource`,
-  `isource`, `vcvs`, `vccs`, `ccvs`, `cccs`, `mutual_inductor`, `iprobe`,
-  `bsource`, ...), of models, of subcircuits and of `ahdl_include`d
-  Verilog-A modules;
-- `parameters`, `model` (with `{ 1: ... 2: ... }` bin groups), `subckt` /
-  `inline subckt` ... `ends`, `real f(real a) { return ... }`, `if` /
-  `else`, `global`, `ic`, `nodeset`, `save`, `options`;
-- `include "file" [section=name]`: a `.scs` file, or one opening with
-  `simulator lang=spectre`, reads as Spectre, any other as SPICE, and the
-  includer's mode resumes after it;
-- `simulator lang=spice` ... `simulator lang=spectre`: SPICE cards with
-  HSPICE's line rules;
-- the `tran`, `dc`, `ac` and `noise` analyses. `tran` reads `stop`,
-  `step`, `start`, `maxstep`, `method` (`euler`, `trap`, `traponly`,
-  `gear2`, `gear2only`; it sets the deck's `.options method`, so it applies
-  to every transient), `skipdc=yes|no` (`yes` starts from the `ic`
-  statements, as SPICE's `uic`) and `errpreset=moderate` (the default).
-
-Refused with `UnsupportedCard`: the other analyses (`pss`, `hb`, `sweep`,
-`montecarlo`, ...), any other `tran` parameter or value (named in the
-error, such as `errpreset=conservative` or `method=trapgear2`), child statements in an analysis's `{ }`, `alter`,
-`altergroup`, `paramset`, `atan2`, the bitwise operators, and an
-`inst:terminal` signal in `ic` or `nodeset`. `statistics` blocks are read
-and set aside with a warning; `info`, `set`, `shell`, `check`, `checklimit`,
-`assert` and `paramtest` are accepted and ignored. `/* ... */` is not a
-comment in Spectre.
-
-```text
---8<-- "examples/spectre_rc.scs"
-```
-
-```sh
-espice --tokenizer=spectre spectre_rc.scs
-```
-
-```text
-// RC low-pass in Spectre syntax: the first line is the title: 3 devices
-  AC Analysis: 51 points, 4 variables
-```
+These follow the HSPICE manuals; most have not been run against HSPICE
+itself, so treat an HSPICE-only result with the same care as any new
+simulator's.
 
 ## What is not supported, or differs
 
@@ -204,13 +188,11 @@ anyway.
 | URC model with `K <= 0` or `K = 1` | NaN or meaningless ladder | `InvalidParameterValue` |
 | URC card without `l=` | zero length | unit length |
 | Verilog-A `$simparam("gmin")` during gmin stepping | the deck gmin | the stepped gmin |
-| `.options vpi="app.so"` (Spectre: `options vpi="app.so"`) | not an option | ESPice's own: loads a VPI application, as `--vpi` does; see [VPI applications](devices.md#vpi-applications) |
-| a `.temp` list and a single `.temp` in one deck | no list form | the last card wins |
+| `.options vpi="app.so"` | not an option | ESPice's own: loads a VPI application, as `--vpi` does; see [VPI applications](devices.md#vpi-applications) |
 | `.ic` with `.tran` but without `uic` | held during the transient's operating point | used only under `uic` |
 | `.store` | checkpoints the process | warning; no checkpoint written |
 | `.powerdc` | per-instance port currents | refused |
 | `.connect` inside a subcircuit | joins nets | refused (top level only) |
-| `.option search` on a `+` continuation line | read | missed: only the first physical line is read |
 | a `.param` or `.model` inside a subcircuit's `.if` | conditional | applies unconditionally |
 | `PAT` Z states, K-strings, `R=-1`, LFSR; `.vec` bidirectional signals, Z/L/H inputs | supported | refused |
 | PWL with `r=` past 64 points | repeats | refused |
@@ -220,7 +202,3 @@ anyway.
 | `.measure ERR3` | the manual gives no reduction | RMS, as `ERR1` |
 | `.meas` with `-r` in batch mode | ngspice refuses | always evaluated and printed |
 | HSPICE `.mt0`, `.ic0` listings, `.err` files | written | not written; results print on stdout |
-
-The HSPICE features above follow the HSPICE manuals; most have not been
-run against HSPICE itself, so treat an HSPICE-only result with the same
-care as any new simulator's.

@@ -4,7 +4,7 @@
 //!
 //! Contents:
 //! - `pub const Wave`
-//! - `pub fn refuseUnknownWave(dev: Device) error{UnsupportedCard}!void`
+//! - `pub fn refuseUnknownKey(dev: Device) error{UnsupportedCard}!void`
 //! - `pub fn waveKind(name: []const u8) ?Wave`
 //! - `pub fn pwlSlot(comptime base: []const u8, comptime k: usize) []const u8`
 //! - `pub fn pwlCapacity(comptime T: type) usize`
@@ -17,6 +17,7 @@
 //! - `pub fn dcFromWaveform(target: anytype) void`
 
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("core");
 const requests = core.query;
 const numerics = core.numerics;
@@ -50,28 +51,51 @@ pub const Wave = enum(u8) { pulse = 1, sin = 2, exp = 3, pwl = 4, sffm = 5, am =
 /// `[start, end)` that spells it (one group, or a keyword and its numbers).
 const WaveAt = struct { kind: Wave, args: []const Value, start: usize, end: usize };
 
-/// Source waveforms ngspice or HSPICE define that the source models do not
-/// draw. A card naming one is refused rather than run as its DC value
-/// (#72), and so is HSPICE's `PWL FILE=`.
-/// ponytail: refused, not drawn; TRNOISE/TRRANDOM need ngspice's noise
-/// generator per source and breakpoints at each sample.
-pub fn refuseUnknownWave(dev: Device) error{UnsupportedCard}!void {
-    const unknown = std.StaticStringMap(void).initComptime(.{ .{"trnoise"}, .{"trrandom"}, .{"lfsr"}, .{"hb"} });
-    var buf: [8]u8 = undefined;
+/// The cards a source word belongs on: vsrc.c's and isrc.c's input
+/// parameters (IP, IOP), and ESPice's `hblin_h`, `hblin_s`.
+const Takes = enum { v, i, both };
+const source_keys = std.StaticStringMap(Takes).initComptime(.{
+    .{ "dc", .both },       .{ "ac", .both },      .{ "acmag", .both },   .{ "acphase", .both },
+    .{ "pulse", .both },    .{ "sin", .both },     .{ "sine", .both },    .{ "exp", .both },
+    .{ "pwl", .both },      .{ "sffm", .both },    .{ "am", .both },      .{ "trnoise", .both },
+    .{ "trrandom", .both }, .{ "distof1", .both }, .{ "distof2", .both }, .{ "r", .v },
+    .{ "td", .v },          .{ "portnum", .v },    .{ "z0", .v },         .{ "pwr", .v },
+    .{ "freq", .v },        .{ "phase", .v },      .{ "hblin_h", .v },    .{ "hblin_s", .v },
+    .{ "c", .i },           .{ "m", .i },
+});
+
+/// Refuses a V or I card word that ngspice-44.2's source tables (vsrc.c,
+/// isrc.c) do not take, as ngspice stops on it ("unknown parameter
+/// (zork)"), where ESPice ran without it or bound the model field of that
+/// name (`pulse_v1=2`); ESPice's own `hblin_h=` and `hblin_s=` stay. Also
+/// refused: TRNOISE and TRRANDOM, which ngspice draws and the source
+/// models do not (#72), a port's `pwr` drive, and a DC value given both as
+/// `DC v` and `dc=v` (or I's `c=v`), whose order the parser does not keep
+/// and ngspice's last-wins rule needs (`net_cards.sourceDc`).
+/// ponytail: TRNOISE/TRRANDOM refused, not drawn; they need ngspice's
+/// noise generator per source and breakpoints at each sample.
+pub fn refuseUnknownKey(dev: Device) error{UnsupportedCard}!void {
+    assert(dev.kind == 'v' or dev.kind == 'i');
+    const letter: Takes = if (dev.kind == 'i') .i else .v;
+    var dc_word = false;
+    var dc_key = false;
     for (dev.positional) |v| {
         const name = switch (v) {
             .group => |g| g.name(),
             .name => |n| n,
-            else => continue, // else: numbers and expressions name no waveform
+            else => continue, // else: numbers and expressions name no key
         };
-        if (name.len > buf.len or !unknown.has(std.ascii.lowerString(&buf, name))) continue;
-        if (!@import("builtin").is_test) std.log.err("{s}: the {s} source waveform is not supported", .{ dev.name, name });
+        try refuseKey(dev, letter, name);
+        dc_word = dc_word or std.ascii.eqlIgnoreCase(name, "dc");
+    }
+    for (dev.kv) |item| {
+        try refuseKey(dev, letter, item.key);
+        dc_key = dc_key or std.ascii.eqlIgnoreCase(item.key, "dc") or std.ascii.eqlIgnoreCase(item.key, "c");
+    }
+    if (dc_word and dc_key) {
+        if (!@import("builtin").is_test) std.log.err("{s}: a DC value given both as `dc v` and `dc=v`", .{dev.name});
         return error.UnsupportedCard;
     }
-    for (dev.kv) |item| if (std.ascii.eqlIgnoreCase(item.key, "file")) {
-        if (!@import("builtin").is_test) std.log.err("{s}: a PWL FILE= source is not supported", .{dev.name});
-        return error.UnsupportedCard;
-    };
 }
 
 /// The waveform a source keyword names, case-insensitively.
@@ -241,6 +265,25 @@ pub fn dcFromWaveform(target: anytype) void {
 
 // ---- private ----
 
+/// Refuses `word` unless `source_keys` lists it for a card of `letter`,
+/// and refuses the listed words ESPice does not run.
+fn refuseKey(dev: Device, letter: Takes, word: []const u8) error{UnsupportedCard}!void {
+    var buf: [16]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..@min(word.len, buf.len)], word[0..@min(word.len, buf.len)]);
+    const takes = if (word.len > buf.len) null else source_keys.get(lower);
+    const known = takes != null and (takes.? == .both or takes.? == letter);
+    const why: []const u8 = if (!known)
+        "unknown parameter, as in ngspice-44.2"
+    else if (std.mem.eql(u8, lower, "trnoise") or std.mem.eql(u8, lower, "trrandom"))
+        "a source waveform ESPice does not draw"
+    else if (std.mem.eql(u8, lower, "pwr"))
+        "a port's pwr drive is not supported"
+    else
+        return;
+    if (!@import("builtin").is_test) std.log.err("{s}: {s}: {s}", .{ dev.name, word, why });
+    return error.UnsupportedCard;
+}
+
 fn applyWaveArgs(comptime T: type, target: anytype, kind: Wave, args: []const Value) void {
     target.waveform = @backingInt(kind);
     switch (kind) {
@@ -296,6 +339,18 @@ fn fieldPairs(comptime w: Wave) []const []const u8 {
         .pwl => &.{},
         // ngspice 44 order (vsrcload.c:235-249): FM third, FC fifth.
         .sffm => &.{ "sffm_vo", "sffm_vo", "sffm_va", "sffm_va", "sffm_fm", "sffm_fm", "sffm_mdi", "sffm_mdi", "sffm_fc", "sffm_fc", "sffm_td", "sffm_td", "sffm_phasem", "sffm_phasem", "sffm_phasec", "sffm_phasec" },
-        .am => &.{ "am_va", "am_va", "am_vo", "am_vo", "am_mf", "am_mf", "am_fc", "am_fc", "am_td", "am_td", "am_phasec", "am_phasec", "am_phases", "am_phases" },
+        .am => &.{ "am_va", "am_va", "am_vo", "am_vo", "am_mf", "am_mf", "am_fc", "am_fc", "am_td", "am_td", "am_phasec", "am_phasec", "am_phases", "am_phases", "am_off", "am_off" },
     };
+}
+
+// Oracle: tests/source_class.zig's waveform list, one ngspice deck per name
+// (tran/source_t0_<name>.sp). A waveform the reader learns fails here until
+// it joins that list, and there until its deck exists.
+test "every waveform the source models draw is in the t = 0 class list" {
+    const class = [_][]const u8{ "am", "exp", "pulse", "pwl", "sffm", "sin", "trnoise", "trrandom" };
+    for (std.enums.values(Wave)) |w| {
+        for (class) |name| {
+            if (std.mem.eql(u8, name, @tagName(w))) break;
+        } else return error.WaveformMissingFromClass;
+    }
 }

@@ -26,6 +26,7 @@ module mos1(d, g, s, b);
 
     // ---- channel (Shichman-Hodges) --------------------------------------
     parameter real    vto    = 0.0;                  // zero-bias threshold [V]
+    aliasparam vt0 = vto;                    // ngspice mos1.c:119 IOPR spelling
     parameter real    kp     = 2.0e-5;               // transconductance [A/V^2]
     parameter real    gamma  = 0.0;                  // body effect [sqrt(V)]
     parameter real    phi    = 0.6 from (0:inf);     // surface potential [V]

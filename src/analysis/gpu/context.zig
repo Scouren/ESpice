@@ -441,7 +441,8 @@ pub const GpuContext = struct {
                 n_cpu += 1;
                 continue;
             }
-            const up = try ctx_batch.loadBatch(gpa, &batches[n_up], b, explicit, report, knobs);
+            // Lever p1: a batch without a model row stays on the host.
+            const up = if (!explicit and knobs.perf.p1 and ctx_cost.unpriced(machine.?, b)) false else try ctx_batch.loadBatch(gpa, &batches[n_up], b, explicit, report, knobs);
             if (!up) {
                 cpu_batches[n_cpu] = b;
                 n_cpu += 1;
@@ -589,7 +590,7 @@ pub const GpuContext = struct {
             .prof = .{ .on = knobs.gpu_stats != .off, .phases = knobs.gpu_stats == .phases },
             .fuse = !knobs.gpu_nofuse,
             .lu_check = knobs.gpu_lu_check,
-            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs } else ctx_cost.CostCache.learn(host, threads, evals, knobs),
+            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs, .demote = !knobs.perf.p1 } else ctx_cost.CostCache.learn(host, threads, evals, knobs),
             .placed = placed,
         };
         if (driver) |d| d.up.store(true, .monotonic);

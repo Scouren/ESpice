@@ -1,5 +1,5 @@
-//! Expression text to postfix. In: expression text in one dialect `S`
-//! (lines.zig's ngspice, hspice or spectre). Out: `Op` rows, constants and
+//! Expression text to postfix. In: expression text in ngspice's syntax `S`
+//! (lines.zig `ngspice`). Out: `Op` rows, constants and
 //! names appended to a `Scratch`; names and probe arguments stay indices
 //! into `Scratch.names` until netlist.zig `subst` splices parameters in.
 //! A recursive-descent parser bounded by `max_depth`.
@@ -7,17 +7,16 @@
 //!
 //! Contents:
 //! - `pub const max_depth = 512`
-//! - `pub fn compile(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8, pos: usize) CompileError!usize`
-//! - `pub fn compileAll(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8) CompileError!void`
+//! - `pub fn compile(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8, pos: usize) Error!usize`
+//! - `pub fn compileAll(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8) Error!void`
 //! - `pub fn numberLen(text: []const u8) usize`
 //! - `pub fn isOperator(c: u8) bool`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const lines = @import("lines.zig");
 const expr_ops = @import("expr_ops.zig");
-const CompileError = expr_ops.CompileError;
+const Error = expr_ops.Error;
 const Scratch = expr_ops.Scratch;
 const Op = expr_ops.Op;
 const Code = expr_ops.Code;
@@ -32,10 +31,15 @@ pub const max_depth = 512;
 /// Compiles the expression starting at `text[pos]` into `s` and returns
 /// where it ends. Grammar: ternary `?:` loosest, then `||`, `&&`,
 /// comparisons, `+ -`, `* /`, `^`/`**` (all left associative); unary `-`/`+`
-/// bind below power. Nesting deeper than `max_depth` is a ParseError;
-/// `%` or `\` after an operand, where `S.remainder_ops` lacks it, is
-/// `UnsupportedCard`. Invalidates slices of `s`'s tables, which grow in `gpa`.
-pub fn compile(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8, pos: usize) CompileError!usize {
+/// bind below power; `%` and `\` are numparam's remainder and integer
+/// division. A single `|` or `&`, and a unary `~`, are PSPICE's, which
+/// plain ngspice-44.2 refuses ("Syntax error"): a ParseError, as is a `{`
+/// inside the text, which ngspice reads three ways (a syntax error in a
+/// `.param`, stripped as text in a B, E or G expression and a `.func`
+/// body, a group in a value only while the deck has a `.param`;
+/// src/tests/expressions.zig), and nesting deeper than `max_depth`.
+/// Invalidates slices of `s`'s tables, which grow in `gpa`.
+pub fn compile(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8, pos: usize) Error!usize {
     var p: Compiler(S) = .{ .text = text, .pos = pos, .gpa = gpa, .s = s };
     try p.bin(0);
     assert(p.pos >= pos);
@@ -45,7 +49,7 @@ pub fn compile(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8, 
 
 /// `compile` over the whole of `text`; trailing input is a ParseError.
 /// Invalidates slices of `s`'s tables, which grow in `gpa`.
-pub fn compileAll(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8) CompileError!void {
+pub fn compileAll(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u8) Error!void {
     var p: Compiler(S) = .{ .text = text, .gpa = gpa, .s = s };
     try p.bin(0);
     assert(p.depth == 0);
@@ -54,7 +58,7 @@ pub fn compileAll(comptime S: type, gpa: Allocator, s: *Scratch, text: []const u
 
 /// Length of the number literal `text` starts with: digits and dots, an
 /// exponent, then a letter suffix (`2.5e-3`, `10meg`). `E` is an exponent
-/// too, as `lines.zig` reads it, for Spectre's case-kept text.
+/// too, as `lines.zig` reads it.
 pub fn numberLen(text: []const u8) usize {
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
@@ -75,8 +79,7 @@ pub fn numberLen(text: []const u8) usize {
 }
 
 /// A byte that continues an expression after an operand: the binary and
-/// ternary operator bytes, `%` and `\` included. `compile` reads those two
-/// where the dialect has them and refuses them elsewhere (#203).
+/// ternary operator bytes, numparam's `%` and `\` included.
 pub fn isOperator(c: u8) bool {
     return switch (c) {
         '|', '&', '<', '>', '=', '!', '+', '-', '*', '/', '%', '\\', '^', '?' => true,
@@ -101,16 +104,16 @@ fn Compiler(comptime S: type) type {
             return if (p.pos < p.text.len) p.text[p.pos] else null;
         }
 
-        fn emit(p: *P, op: Op) CompileError!void {
+        fn emit(p: *P, op: Op) Error!void {
             try p.s.ops.append(p.gpa, op);
         }
 
-        fn name(p: *P, n: []const u8) CompileError!u32 {
+        fn name(p: *P, n: []const u8) Error!u32 {
             try p.s.names.append(p.gpa, n);
             return @intCast(p.s.names.items.len - 1);
         }
 
-        fn bin(p: *P, min_prec: u8) CompileError!void {
+        fn bin(p: *P, min_prec: u8) Error!void {
             if (p.depth == max_depth) return error.ParseError;
             p.depth += 1;
             defer p.depth -= 1;
@@ -126,9 +129,6 @@ fn Compiler(comptime S: type) type {
                     try p.emit(.{ .code = .call, .a = @backingInt(Fn.ternary), .b = 3 });
                     continue;
                 }
-                // A dialect without `%` or `\` refuses the deck by name
-                // rather than end the expression before it (#203).
-                if ((c == '%' or c == '\\') and std.mem.indexOfScalar(u8, S.remainder_ops, c) == null) return error.UnsupportedCard;
                 const power = c == '*' and p.pos + 1 < p.text.len and p.text[p.pos + 1] == '*';
                 const prec: u8 = switch (c) {
                     '|' => 1,
@@ -174,14 +174,13 @@ fn Compiler(comptime S: type) type {
                     }
                 }
                 try p.bin(prec + 1);
-                // `b` marks an HSPICE power, which `fold` reads its own way.
-                try p.emit(.{ .code = code, .b = @intFromBool(code == .pow and S == lines.hspice) });
+                try p.emit(.{ .code = code });
             }
         }
 
         // Every recursion passes through `bin` or `unary`, so the guard in
         // both bounds them all.
-        fn unary(p: *P) CompileError!void {
+        fn unary(p: *P) Error!void {
             if (p.depth == max_depth) return error.ParseError;
             p.depth += 1;
             defer p.depth -= 1;
@@ -197,8 +196,6 @@ fn Compiler(comptime S: type) type {
                     try p.bin(6);
                 },
                 '!' => {
-                    // HSPICE has no unary `!` (#203).
-                    if (!S.unary_not) return error.UnsupportedCard;
                     p.pos += 1;
                     try p.unary();
                     try p.emit(.{ .code = .not });
@@ -209,7 +206,7 @@ fn Compiler(comptime S: type) type {
 
         /// A probe argument: up to `,` `)` or a blank, kept as a name (node
         /// `10` is a node, and a node `1n` must not read as 1e-9).
-        fn nodeArg(p: *P) CompileError![]const u8 {
+        fn nodeArg(p: *P) Error![]const u8 {
             _ = p.peek();
             const start = p.pos;
             while (p.pos < p.text.len) : (p.pos += 1) {
@@ -220,12 +217,13 @@ fn Compiler(comptime S: type) type {
             return p.text[start..p.pos];
         }
 
-        fn atom(p: *P) CompileError!void {
+        fn atom(p: *P) Error!void {
             const c = p.peek() orelse return error.ParseError;
             if (c == '"' or c == '\'' or c == '(') {
                 p.pos += 1;
                 try p.bin(0);
-                if (p.peek() != if (c == '(') ')' else c) return error.ParseError;
+                const close: u8 = if (c == '(') ')' else c;
+                if (p.peek() != close) return error.ParseError;
                 p.pos += 1;
                 return;
             }
@@ -264,8 +262,9 @@ fn Compiler(comptime S: type) type {
             if (p.peek() != ')') return error.ParseError;
             p.pos += 1;
             if (probe) |code| return p.emit(.{ .code = code, .a = args[0], .b = args[1] });
-            const table = if (S == lines.hspice) expr_ops.hspice_fns else expr_ops.fns;
-            if (table.get(word)) |f| return p.emit(.{ .code = .call, .a = @backingInt(f), .b = argc });
+            // numparam's `limit` takes two arguments; any other count goes
+            // to reader_subst.zig `inline_`, which refuses PSPICE's clamp.
+            if (expr_ops.fns.get(word)) |f| if (f != .limit or argc == 2) return p.emit(.{ .code = .call, .a = @backingInt(f), .b = argc });
             try p.emit(.{ .code = .ucall, .a = try p.name(word), .b = argc });
         }
     };

@@ -12,8 +12,6 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -41,6 +39,28 @@ pub fn Methods(comptime S: type) type {
         const R = reader.Reader(S);
         const Binding = R.Binding;
         const find = R.find;
+
+        /// Functions ngspice defines outside numparam, as the `.func` bodies
+        /// a deck's own `.func` of the same name overrides: the B-source
+        /// parser's step and sign tests (inpptree.c:158-172,
+        /// ptfuncs.c:186-252), read only in a B, E or G expression, as
+        /// ngspice-44.2 reads them ("Undefined parameter [u]" in a value).
+        /// Their derivatives are ngspice's (inpptree.c:526-542): zero,
+        /// uramp's the step, and u2's one between 0 and 1. PSPICE's `if`
+        /// is not one: plain ngspice-44.2 stops on it everywhere
+        /// ("Undefined parameter [if]", "no such function 'if'";
+        /// src/tests/expressions.zig).
+        const builtin_funcs = std.StaticStringMap(R.Func).initComptime(.{
+            .{ "u", R.Func{ .formals = &.{"x"}, .body = "x > 0 ? 1 : x == 0 ? 0.5 : 0" } },
+            .{ "uramp", R.Func{ .formals = &.{"x"}, .body = "x > 0 ? x : 0" } },
+            .{ "u2", R.Func{ .formals = &.{"x"}, .body = "min(max(x, 0), 1)" } },
+            .{ "eq0", R.Func{ .formals = &.{"x"}, .body = "x == 0" } },
+            .{ "ne0", R.Func{ .formals = &.{"x"}, .body = "x != 0" } },
+            .{ "gt0", R.Func{ .formals = &.{"x"}, .body = "x > 0" } },
+            .{ "lt0", R.Func{ .formals = &.{"x"}, .body = "x < 0" } },
+            .{ "ge0", R.Func{ .formals = &.{"x"}, .body = "x >= 0" } },
+            .{ "le0", R.Func{ .formals = &.{"x"}, .body = "x <= 0" } },
+        });
 
         /// Copies `src`'s ops `from..to` into the netlist's ops. A name a scope
         /// defines is replaced by its definition, read in the scope that
@@ -85,10 +105,14 @@ pub fn Methods(comptime S: type) type {
                                 if (r.monte) r.site_owner = nameKey(nameKey(0, levelPath(frame, hit.level)), name);
                                 r.site_ordinal = 0;
                                 // A parameter's text never sees the formals of a
-                                // function that reads it.
+                                // function that reads it, and is numparam's in a
+                                // B card too.
                                 const saved = r.bindings;
+                                const bsource = r.bsource;
                                 r.bindings = .empty;
+                                r.bsource = false;
                                 defer r.bindings = saved;
+                                defer r.bsource = bsource;
                                 try r.subst(code, 0, code.ops.items.len, frame, scopes[0 .. hit.level + 1], depth + 1);
                             },
                         }
@@ -108,14 +132,18 @@ pub fn Methods(comptime S: type) type {
                         .a = if (op.a == none) none else (try r.netOf(frame, src.names.items[op.a])).index(),
                         .b = if (op.b == none) none else (try r.netOf(frame, src.names.items[op.b])).index(),
                     }),
-                    else => {
-                        if (r.monte and op.code == .call and expr.isDistribution(@fromBackingInt(@intCast(op.a)))) {
+                    .call => {
+                        const f: expr.Fn = @fromBackingInt(@intCast(op.a));
+                        if (r.monte and expr.isDistribution(f)) {
                             try r.site_ops.append(r.arena, @intCast(r.ops.items.len));
                             try r.site_keys.append(r.arena, siteKey(r.site_owner, r.site_ordinal));
                             r.site_ordinal += 1;
                         }
-                        try r.ops.append(r.arena, op);
+                        const g = if (!r.bsource) f else expr.bsourceFn(f) orelse
+                            return r.unsupported(r.card, try r.arena.print("'{s}' in a B, E or G expression, where ngspice's B parser has no such function", .{@tagName(f)}));
+                        try r.ops.append(r.arena, .{ .code = .call, .a = @backingInt(g), .b = op.b });
                     },
+                    else => try r.ops.append(r.arena, op),
                 }
             }
         }
@@ -132,12 +160,34 @@ pub fn Methods(comptime S: type) type {
 
         /// Emits a call `op` of a function outside `expr.Fn`: a `.func`
         /// expands to its body with each formal bound to its argument (the
-        /// arguments' final ops, the last `op.b` subtrees emitted); any
-        /// other stays a `call` of `Fn.other`, which nothing folds.
+        /// arguments' final ops, the last `op.b` subtrees emitted), and so
+        /// does a `builtin_funcs` name no `.func` defines in a B, E or G
+        /// expression, where `ddt` and an odd-count `pwl` become their
+        /// `expr.Fn` call. Any other name, one of those outside such an
+        /// expression, and a `limit` of other than two arguments
+        /// (`expr_compile` passes those here), is `UnsupportedCard`, logged
+        /// with the function and `r.card`: every value, `.param`, `.meas`
+        /// and B or E expression reaches its functions here, so none reads
+        /// a stand-in for it (ngspice's numparam fails the deck: "Undefined
+        /// parameter").
         pub fn inline_(r: *R, src: *const expr.Scratch, op: expr.Op, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
             const name = src.names.items[op.a];
-            const func = r.funcs.get(name) orelse
-                return r.ops.append(r.arena, .{ .code = .call, .a = @backingInt(expr.Fn.other), .b = op.b });
+            const ddt = std.mem.eql(u8, name, "ddt");
+            const pwl = std.mem.eql(u8, name, "pwl");
+            const func = r.funcs.get(name) orelse (if (r.bsource) builtin_funcs.get(name) else null) orelse {
+                // The B-source parser's `ddt` and `pwl` (inpptree.c:165,
+                // 177); a pwl is the odd-count `table` (expr_ops.zig `Fn`).
+                if (r.bsource and (ddt or (pwl and op.b % 2 == 1)))
+                    return r.ops.append(r.arena, .{ .code = .call, .a = @backingInt(if (ddt) expr.Fn.ddt else .table), .b = op.b });
+                // Three arguments are PSPICE's clamp, which only ngspice's
+                // PSPICE mode defines (inpcompat.c:692-695); plain
+                // ngspice-44.2 draws nom ± the last one in a `.param` and
+                // reads 0 in a B source (measured).
+                if (std.mem.eql(u8, name, "limit")) return r.unsupported(r.card, try r.arena.print("limit() with {d} arguments, where ngspice's takes (nominal, variation); three are PSPICE's clamp: translate the deck to ngspice first", .{op.b}));
+                if (!r.bsource and (ddt or pwl or builtin_funcs.has(name)))
+                    return r.unsupported(r.card, try r.arena.print("'{s}' outside a B, E or G expression: only ngspice's B parser has it", .{name}));
+                return r.unsupported(r.card, try r.arena.print("an unknown function '{s}'", .{name}));
+            };
             if (func.formals.len != op.b) return error.ParseError;
             // Lift the argument subtrees off the output, last argument first.
             const args = try r.arena.alloc([]const expr.Op, op.b);

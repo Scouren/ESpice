@@ -84,7 +84,7 @@ pub fn integrateFixed(gpa: std.mem.Allocator, periods: []const FixedLane, opts: 
             if (on == 0) continue;
             try l.ckt.checkpoint(.{ .phase = .periodic, .completed = step, .total = steps });
             const dt = l.period / @as(f64, @floatFromInt(steps));
-            const t = l.period * @as(f64, @floatFromInt(step + 1)) / @as(f64, @floatFromInt(steps));
+            const t = l.t_origin + stepTime(l, step);
             l.ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
             dev.sims[k] = l.ckt.sim;
             dev.sc[k] = .{ .t_dev = t, .dt = dt, .xfact = 0, .ag0 = 2.0 / dt, .ag1 = 1, .ag2 = 0, .method = 1, .flags = 1, .sq = @splat(0), .sqt = @splat(0) };
@@ -112,7 +112,7 @@ pub fn integrateFixed(gpa: std.mem.Allocator, periods: []const FixedLane, opts: 
                 if (!ok or l.wave.len == 0) continue;
                 const cols = 1 + l.probes.len;
                 const row = l.wave[(step + 1) * cols ..][0..cols];
-                row[0] = dev.sc[k].t_dev;
+                row[0] = stepTime(l, step);
                 for (l.probes, 0..) |p, j| row[j + 1] = host[@as(usize, p) * N + k];
             }
         }
@@ -163,3 +163,9 @@ pub fn integrateFixed(gpa: std.mem.Allocator, periods: []const FixedLane, opts: 
 }
 
 // ---- private ----
+
+/// The end time of step `step` of lane `l`'s period, from its start, the
+/// same expression as the host's `period.stepTime`.
+fn stepTime(l: FixedLane, step: usize) f64 {
+    return l.period * @as(f64, @floatFromInt(step + 1)) / @as(f64, @floatFromInt(l.n_samples));
+}

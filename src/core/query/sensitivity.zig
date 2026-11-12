@@ -9,7 +9,7 @@
 //! - `pub const Dcmatch = struct`
 //! - `pub const Acmatch = struct`
 //! - `pub const Dcsens = struct`
-//! - `pub const Sens = struct`
+//! - `pub const Sens = struct`, `Sens.AcSource = struct`
 
 const Tolerances = @import("../numerics.zig").Tolerances;
 const FreqSweep = @import("../freq_sweep.zig").FreqSweep;
@@ -60,7 +60,8 @@ pub const Dcsens = struct {
     variations: Variations = .{},
 };
 
-/// DC sensitivity of one output to every device parameter (`.sens`).
+/// Sensitivity of one output to every device parameter (`.sens`): DC, or
+/// over an AC sweep (`.sens <out> ac <sweep>`, ngspice inp2dot.c:481-570).
 pub const Sens = struct {
     tol: Tolerances = .{},
     output_node: u32,
@@ -69,4 +70,21 @@ pub const Sens = struct {
     /// Card names for the result columns, so they match ngspice's. An
     /// unnamed instance falls back to `<type>#<ordinal>`.
     card_names: CardNames = .empty,
+    /// The AC form's sweep; null is the DC sensitivity.
+    ac: ?FreqSweep = null,
+    /// Every V and I card, `AC` spec or not, for their `<card>_acmag`
+    /// and `<card>_acphase` columns (ngspice vsrc.c, isrc.c).
+    ac_sources: []const AcSource = &.{},
+
+    /// One source's share of `Deck.ac_drive`: its phasor is subtracted at
+    /// row `pos` and added at row `neg` (GROUND, branch for a V card).
+    pub const AcSource = struct {
+        name: []const u8,
+        pos: u32,
+        neg: u32,
+        re: f64,
+        im: f64,
+        /// d(re, im)/d(acmag): e^(j phase), times `m` on an I card.
+        unit: [2]f64,
+    };
 };

@@ -57,7 +57,14 @@ module mesa(dr, g, s);
     parameter real l     = 1.0e-6  from (0:inf);  // m   gate length
     parameter real w     = 20.0e-6 from (0:inf);  // m   gate width
     parameter real dtemp = 0.0;                   // K   instance temp offset
-    parameter real tnom  = $simparam("tnom") + 273.15  from (0:inf);  // K   parameter ref temp
+    // Source- and drain-side temperatures (mesa.c:21-22, mesaparam.c:63-70):
+    // each given one replaces $temperature + dtemp (mesasetup.c:245-250).
+    parameter real ts    = 27.0;                  // degC source-side temperature
+    parameter real td    = 27.0;                  // degC drain-side temperature
+    // No model TNOM: ngspice refers every tempco to .options tnom
+    // (CKTnomTemp, mesatemp.c:60-149) and 44.2 prints "unrecognized parameter
+    // (tnom) - ignored" for one on the card, which a degC card value read
+    // here as kelvin would not.
     // ngspice's instance parallel multiplier (mesa.c MESApTable `m`, default 1;
     // mesaload.c:422 scales every RHS/Y entry by it).  Named `mult` because the
     // model card's knee shape already owns `m` and a Verilog-A module has one
@@ -70,6 +77,7 @@ module mesa(dr, g, s);
 
     // ---- dc channel --------------------------------------------------------
     parameter real vto     = -1.26;                  // V     pinch-off
+    aliasparam vt0 = vto;                    // ngspice mesa.c:49-50 IOPR spelling
     parameter real beta    = 0.0085  from [0:inf);   //       transconductance
     parameter real vs      = 1.5e5   from (0:inf);   // m/s   saturation vel.
     parameter real lambda  = 0.045;                  // 1/V   output conductance
@@ -153,7 +161,7 @@ module mesa(dr, g, s);
     parameter real delfo    = 0.0    from [0:inf);   // Hz   transition width
 
     // bias-independent prep (mesatemp.c / mesasetup.c)
-    real tempk, dtk, vt, vtj, vtes, vted, etavth, vcrits, vcritd;
+    real tempk, tempd, tnom, dtk, dtd, vt, vtj, vtes, vted, etavth, vcrits, vcritd;
     real t_mu, t_phib, t_vto, t_eta, t_lambda;
     real t_rd, t_rs, t_rg, t_ri, t_rf, t_rsi, t_rdi, rt;
     real muimp, mupo, dlay, vpou, vpod, vpo, deltasqr;
@@ -168,14 +176,20 @@ module mesa(dr, g, s);
     analog begin
         // ------------------------------------------------------------------
         // §1.5 temperature map.  All of this is node-voltage independent.
-        // ponytail: ngspice carries separate drain/source temperatures
-        // (instance `td`/`ts`, both defaulting to CKTtemp+dtemp); one device
-        // temperature covers every documented use, so `td == ts == tempk`.
+        // ngspice carries separate source/drain temperatures, both
+        // CKTtemp + dtemp unless the card gives `ts`/`td`. ts (tempk) sets
+        // everything but the drain side: csatfd, the drain junction's vt
+        // and rd, rf, rdi (mesatemp.c:46-150, mesaload.c:109-112, 301).
         // ------------------------------------------------------------------
         tempk = $temperature + dtemp;
+        tempd = tempk;
+        if ($param_given(ts)) tempk = ts + 273.15;
+        if ($param_given(td)) tempd = td + 273.15;
+        tnom  = $simparam("tnom") + 273.15;  // .options tnom [K]
         dtk   = tempk - tnom;
+        dtd   = tempd - tnom;
         vt    = kb * tempk / qe;
-        vtj   = vt;                 // junction thermal voltage (td == ts)
+        vtj   = kb * tempd / qe;    // drain-junction thermal voltage
         vtes  = n * vt;
         vted  = n * vtj;
 
@@ -194,13 +208,13 @@ module mesa(dr, g, s);
 
         // Series resistances: r == 0 keeps the branch an exact short, which is
         // what ngspice's "node not created" case means.
-        t_rd  = rd  * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
+        t_rd  = rd  * (1.0 + rtc1 * dtd + rtc2 * dtd * dtd);
         t_rs  = rs  * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
         t_rg  = rg  * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
         t_ri  = ri  * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
-        t_rf  = rf  * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
+        t_rf  = rf  * (1.0 + rtc1 * dtd + rtc2 * dtd * dtd);
         t_rsi = rsi * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
-        t_rdi = rdi * (1.0 + rtc1 * dtk + rtc2 * dtk * dtk);
+        t_rdi = rdi * (1.0 + rtc1 * dtd + rtc2 * dtd * dtd);
         rt    = t_rsi + t_rdi;
 
         // Pinch-off voltage of the epi stack (level 2 uniform, 3/4 delta doped).
@@ -229,8 +243,8 @@ module mesa(dr, g, s);
         else            cf = 0.5 * eps_gaas * w;
         csatfs = 0.5 * astar * tempk * tempk *
                  exp(-t_phib / (kb * tempk)) * l * w;
-        csatfd = 0.5 * astar * tempk * tempk *
-                 exp(-t_phib / (kb * tempk)) * l * w;
+        csatfd = 0.5 * astar * tempd * tempd *
+                 exp(-t_phib / (kb * tempd)) * l * w;
         ggrwl  = ggr * l * w * exp(xchi * dtk);
         imax   = qe * nmax * vs * w;
 

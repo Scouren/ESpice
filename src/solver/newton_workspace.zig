@@ -25,6 +25,7 @@ const BbdInfo = num.BbdInfo;
 const direct = @import("direct.zig");
 const Gmres = @import("gmres.zig").Gmres;
 const converger = @import("converger.zig");
+const confirm_mod = @import("confirm.zig");
 const Knobs = converger.Knobs;
 const Lanes = @import("lane/lanes.zig").Lanes;
 const LaneSolver = @import("lane/solver.zig").LaneSolver;
@@ -78,6 +79,11 @@ pub const Workspace = struct {
     a_vals: []f64 = &.{},
     prof: Prof = .{},
     knobs: Knobs,
+    /// Every stamp is independent of x; set by the circuit owner. Read by
+    /// lever c3 (`confirm.settle`).
+    linear: bool = false,
+    /// Lever c3: its counters.
+    confirm: confirm_mod.Stats = .{},
 
     /// Borrows `col_ptr` and `row_idx` for the workspace's lifetime. Caller
     /// frees with `deinit` and the same allocator. Fails as

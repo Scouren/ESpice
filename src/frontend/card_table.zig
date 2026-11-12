@@ -10,7 +10,6 @@
 //! - `pub const Branches`
 //! - `pub const max`
 //! - `pub fn active(b: Branches) bool`
-//! - `pub const port_source_words`
 //! - `pub const cards`
 //! - `pub const variant_cards`
 //! - `pub const Form`
@@ -23,6 +22,7 @@
 //! - `pub fn seedOption(line: []const u8) bool`
 //! - `pub fn analysisOf(line: []const u8) ?Kind`
 //! - `pub fn setsKey(line: []const u8, key: []const u8) bool`
+//! - `pub fn isDataElement(letter: u8, line: []const u8) bool`
 //! - `pub fn bTransformationWanted(p: []const u8) bool`
 //! - `pub fn kvIndex(kvs: []const Kv, key: []const u8) ?usize`
 //! - `pub fn isBinOf(model: []const u8, base: []const u8) bool`
@@ -32,7 +32,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -49,7 +48,9 @@ const Kv = card_rows.Kv;
 const kvNumber = netlist_view.kvNumber;
 
 /// `ignored`: a card that only shapes printed output, which ESPice writes
-/// in full anyway.
+/// in full anyway, or only feeds ngspice's `.control` interpreter, which a
+/// batch run skips: `.csparam` makes vectors in its `const` plot and is
+/// then commented out (inp.c:1104-1131).
 pub const Card = union(enum) { end, ends, subckt, param, func, model, include, osdi_include, pre_osdi, verilog, control, endc, options, ic, nodeset, global, connect, save, store, sample, meas, ignored, mosra, appendmodel, step, data, enddata, variation, end_variation, wcd, analysis: Kind, cond: CondCard };
 
 pub const CondCard = enum { @"if", elseif, @"else", endif };
@@ -70,51 +71,44 @@ pub const Branches = struct {
     }
 };
 
-/// Source keywords that may follow a P card's nodes (`mixedPort`).
-pub const port_source_words = std.StaticStringMap(void).initComptime(.{
-    .{"dc"},  .{"ac"},   .{"hb"}, .{"hbac"}, .{"pulse"}, .{"sin"},     .{"exp"},
-    .{"pwl"}, .{"sffm"}, .{"am"}, .{"lfsr"}, .{"pat"},   .{"distof1"}, .{"distof2"},
-});
-
-/// Every dot card the three dialects accept, looked up lowercased.
+/// Every dot card ESPice accepts, looked up lowercased.
 pub const cards = std.StaticStringMap(Card).initComptime(.{
-    .{ "end", .end },                .{ "ends", .ends },                 .{ "subckt", .subckt },
-    // HSPICE's `.macro`/`.eom` and `.parameter(s)`/`.temperature` spellings,
-    // ngspice's too for `.macro` (hspice-syntax.md D1, X4, D4; #121).
-    .{ "macro", .subckt },           .{ "eom", .ends },                  .{ "parameter", .param },
-    .{ "parameters", .param },       .{ "temperature", an(.temp) },      .{ "func", .func },
-    .{ "param", .param },            .{ "model", .model },               .{ "include", .include },
-    .{ "hdl", .include },            .{ "osdi_include", .osdi_include }, .{ "pre_osdi", .pre_osdi },
-    .{ "verilog", .verilog },        .{ "option", .options },            .{ "options", .options },
-    .{ "opt", .options },            .{ "opts", .options },              .{ "ic", .ic },
-    .{ "ac", an(.ac) },              .{ "dc", an(.dc) },                 .{ "dcmatch", an(.dcmatch) },
-    .{ "disto", an(.disto) },        .{ "envelope", an(.envelope) },     .{ "envlp", an(.envelope) },
-    .{ "four", an(.four) },          .{ "hb", an(.hb) },                 .{ "matex", an(.matex) },
-    .{ "hbac", an(.hbac) },          .{ "hbnoise", an(.hbnoise) },       .{ "hbxf", an(.hbxf) },
-    .{ "hbosc", an(.hb) },           .{ "snosc", an(.pss) },             .{ "phasenoise", an(.phasenoise) },
-    .{ "mc", an(.mc) },              .{ "montecarlo", an(.mc) },         .{ "noise", an(.noise) },
-    .{ "op", an(.op) },              .{ "pac", an(.pac) },               .{ "pnoise", an(.pnoise) },
-    .{ "pss", an(.pss) },            .{ "pxf", an(.pxf) },               .{ "pz", an(.pz) },
-    .{ "qpss", an(.qpss) },          .{ "sens", an(.sens) },             .{ "sp", an(.sp) },
-    .{ "stb", an(.stb) },            .{ "temp", an(.temp) },             .{ "tf", an(.tf) },
-    .{ "sn", an(.pss) },             .{ "snac", an(.pac) },              .{ "snnoise", an(.pnoise) },
-    .{ "snxf", an(.pxf) },           .{ "fft", an(.fft) },               .{ "ptdnoise", an(.pnoise) },
-    .{ "tran", an(.tran) },          .{ "trannoise", an(.tran_noise) },  .{ "tran_noise", an(.tran_noise) },
-    .{ "lstb", an(.lstb) },          .{ "acxf", an(.acxf) },             .{ "dcxf", an(.dcxf) },
-    .{ "dcinc", an(.dcinc) },        .{ "lin", an(.sp) },                .{ "acmatch", an(.acmatch) },
-    .{ "dcsens", an(.dcsens) },      .{ "hblin", an(.hblin) },           .{ "net", an(.sp) },
-    .{ "acphasenoise", an(.noise) }, .{ "if", cond(.@"if") },            .{ "elseif", cond(.elseif) },
-    .{ "else", cond(.@"else") },     .{ "endif", cond(.endif) },         .{ "meas", .meas },
-    .{ "measure", .meas },           .{ "save", .save },                 .{ "dcvolt", .ic },
-    .{ "nodeset", .nodeset },        .{ "global", .global },             .{ "connect", .connect },
-    .{ "jitter", .meas },            .{ "store", .store },               .{ "sample", .sample },
-    .{ "mosra", .mosra },            .{ "appendmodel", .appendmodel },   .{ "check", .meas },
-    .{ "dout", .meas },              .{ "biaschk", .meas },              .{ "power", .meas },
-    .{ "pat", .ignored },            .{ "stim", .meas },                 .{ "stimuli", .meas },
-    .{ "control", .control },        .{ "endc", .endc },                 .{ "print", .ignored },
-    .{ "plot", .ignored },           .{ "probe", .ignored },             .{ "graph", .ignored },
-    .{ "width", .ignored },          .{ "title", .ignored },             .{ "protect", .ignored },
-    .{ "unprotect", .ignored },      .{ "prot", .ignored },              .{ "unprot", .ignored },
+    .{ "end", .end },                   .{ "ends", .ends },                .{ "subckt", .subckt },
+    // `.macro`/`.eom` and `.parameter(s)`: ngspice 44.2 reads them too
+    // (measured), so they stay (#121).
+    .{ "macro", .subckt },              .{ "eom", .ends },                 .{ "parameter", .param },
+    .{ "parameters", .param },          .{ "func", .func },                .{ "param", .param },
+    .{ "model", .model },               .{ "include", .include },          .{ "hdl", .include },
+    .{ "osdi_include", .osdi_include }, .{ "pre_osdi", .pre_osdi },        .{ "verilog", .verilog },
+    .{ "option", .options },            .{ "options", .options },          .{ "opt", .options },
+    .{ "opts", .options },              .{ "ic", .ic },                    .{ "ac", an(.ac) },
+    .{ "dc", an(.dc) },                 .{ "dcmatch", an(.dcmatch) },      .{ "disto", an(.disto) },
+    .{ "envelope", an(.envelope) },     .{ "four", an(.four) },            .{ "hb", an(.hb) },
+    .{ "matex", an(.matex) },           .{ "hbac", an(.hbac) },            .{ "hbnoise", an(.hbnoise) },
+    .{ "hbxf", an(.hbxf) },             .{ "hbosc", an(.hb) },             .{ "snosc", an(.pss) },
+    .{ "phasenoise", an(.phasenoise) }, .{ "mc", an(.mc) },                .{ "noise", an(.noise) },
+    .{ "op", an(.op) },                 .{ "pac", an(.pac) },              .{ "pnoise", an(.pnoise) },
+    .{ "pss", an(.pss) },               .{ "pxf", an(.pxf) },              .{ "pz", an(.pz) },
+    .{ "qpss", an(.qpss) },             .{ "sens", an(.sens) },            .{ "sp", an(.sp) },
+    .{ "stb", an(.stb) },               .{ "temp", an(.temp) },            .{ "tf", an(.tf) },
+    .{ "sn", an(.pss) },                .{ "snac", an(.pac) },             .{ "snnoise", an(.pnoise) },
+    .{ "snxf", an(.pxf) },              .{ "fft", an(.fft) },              .{ "ptdnoise", an(.pnoise) },
+    .{ "tran", an(.tran) },             .{ "trannoise", an(.tran_noise) }, .{ "lstb", an(.lstb) },
+    .{ "acxf", an(.acxf) },             .{ "dcxf", an(.dcxf) },            .{ "dcinc", an(.dcinc) },
+    .{ "lin", an(.sp) },                .{ "acmatch", an(.acmatch) },      .{ "dcsens", an(.dcsens) },
+    .{ "hblin", an(.hblin) },           .{ "net", an(.sp) },               .{ "acphasenoise", an(.noise) },
+    .{ "if", cond(.@"if") },            .{ "elseif", cond(.elseif) },      .{ "else", cond(.@"else") },
+    .{ "endif", cond(.endif) },         .{ "meas", .meas },                .{ "measure", .meas },
+    .{ "save", .save },                 .{ "nodeset", .nodeset },          .{ "global", .global },
+    .{ "connect", .connect },           .{ "jitter", .meas },              .{ "store", .store },
+    .{ "sample", .sample },             .{ "mosra", .mosra },              .{ "appendmodel", .appendmodel },
+    .{ "check", .meas },                .{ "dout", .meas },                .{ "biaschk", .meas },
+    .{ "power", .meas },                .{ "pat", .ignored },              .{ "stim", .meas },
+    .{ "stimuli", .meas },              .{ "control", .control },          .{ "endc", .endc },
+    .{ "print", .ignored },             .{ "plot", .ignored },             .{ "probe", .ignored },
+    .{ "graph", .ignored },             .{ "width", .ignored },            .{ "title", .ignored },
+    .{ "protect", .ignored },           .{ "unprotect", .ignored },        .{ "prot", .ignored },
+    .{ "unprot", .ignored },            .{ "csparam", .ignored },
 });
 
 /// Sweep and variation cards (frontend/variants.zig), and `.wcd` (#240).
@@ -123,19 +117,25 @@ pub const variant_cards = std.StaticStringMap(Card).initComptime(.{
 });
 
 /// A behavioural E/F/G/H form, named by the word in the first control-node
-/// slot (ngspice inpcom.c, HSPICE's E/G element keywords).
-pub const Form = enum { value, poly, table, pwl, laplace, pole, delay, vcr, vccap, kind, refused };
+/// slot (ngspice inpcom.c, HSPICE's E/G element keywords) unless a linear
+/// card's tail follows it, where the word is a node, as ngspice-44.2 reads
+/// it (reader_devices.zig). HSPICE's PWL, VCR and VCCAP are refused: plain
+/// ngspice-44.2 stops on PWL(1) and VCR PWL(1) ("Bad real value"). A
+/// `gate` (AND, NAND, OR, NOR) is refused by name: ngspice runs it on an E
+/// card as XSPICE's multi_input_pwl, which is not ported.
+pub const Form = enum { value, poly, table, laplace, pole, delay, kind, gate, refused };
 
 pub const behavioural = std.StaticStringMap(Form).initComptime(.{
     .{ "poly", .poly },    .{ "value", .value },     .{ "vol", .value },   .{ "cur", .value },
     .{ "table", .table },  .{ "laplace", .laplace }, .{ "pole", .pole },   .{ "freq", .refused },
-    .{ "vcr", .vcr },      .{ "vccap", .vccap },     .{ "delay", .delay }, .{ "opamp", .refused },
-    .{ "npwl", .refused }, .{ "ppwl", .refused },    .{ "pwl", .pwl },     .{ "and", .refused },
-    .{ "nand", .refused }, .{ "or", .refused },      .{ "nor", .refused }, .{ "vcvs", .kind },
+    .{ "vcr", .refused },  .{ "vccap", .refused },   .{ "delay", .delay }, .{ "opamp", .refused },
+    .{ "npwl", .refused }, .{ "ppwl", .refused },    .{ "pwl", .refused }, .{ "and", .gate },
+    .{ "nand", .gate },    .{ "or", .gate },         .{ "nor", .gate },    .{ "vcvs", .kind },
     .{ "vccs", .kind },    .{ "ccvs", .kind },       .{ "cccs", .kind },   .{ "transformer", .refused },
 });
 
-/// Keys whose value is a data file an HSPICE W or S card reads.
+/// Keys whose value is a data file a `.model` card names: an RLGC table,
+/// a Touchstone or a CITI file.
 pub const data_file_keys = std.StaticStringMap(void).initComptime(.{
     .{ "rlgcfile", {} }, .{ "tstonefile", {} }, .{ "citifile", {} },
 });
@@ -190,6 +190,16 @@ pub fn setsKey(line: []const u8, key: []const u8) bool {
         if (rest.len > 0 and rest[0] == '=') return true;
     }
     return false;
+}
+
+/// Whether the `letter` card `line` is ESPice's W RLGC line or S N-port
+/// (HSPICE's spelling, [CR] W and S elements): a W or S card with any
+/// `key=value` field (`rlgcmodel=`, `tablemodel=`, `n=`, `l=`, `mname=`,
+/// `tstonefile=`, `fqmodel=`, `type=`, `zo=`, ...). ngspice's switches
+/// (`S1 1 2 3 4 sw ON`, `W1 1 2 vc sw OFF`; inp2s.c, inp2w.c) carry none,
+/// and refuse `m=` (net_card.zig), so the two readings never meet.
+pub fn isDataElement(letter: u8, line: []const u8) bool {
+    return (letter == 's' or letter == 'w') and std.mem.indexOfScalar(u8, line, '=') != null;
 }
 
 /// ngspice b_transformation_wanted (inpcom.c): `p` reads a node voltage,

@@ -42,7 +42,9 @@ done < <(find docs -name '*.md' | sort)
 # A deck read through a pipe or FIFO prints what the file prints (#234): the
 # dialect check once drained the pipe and the run saw an empty deck.
 # stdout and stderr both count; each run's deck path is replaced by DECK.
-for deck in measure.sp spectre_rc.scs; do
+# A deck in another dialect goes to spice2rack, which reads no pipe: the
+# CLI refuses it (SpiceRackNeedsFile), checked below.
+for deck in measure.sp; do
   total=$((total + 1))
   each() { (cd docs/examples && timeout 60 "$exe" --backend cpu "$1" <"$deck" 2>&1 | sed "s|$1|DECK|g"); }
   each "$deck" >"$work/file.out"
@@ -57,6 +59,13 @@ for deck in measure.sp spectre_rc.scs; do
     diff "$work/file.out" "$work/pipe.out" | head -5
   fi
 done
+total=$((total + 1))
+if (cd docs/examples && cat spectre_rc.scs | timeout 60 "$exe" --backend cpu /dev/stdin >"$work/pipe.out" 2>&1) ||
+  ! grep -q 'SpiceRackNeedsFile' "$work/pipe.out"; then
+  fail=$((fail + 1))
+  echo "FAIL spectre_rc.scs through a pipe: not refused with SpiceRackNeedsFile"
+  tail -5 "$work/pipe.out"
+fi
 
 echo "doc decks: $((total - fail)) of $total run"
 [ "$fail" -eq 0 ]

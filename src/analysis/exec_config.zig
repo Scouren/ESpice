@@ -7,7 +7,8 @@
 //!
 //! Contents:
 //! - `pub const Config = struct` (`Backend`, `gpuPriced`)
-//! - `pub const ThreadPool = struct` (`per_query`, `init`, `take`, `give`)
+//! - `pub const ThreadPool = struct` (`per_query`, `per_query_wide`, `init`, `take`, `queryWant`, `give`)
+//! - `pub const LaneLoan = struct`
 //! - `pub const lane_width`
 //! - `pub fn validateBackend(config: Config) error{GpuBackendUnavailable, InvalidThreadCount}!void`
 //! - `pub fn lanesOn(config: Config) bool`
@@ -112,6 +113,10 @@ pub const ThreadPool = struct {
     /// Most lanes one query runs. ParEval measured flat or worse past 8
     /// on a hybrid CPU (dev/analysis/refactoring.md, #138).
     pub const per_query: u32 = 8;
+    /// Most lanes one query runs under lever C6 (step 3), which measures
+    /// lanes past eight. ponytail: 16 is the brief's first probe (the
+    /// P-cores' hyperthreads); its runs decide the shipped cap.
+    pub const per_query_wide: u32 = 16;
 
     /// Half the logical CPUs (SMT siblings share a core's FP units), at
     /// least none.
@@ -131,11 +136,28 @@ pub const ThreadPool = struct {
         }
     }
 
+    /// Lanes a query asks the pool for, its own included: `plan_want`
+    /// (`executor.lanePlan`: 1 or `per_query`), widened to `per_query_wide`
+    /// under C6 step 3 when the plan borrows at all.
+    pub fn queryWant(plan_want: u32, c6: bool) u32 {
+        assert(plan_want >= 1 and plan_want <= per_query);
+        return if (c6 and plan_want > 1) per_query_wide else plan_want;
+    }
+
     /// Returns `n` threads a `take` handed out.
     pub fn give(pool: *ThreadPool, n: u32) void {
-        assert(n <= per_query);
+        assert(n <= per_query_wide);
         if (n != 0) _ = pool.free.fetchAdd(n, .monotonic); // The old count is not needed.
     }
+};
+
+/// Lanes a query borrowed from `pool` for the LU alone (C6 step 1, #253).
+/// `held` is the query's own borrowed count, which the executor gives back
+/// at the end; `circuit_devices.settleLaneLoan` lowers it as it returns the
+/// lanes past the width the LU admitted.
+pub const LaneLoan = struct {
+    pool: *ThreadPool,
+    held: *u32,
 };
 
 /// Lanes per batch: the CPU's f64 vector width (4 on AVX2, 8 on AVX-512).

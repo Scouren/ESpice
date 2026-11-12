@@ -21,6 +21,11 @@
 //! With `--perturb` every expected value moves by 0.1% (`perturb`) and a deck
 //! that still passes is reported LOOSE: its tolerance cannot see an error
 //! that size. It reports and never fails (the nightly tier).
+//! After the decks, the `spicerack/` checks run the CLI's SpiceRack step
+//! against fake spice2rack binaries (tests/spicerack/, `spicerack_checks`).
+//! `--zig PATH` and `--perf LEVERS` set `ZIG` and `ESPICE_PERF` in every
+//! espice it starts. build.zig passes them (`-Dperf`) as arguments: setting
+//! a variable on its Run step would clone and hash its whole environment.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -55,7 +60,9 @@ const Expectation = struct {
     category: ?[]const u8 = null,
 };
 /// `tokenizer`: the `--tokenizer` dialect the deck is read in; null keeps
-/// espice's default (ngspice).
+/// espice's default (ngspice). The CLI runs any other through spice2rack
+/// (src/spicerack.zig), found as a user's espice finds it: a missing one
+/// fails the deck, never skips it.
 const Oracle = struct { schema_version: u8, netlist_sha256: []const u8, expect: Expectation, tokenizer: ?[]const u8 = null };
 /// One plot of a binary raw file, borrowing the file's row-major data.
 const Plot = struct {
@@ -104,6 +111,9 @@ var perturb: f64 = 1;
 /// The C VPI application build.zig compiles for the decks marked
 /// `* VPI FIXTURE` (`--vpi-fixture`, #197); no path in a deck can name it.
 var vpi_fixture: ?[]const u8 = null;
+/// Every espice child's environment: this process's, with `--zig` and
+/// `--perf` applied. Set once in `main`, before any worker; null inherits.
+var child_env: ?*const std.process.Environ.Map = null;
 /// Per-case failure detail, printed under the case's FAIL line.
 threadlocal var diagnostics: ?*Io.Writer = null;
 fn diagnostic(comptime fmt: []const u8, args: anytype) void {
@@ -120,13 +130,14 @@ pub fn main(init: std.process.Init) !u8 {
     var list = equal(app, "--list");
     var update_verdicts = false;
     var metamorphic_mode = false;
-    const Flag = enum(u8) { list, filter, jobs, timeout, backend, update_verdicts, metamorphic, vpi_fixture, perturb };
+    const Flag = enum(u8) { list, filter, jobs, timeout, backend, update_verdicts, metamorphic, vpi_fixture, perturb, zig, perf };
     const flags = std.StaticStringMap(Flag).initComptime(.{
         .{ "--list", .list },               .{ "--filter", .filter },
         .{ "--jobs", .jobs },               .{ "--timeout", .timeout },
         .{ "--backend", .backend },         .{ "--update-verdicts", .update_verdicts },
         .{ "--metamorphic", .metamorphic }, .{ "--vpi-fixture", .vpi_fixture },
-        .{ "--perturb", .perturb },
+        .{ "--perturb", .perturb },         .{ "--zig", .zig },
+        .{ "--perf", .perf },
     });
     while (args.next()) |arg| {
         switch (flags.get(arg) orelse return error.UnknownArgument) {
@@ -139,8 +150,11 @@ pub fn main(init: std.process.Init) !u8 {
             .metamorphic => metamorphic_mode = true,
             .vpi_fixture => vpi_fixture = args.next() orelse return error.MissingArgument,
             .perturb => perturb = 1 + 1e-3,
+            .zig => try init.environ_map.put("ZIG", args.next() orelse return error.MissingArgument),
+            .perf => try init.environ_map.put("ESPICE_PERF", args.next() orelse return error.MissingArgument),
         }
     }
+    child_env = init.environ_map;
     if (jobs == 0) return error.InvalidWorkerCount;
     if (timeout_seconds == 0) return error.InvalidTimeout;
     var selected: u32 = 0;
@@ -149,6 +163,10 @@ pub fn main(init: std.process.Init) !u8 {
         selected += 1;
         if (list) std.debug.print("{s} -> {s}\n", .{ path, expected });
     }
+    for (spicerack_checks) |name| if (std.mem.indexOf(u8, name, filter) != null) {
+        selected += 1;
+        if (list) std.debug.print("{s} -> tests/spicerack/\n", .{name});
+    };
     if (selected == 0) return error.NoMatchingFixtures;
     if (list) return 0;
     const outcomes = try init.gpa.alloc(Outcome, spice_files.len);
@@ -162,6 +180,10 @@ pub fn main(init: std.process.Init) !u8 {
     try group.await(init.io);
     var count = std.EnumArray(Outcome, u32).initFill(0);
     for (outcomes) |outcome| count.getPtr(outcome).* += 1;
+    if (!metamorphic_mode and perturb == 1) for (spicerack_checks) |name| {
+        if (std.mem.indexOf(u8, name, filter) == null) continue;
+        count.getPtr(if (spicerackCheck(init.io, app, name, timeout_seconds)) .pass else .fail).* += 1;
+    };
     std.debug.print("Correctness: {d} passed, {d} failed, {d} xfail, {d} xpass, {d} skipped, {d} selected\n", .{
         count.get(.pass), count.get(.fail), count.get(.xfail), count.get(.xpass), count.get(.skip), selected,
     });
@@ -305,6 +327,123 @@ fn worker(runner: *Runner) void {
     }
 }
 
+/// The translation step's contract (src/spicerack.zig), run through the
+/// CLI with fake spice2rack binaries from tests/spicerack/. Each runs as a
+/// pseudo-deck under its name, after the decks: PASS or FAIL, chosen by
+/// `--filter`, outside VERDICTS.tsv. The first three went red before the
+/// step existed: `--spicerack` was a usage error (exit 2), and
+/// `--tokenizer=hspice` read deck.hsp natively and printed no spicerack line.
+/// `include` goes red when the kit names an include relatively: ngspice's
+/// order reads the working directory's decoy.inc first. `fifo` goes red
+/// without the CLI's regular-file check: the fake translates the FIFO's
+/// name and the run exits 0.
+const spicerack_checks = [_][]const u8{ "spicerack/translated", "spicerack/missing", "spicerack/refused", "spicerack/include", "spicerack/fifo" };
+
+/// Runs the check `name` and prints its verdict; true when it passed.
+fn spicerackCheck(io: Io, app: []const u8, name: []const u8, timeout_seconds: u32) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var report: Io.Writer.Allocating = .init(arena.allocator());
+    diagnostics = &report.writer;
+    defer diagnostics = null;
+    runSpicerackCheck(arena.allocator(), io, app, name, timeout_seconds) catch |err| {
+        std.debug.print("FAIL {s}: {s}\n{s}", .{ name, @errorName(err), report.written() });
+        return false;
+    };
+    std.debug.print("PASS {s}\n", .{name});
+    return true;
+}
+
+/// `translated`: oracle, the native run of the ngspice twin the fake
+/// writes, bit for bit, and the fake's 0.2 s sleep as a floor under the
+/// SpiceRack time both stderr lines report. `missing` and `refused`:
+/// oracle, the contract's coded error and exit 1, the fake's stderr passed
+/// through, and no raw file, so the deck was never read natively.
+/// `include`: oracle, the divider worked by hand, v(out) = 2 V * 1k / (1k +
+/// 1k) = 1 V from the kit's decoy.inc; the working directory's gives 1.5 V.
+/// `fifo`: oracle, the contract's coded refusal (`SpiceRackNeedsFile`, exit
+/// 1) for a deck spice2rack would open and find empty.
+fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, timeout_seconds: u32) !void {
+    const dir = "tests/spicerack";
+    const fixtures = try Io.Dir.cwd().realPathFileAlloc(io, dir, a);
+    const scratch = try scratchDir(a, io, "spicerack");
+    defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
+    const out = try Io.Dir.cwd().realPathFileAlloc(io, scratch, a);
+    const exe = try Io.Dir.cwd().realPathFileAlloc(io, app, a);
+    const kind = std.meta.stringToEnum(enum { translated, missing, refused, include, fifo }, name["spicerack/".len..]).?;
+    const fake = try std.fmt.allocPrint(a, "{s}/{s}", .{ fixtures, switch (kind) {
+        .translated, .fifo => "fake_spice2rack.sh",
+        .missing => "no_such_spice2rack",
+        .refused => "refusing_spice2rack.sh",
+        .include => "kit_spice2rack.sh",
+    } });
+    const deck = if (kind == .fifo) fifo: {
+        const path = try std.fmt.allocPrint(a, "{s}/deck.hsp", .{out});
+        const made = try std.process.run(a, io, .{ .argv = &.{ "mkfifo", path } });
+        if (!made.term.success()) return error.MkfifoFailed;
+        break :fifo path;
+    } else "deck.hsp";
+    const raw = try std.fmt.allocPrint(a, "{s}/translated.raw", .{out});
+    const result = try runEspice(a, io, &.{ exe, "--backend", backend_name, "--format=binary", "-b", "-r", raw, "--tokenizer", "hspice", "--spicerack", fake, deck }, dir, timeout_seconds);
+    if (kind == .include) {
+        try requireSuccess(result);
+        _ = try stderrLine(result.stderr, "espice: spicerack translated deck.hsp (hspice -> ngspice, 2 files) in ");
+        const plots = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited));
+        if (plots.len != 1 or plots[0].rows != 1) return error.UnexpectedPlots;
+        const v_out = plots[0].value(0, try plots[0].column("v(out)")).re;
+        if (!(@abs(v_out - 1) <= 1e-9)) {
+            diagnostic("  v(out) = {d} V, not the kit's 1 V (1.5 V is the working directory's decoy.inc)\n", .{v_out});
+            return error.IncludeFromWorkDir;
+        }
+        return;
+    }
+    if (kind != .translated) {
+        if (result.term != .exited or result.term.exited != 1) {
+            diagnostic("  process {any}\n{s}\n", .{ result.term, result.stderr });
+            return error.ExpectedExit1;
+        }
+        _ = try stderrLine(result.stderr, switch (kind) {
+            .missing => "Error: deck.hsp: SpiceRackNotFound",
+            .refused => "Error: deck.hsp: SpiceRackFailed",
+            .fifo => try std.fmt.allocPrint(a, "Error: {s}: SpiceRackNeedsFile", .{deck}),
+            .translated, .include => unreachable, // returned above
+        });
+        if (kind == .refused) _ = try stderrLine(result.stderr, "W0001: fake spice2rack refuses deck.hsp");
+        if (Io.Dir.cwd().access(io, raw, .{})) |_| return error.ReadNatively else |_| {}
+        return;
+    }
+    try requireSuccess(result);
+    const twin = try std.fmt.allocPrint(a, "{s}/twin.raw", .{out});
+    try requireSuccess(try runEspice(a, io, &.{ exe, "--backend", backend_name, "--format=binary", "-b", "-r", twin, "--tokenizer", "ngspice", "twin.sp" }, dir, timeout_seconds));
+    const want = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, twin, a, .unlimited));
+    try repeatable(want, try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited)));
+    _ = try stderrLine(result.stderr, "note: fake spice2rack translated deck.hsp");
+    const lines = [_][2][]const u8{
+        .{ "espice: spicerack translated deck.hsp (hspice -> ngspice, 1 files) in ", " s" },
+        .{ "espice: finished deck.hsp in ", " s in spicerack" },
+    };
+    for (lines) |l| {
+        const rest = try stderrLine(result.stderr, l[0]);
+        const value = std.mem.cutSuffix(u8, rest, l[1]) orelse return error.TimingLine;
+        // The last number on the line is SpiceRack's time.
+        const at = if (std.mem.lastIndexOfScalar(u8, value, ' ')) |i| i + 1 else 0;
+        const spent = std.fmt.parseFloat(f64, value[at..]) catch return error.TimingLine;
+        if (!(spent >= 0.2)) {
+            diagnostic("  {s}{s}: under the fake's 0.2 s\n", .{ l[0], rest });
+            return error.TimingLine;
+        }
+    }
+}
+
+/// The rest of the first `stderr` line starting with `prefix`;
+/// `error.MissingLine` when none does.
+fn stderrLine(stderr: []const u8, prefix: []const u8) ![]const u8 {
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |l| if (std.mem.cutPrefix(u8, l, prefix)) |rest| return rest;
+    diagnostic("  no stderr line `{s}...`:\n{s}\n", .{ prefix, stderr });
+    return error.MissingLine;
+}
+
 /// Whether the deck at `path` (under tests/) is marked `* KNOWN GAP:`.
 fn knownGap(a: Allocator, io: Io, path: []const u8) bool {
     const full = std.fmt.allocPrint(a, "tests/{s}", .{path}) catch return false;
@@ -387,6 +526,9 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
     const plots = try parseRaw(a, bytes);
     try compare(a, oracle.expect, plots);
     for (oracle.expect.checks) |check| if (try checkKind(check) == .measure) try measureLine(result.stdout, check);
+    for (oracle.expect.checks) |check| if (try checkKind(check) == .stderr_line) {
+        _ = try stderrLine(result.stderr, try string(try field(check, "prefix")));
+    };
     for (oracle.expect.checks) |check| {
         if (!equal(try string(try field(check, "kind")), "repeatability")) continue;
         // Remove the first output so a missing second result cannot reuse it.
@@ -438,7 +580,11 @@ fn sameResults(a: Allocator, base: []const Plot, got: []const Plot, v: metamorph
         const transient = std.ascii.findIgnoreCase(p.name, "transient") != null;
         if (!transient and p.rows != q.rows) return error.RowCount;
         for (p.names, 0..) |name, col| {
-            const qcol = q.column(try v.column(a, name)) catch |err| {
+            // A variant keeps the base's column order, so the same index is
+            // tried first: `column` walks every name, which is quadratic
+            // over a plot with one column per node.
+            const mapped = try v.column(a, name);
+            const qcol = if (col < q.names.len and equal(q.names[col], mapped)) col else q.column(mapped) catch |err| {
                 diagnostic("  column {s}: {s}\n", .{ name, @errorName(err) });
                 return err;
             };
@@ -478,11 +624,6 @@ fn sameResults(a: Allocator, base: []const Plot, got: []const Plot, v: metamorph
 /// when the run's allocator reported a leak, whatever it exited with: Zig's
 /// start code leaves the exit code alone on one, so only stderr shows it.
 fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: []const u8, timeout_seconds: u32, tokenizer: ?[]const u8) !std.process.RunResult {
-    // A total deadline also covers a child that closes its streams then hangs.
-    const Event = union(enum) { process: std.process.RunError!std.process.RunResult, timeout: Io.Cancelable!void };
-    var events: [2]Event = undefined;
-    var select: Io.Select(Event) = .init(io, &events);
-    defer select.cancelDiscard();
     const base = [_][]const u8{ app, "--backend", backend_name, "--format=binary", "-b", "-r", output, "--tokenizer", tokenizer orelse "ngspice", std.fs.path.basename(netlist) };
     var with_vpi: [base.len + 2][]const u8 = undefined;
     const argv: []const []const u8 = if (marked(a, io, netlist, "VPI FIXTURE")) blk: {
@@ -492,9 +633,21 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
         with_vpi[base.len + 1] = try Io.Dir.cwd().realPathFileAlloc(io, vpi_fixture orelse return error.MissingVpiFixture, a);
         break :blk &with_vpi;
     } else &base;
+    return runEspice(a, io, argv, std.fs.path.dirname(netlist).?, timeout_seconds);
+}
+
+/// Runs the espice command `argv` in `cwd`. `error.Timeout` after
+/// `timeout_seconds`; `error.MemoryLeaked` as `simulate` says.
+fn runEspice(a: Allocator, io: Io, argv: []const []const u8, cwd: []const u8, timeout_seconds: u32) !std.process.RunResult {
+    // A total deadline also covers a child that closes its streams then hangs.
+    const Event = union(enum) { process: std.process.RunError!std.process.RunResult, timeout: Io.Cancelable!void };
+    var events: [2]Event = undefined;
+    var select: Io.Select(Event) = .init(io, &events);
+    defer select.cancelDiscard();
     const options: std.process.RunOptions = .{
         .argv = argv,
-        .cwd = .{ .path = std.fs.path.dirname(netlist).? },
+        .cwd = .{ .path = cwd },
+        .environ_map = child_env,
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     };
@@ -876,14 +1029,15 @@ fn sample(p: Plot, axis: usize, col: usize, t: f64, rtol: f64, atol: f64) !Compl
     return .init(x.re + fraction * (y.re - x.re), x.im + fraction * (y.im - x.im));
 }
 
-const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure };
+/// `stderr_line`: some stderr line starts with `prefix`, such as a note.
+const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure, stderr_line };
 fn checkKind(check: Json) !Check {
     const kinds = std.StaticStringMap(Check).initComptime(.{
         .{ "selected_values", .selected_values },             .{ "fourier_thd", .fourier_thd },
         .{ "sample_moments", .sample_moments },               .{ "repeatability", .repeatability },
         .{ "pole_zero_sets", .pole_zero_sets },               .{ "axis_bounds", .axis_bounds },
         .{ "time_weighted_moments", .time_weighted_moments }, .{ "oscillation", .oscillation },
-        .{ "measure", .measure },
+        .{ "measure", .measure },                             .{ "stderr_line", .stderr_line },
     });
     return kinds.get(try string(try field(check, "kind"))) orelse error.UnknownCheck;
 }
@@ -928,7 +1082,7 @@ fn measured(name: []const u8, got: f64, expected: f64, rtol: f64) !void {
 
 fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     const kind = try checkKind(check);
-    if (kind == .measure) return; // runCase reads it off stdout.
+    if (kind == .measure or kind == .stderr_line) return; // runCase reads them off stdout and stderr.
     if (kind == .repeatability) {
         if ((try field(check, "same_netlist")) != .bool or !(try field(check, "same_netlist")).bool or
             !equal(try string(try field(check, "comparison")), "bitwise_numeric_results")) return error.InvalidOracle;
@@ -936,7 +1090,7 @@ fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     }
     const p = try findPlot(plots, if (kind == .fourier_thd) "Fourier Analysis" else try string(try field(check, "plot")));
     switch (kind) {
-        .repeatability, .measure => unreachable,
+        .repeatability, .measure, .stderr_line => unreachable,
         .axis_bounds => {
             const col = try p.column(try string(try field(check, "axis")));
             const minimum = try nfield(check, "minimum");
@@ -1121,6 +1275,7 @@ fn repeatable(first: []const Plot, second: []const Plot) !void {
 
 test {
     _ = metamorphic;
+    _ = @import("source_class.zig");
 }
 
 // Oracle: SHA-256 of each deck against the hash its .expected.json records.

@@ -4,7 +4,7 @@
 //! Cites: the card readers each family file cites.
 //!
 //! Contents:
-//! - `pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const requests.CardRef, ctx: analysis_args.CardContext) !?Job`
+//! - `pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const requests.CardRef, ctx: analysis_args.CardContext) !Job`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,14 +25,13 @@ const analysis_time = @import("analysis_time.zig");
 const analysis_small = @import("analysis_small.zig");
 const analysis_rf = @import("analysis_rf.zig");
 
-/// The query one analysis card asks for; null for a card that only
-/// configures the deck (single-value `.temp`). Errors name the argument
+/// The query one analysis card asks for. Errors name the argument
 /// that is wrong: `InvalidAnalysisArguments`, `AnalysisNodeNotFound`,
 /// `AnalysisSourceNotFound`, `UnsupportedFrequencySweep`,
 /// `UnsupportedAnalysisOutput`, and `MissingAnalysisCard` for an HSPICE form
 /// whose deck lacks the card it reads (`ctx`). Point lists and labels are
 /// allocated in `ctx.arena`; `OutOfMemory` when it fails.
-pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const requests.CardRef, ctx: analysis_args.CardContext) !?Job {
+pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const requests.CardRef, ctx: analysis_args.CardContext) !Job {
     assert(a.args.len < std.math.maxInt(u32));
     return switch (a.kind) {
         .op => try analysis_time.opJob(a),
@@ -43,7 +42,7 @@ pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const
         .noise => try analysis_small.noiseJob(a, sources, ctx),
         .pnoise => try analysis_rf.pnoiseJob(a, sources, ctx),
         .tf => try analysis_small.tfJob(a, sources),
-        .sens, .dcmatch => try analysis_small.sensJob(a, ctx),
+        .sens, .dcmatch => try analysis_small.sensJob(a, sources, ctx),
         .acmatch, .dcsens => try analysis_small.acmatchJob(a, ctx),
         .four => try analysis_time.fourJob(a, ctx),
         .fft => .{ .fft = try analysis_time.fft(ctx, a.args, a.pos, a.neg) },
@@ -63,7 +62,9 @@ pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const
         .dcinc => try analysis_small.dcincJob(a),
         .envelope => try analysis_time.envelopeJob(a),
         .mc => try analysis_time.mcJob(a),
-        .temp => try analysis_time.tempJob(a),
+        // The reader keeps every `.temp` card as configuration (ngspice
+        // 44.2's reading); none reaches here.
+        .temp => unreachable,
     };
 }
 

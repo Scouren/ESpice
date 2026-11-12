@@ -4,8 +4,9 @@
 //! twin: `.hbac` is PAC's forward sweep, `.hbxf` PXF's adjoint sweep and
 //! `.hbnoise` `pnoise.orbitSweep`. The linearization, conversion matrix and
 //! sideband folding are shared code, so the two orbit providers differ only
-//! in how they find the orbit. `.hblin` builds the same conversion matrix
-//! with the port terminations and reads S-parameters between port bands.
+//! in how they find the orbit. `.hblin` builds the same conversion matrix,
+//! whose circuit holds each port's z0, and reads S-parameters between port
+//! bands.
 //!
 //! Cites: HSPICE RF [RF Ch.10] for `.hblin`.
 //!
@@ -197,12 +198,7 @@ pub const Lin = struct {
                 pac.dynSpectra(ckt, lin, omegas, dyn_f[n_sb..], dyn_hat);
                 pac.addDynConversion(false, a_work, lin, ckt.ac_dyn_slots, dyn_hat, n, n_sb, nn, nn2);
             }
-            // z0 in series with every ideal port source, on every sideband.
-            for (ports) |p| if (!p.series_z0) for (0..n_sb) |q| {
-                const r = q * n + p.branch;
-                a_work[r * nn2 + r] -= p.z0;
-                a_work[(nn + r) * nn2 + nn + r] -= p.z0;
-            };
+            // Each port's z0 is in the circuit, in series with its source.
             try dense_lu.factorize(nn2, a_work, piv);
             const row = data[k * row_len ..][0..row_len];
             row[0] = f;
@@ -245,8 +241,8 @@ pub const Lin = struct {
         }
         if (noisy) {
             // The circuit's own noise at port 2's band (`.hbnoise` on the same
-            // orbit); the P cards' z0 are noiseless resistors, so it holds
-            // no port termination.
+            // orbit); the ports' z0 resistors are noiseless, so it holds none
+            // of theirs, and port 1's z0 at T0 is the `noise_work` term.
             const f_out = noise_work[0..n_points];
             const dev = try scratch.alloc(f64, n_points);
             defer scratch.free(dev);

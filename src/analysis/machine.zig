@@ -11,35 +11,47 @@
 //!
 //! Contents:
 //! - `pub const Vendor = enum { nvidia, amd }`, `pub const vendor: ?Vendor`
+//! - `pub const Keys`, `pub const liveKeys` (from `machine_keys.zig`)
 //! - `pub const cards_max: usize`, `pub const model_sizes: [4]u32`
 //! - `pub const Text = struct` (`init`, `slice`)
 //! - `pub const Identity = struct` (`cardsKey`)
 //! - `pub const Constants = struct`
-//! - `pub const Model = struct`
+//! - `pub const Model = struct`, `pub const Lu = struct`, `pub const Family = enum`, `pub const Lane = struct`
+//! - `pub const lu_host_key: u64`
 //! - `pub const Machine = struct`
 //! - `pub const ParseError`, `pub const WriteError`
 //! - `pub const test_hooks` (`notes`, `fixture`)
 //! - `pub fn identity(root: []const u8, v: Vendor) Identity`
 //! - `pub fn stale(file: *const Identity, live: *const Identity) bool`
 //! - `pub fn load(arena: Allocator, knobs: Knobs, live: *const Identity) ?Machine`
+//! - `pub fn loadKeyed(arena: Allocator, knobs: Knobs, live: *const Identity, v: Vendor) ?Machine`
 //! - `pub fn parse(arena: Allocator, text: []const u8) ParseError!Machine`
+//! - `pub fn parseRows(arena: Allocator, text: []const u8, row: *[]const u8) ParseError!Machine`
 //! - `pub fn format(m: *const Machine, w: *std.Io.Writer) std.Io.Writer.Error!void`
 //! - `pub fn write(gpa: Allocator, m: *const Machine, knobs: Knobs) WriteError!void`
 //! - `pub fn noteUncalibrated(live: *const Identity) void`
 //! - `pub fn cachePath(buf: []u8, comptime dir: []const u8, key: u64, comptime ext: []const u8, knobs: Knobs) ?[:0]const u8`
 //! - `pub fn makeParents(buf: []u8, path: []const u8) bool`
+//! - `pub fn readAt(root: []const u8, rel: []const u8, buf: []u8) ?[]const u8`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const artifacts = @import("gompute_kernels");
 const Knobs = @import("knobs.zig").Knobs;
+const machine_keys = @import("machine_keys.zig");
 
 /// Whose driver and cards `identity` reads.
 pub const Vendor = enum { nvidia, amd };
 
 /// This build's kernel vendor; null without kernel images (no GPU at all).
 pub const vendor: ?Vendor = if (artifacts.has_cuda) .nvidia else if (artifacts.has_hip) .amd else null;
+
+/// The identity rows lever `p1` compares (`machine_keys.zig`).
+pub const Keys = machine_keys.Keys;
+
+/// The live machine's `Keys` (`machine_keys.live`), for `espice calibrate`.
+pub const liveKeys = machine_keys.live;
 
 /// Cards one machine lists, at most (`gpu/devices.zig` `devices_max`).
 pub const cards_max: usize = 16;
@@ -164,14 +176,63 @@ pub const Model = struct {
     lane_gain: f64,
 };
 
+/// One sparse LU's measured row, keyed by the host refactor kernel
+/// (`host_key`, `lu_host_key`) and the device LU image's Wyhash (`image`):
+/// a row whose keys are not this binary's prices nothing. For the device
+/// LU's rent-or-buy (08-placement.md step 4); nothing reads it yet.
+pub const Lu = struct {
+    host_key: u64,
+    image: u64,
+    /// The measured matrix's unknowns, and its LU flops per refactor.
+    n: u32,
+    flops: u64,
+    /// Host refactor and solve, us: on one lane, and on
+    /// `ThreadPool.per_query` lanes.
+    host_us: f64,
+    host_par_us: f64,
+    /// One device call, refactor and both solves, upload to download, us.
+    dev_us: f64,
+    /// The pivot epoch's table build, us, the driver's bring-up excluded.
+    table_us: f64,
+};
+
+/// The lane families a sweep batches on the device: transient; operating
+/// point and DC; shooting PSS; harmonic balance; frequency (AC and kin).
+pub const Family = enum { tran, op, pss, hb, freq };
+
+/// One lane family's measured row at one batch width. For the lane
+/// policy (08-placement.md step 5); nothing reads it yet. A family with
+/// no row stays on the host.
+pub const Lane = struct {
+    family: Family,
+    /// The Wyhash of the image the reference circuit's lanes run.
+    image: u64,
+    /// Lanes in the measured batch.
+    width: u32,
+    /// Device us per Newton tick of the whole batch.
+    tick_us: f64,
+    /// Host us per point of the work that stays on the host.
+    host_pt_us: f64,
+};
+
+/// The `lu` rows' host key for this binary. ponytail: 0 until a build
+/// option hashes the solver's kernel sources (a Request); `GpuLu.admits`
+/// must price no row whose key is 0.
+pub const lu_host_key: u64 = 0;
+
 /// The calibration file, parsed. Immutable after `load`; every query of a
-/// Problem reads it. Text lives in the struct, `models` in the loader's arena.
+/// Problem reads it. Text lives in the struct, the row slices in the
+/// loader's arena.
 pub const Machine = struct {
     id: Identity,
+    /// The identity rows only `loadKeyed` (lever `p1`) compares.
+    keys: Keys = .{},
     /// The espice version that wrote the file.
     espice: Text = .{},
     c: Constants,
     models: []const Model = &.{},
+    lus: []const Lu = &.{},
+    lanes: []const Lane = &.{},
 };
 
 pub const ParseError = error{
@@ -243,40 +304,65 @@ pub fn stale(file: *const Identity, live: *const Identity) bool {
 /// measured on `live`; null when missing, unreadable, malformed or stale.
 /// `models` and the file's bytes live in `arena`.
 pub fn load(arena: Allocator, knobs: Knobs, live: *const Identity) ?Machine {
-    var buf: [512]u8 = undefined;
-    const p = path(&buf, knobs) orelse return null;
-    const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const text = arena.alloc(u8, file_max) catch return null;
-    var len: usize = 0;
-    for (0..file_max) |_| {
-        const got = std.c.read(fd, text[len..].ptr, text.len - len);
-        if (got < 0) return null;
-        if (got == 0) break;
-        len += @intCast(got);
-        if (len == text.len) return null;
-    }
-    const m = parse(arena, text[0..len]) catch return null;
+    const text = readFile(arena, knobs) orelse return null;
+    const m = parse(arena, text) catch return null;
     if (stale(&m.id, live)) return null;
+    return m;
+}
+
+/// `load` under lever `p1`: the file when it parses and
+/// `machine_keys.refusal` finds no row on which it must not price this
+/// machine and build (`v`'s cards, read without the driver). Null
+/// otherwise, with one note per process naming the row; a missing file
+/// prints `noteUncalibrated`'s note.
+pub fn loadKeyed(arena: Allocator, knobs: Knobs, live: *const Identity, v: Vendor) ?Machine {
+    assert(live.cards <= cards_max);
+    const text = readFile(arena, knobs) orelse {
+        noteUncalibrated(live);
+        return null;
+    };
+    var row: []const u8 = "";
+    const m = parseRows(arena, text, &row) catch {
+        noteRefused(.{ .row = row, .missing = true });
+        return null;
+    };
+    const keys = machine_keys.live("", v, live);
+    if (machine_keys.refusal(&m, live, &keys)) |r| {
+        noteRefused(r);
+        return null;
+    }
+    assert(m.id.threads > 0);
     return m;
 }
 
 /// Parses a calibration file. Unknown rows (a newer espice's) are skipped;
 /// every `Constants` row and the `driver` and `threads` rows are required.
 pub fn parse(arena: Allocator, text: []const u8) ParseError!Machine {
+    var row: []const u8 = "";
+    return parseRows(arena, text, &row);
+}
+
+/// `parse`, naming in `row` the row a `Malformed` file lacks or holds
+/// unparsed (the line itself when it has no tab).
+pub fn parseRows(arena: Allocator, text: []const u8, row: *[]const u8) ParseError!Machine {
     const names = @typeInfo(Constants).@"struct".field_names;
     var m: Machine = .{ .id = .{}, .c = undefined };
     var seen: std.StaticBitSet(names.len) = .empty;
     var have_driver = false;
     var models: std.ArrayList(Model) = .empty;
+    var lus: std.ArrayList(Lu) = .empty;
+    var lanes: std.ArrayList(Lane) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0 or line[0] == '#') continue;
-        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.Malformed;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse {
+            row.* = line;
+            return error.Malformed;
+        };
         const key = line[0..tab];
         const value = line[tab + 1 ..];
+        row.* = key;
         if (std.mem.eql(u8, key, "driver")) {
             m.id.driver = Text.init(value) orelse return error.Malformed;
             have_driver = true;
@@ -294,6 +380,12 @@ pub fn parse(arena: Allocator, text: []const u8) ParseError!Machine {
             m.espice = Text.init(value) orelse return error.Malformed;
         } else if (std.mem.eql(u8, key, "model")) {
             try models.append(arena, try parseModel(value));
+        } else if (std.mem.eql(u8, key, "lu")) {
+            try lus.append(arena, try parseLu(value));
+        } else if (std.mem.eql(u8, key, "lane")) {
+            try lanes.append(arena, try parseLane(value));
+        } else if (try m.keys.parseRow(key, value)) {
+            // An identity row `loadKeyed` compares.
         } else inline for (names, 0..) |name, i| {
             if (std.mem.eql(u8, key, name)) {
                 @field(m.c, name) = try parseNumber(value);
@@ -301,8 +393,15 @@ pub fn parse(arena: Allocator, text: []const u8) ParseError!Machine {
             }
         }
     }
+    row.* = if (!have_driver) "driver" else if (m.id.threads == 0) "threads" else "";
+    inline for (names, 0..) |name, i| {
+        if (row.*.len == 0 and !seen.isSet(i)) row.* = name;
+    }
     if (seen.count() != names.len or !have_driver or m.id.threads == 0) return error.Malformed;
+    row.* = "";
     m.models = try models.toOwnedSlice(arena);
+    m.lus = try lus.toOwnedSlice(arena);
+    m.lanes = try lanes.toOwnedSlice(arena);
     assert(m.id.cards <= cards_max);
     return m;
 }
@@ -327,6 +426,7 @@ pub fn format(m: *const Machine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeByte('\n');
     }
     try w.print("threads\t{d}\np_cpus\t{s}\ne_cpus\t{s}\nespice\t{s}\n", .{ m.id.threads, m.id.p_cpus.slice(), m.id.e_cpus.slice(), m.espice.slice() });
+    try m.keys.format(w);
     inline for (@typeInfo(Constants).@"struct".field_names) |name| {
         const x = @field(m.c, name);
         assert(std.math.isFinite(x));
@@ -341,6 +441,8 @@ pub fn format(m: *const Machine, w: *std.Io.Writer) std.Io.Writer.Error!void {
         }
         try w.writeByte('\n');
     }
+    for (m.lus) |*l| try w.print("lu\t{x:0>16}\t{x:0>16}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{ l.host_key, l.image, l.n, l.flops, l.host_us, l.host_par_us, l.dev_us, l.table_us });
+    for (m.lanes) |*l| try w.print("lane\t{s}\t{x:0>16}\t{d}\t{d}\t{d}\n", .{ @tagName(l.family), l.image, l.width, l.tick_us, l.host_pt_us });
 }
 
 /// Writes `m` to its path under `knobs`' cache root: a `.tmp` beside it,
@@ -410,7 +512,51 @@ pub fn makeParents(buf: []u8, path_: []const u8) bool {
     return true;
 }
 
+/// `root ++ rel`'s first `buf.len` bytes from one read, or null when it
+/// cannot be read: sysfs and procfs files for `identity` and
+/// `machine_keys.live`.
+pub fn readAt(root: []const u8, rel: []const u8, buf: []u8) ?[]const u8 {
+    var path_buf: [1024]u8 = undefined;
+    const p = std.mem.printSentinel(&path_buf, "{s}{s}", .{ root, rel }, 0) catch return null;
+    const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const got = std.c.read(fd, buf.ptr, buf.len);
+    if (got <= 0) return null;
+    return buf[0..@intCast(got)];
+}
+
 // ---- private ----
+
+/// The calibration file's bytes under `knobs`' cache root, in `arena`;
+/// null when missing, unreadable or past `file_max`.
+fn readFile(arena: Allocator, knobs: Knobs) ?[]const u8 {
+    var buf: [512]u8 = undefined;
+    const p = path(&buf, knobs) orelse return null;
+    const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const text = arena.alloc(u8, file_max) catch return null;
+    var len: usize = 0;
+    for (0..file_max) |_| {
+        const got = std.c.read(fd, text[len..].ptr, text.len - len);
+        if (got < 0) return null;
+        if (got == 0) break;
+        len += @intCast(got);
+        if (len == text.len) return null;
+    }
+    return text[0..len];
+}
+
+/// Prints, once per process, which row keeps `auto` on the CPU under `p1`.
+fn noteRefused(r: machine_keys.Refusal) void {
+    const Once = struct {
+        var printed: std.atomic.Value(bool) = .init(false);
+    };
+    if (Once.printed.swap(true, .monotonic)) return;
+    if (@import("builtin").is_test) _ = test_hooks.notes.fetchAdd(1, .monotonic);
+    std.debug.print("note: auto runs on the CPU: the GPU calibration's '{s}' row {s}; run 'espice calibrate'\n", .{ r.row, if (r.missing) "is missing or does not parse" else "is not this machine's or build's" });
+}
 
 fn trim(t: []const u8) []const u8 {
     return std.mem.trim(u8, t, " \t\r\n");
@@ -509,18 +655,6 @@ fn kfdUuid(text: []const u8) ?[16]u8 {
     return null;
 }
 
-/// `root ++ rel`'s first `buf.len` bytes, or null when it cannot be read.
-fn readAt(root: []const u8, rel: []const u8, buf: []u8) ?[]const u8 {
-    var path_buf: [1024]u8 = undefined;
-    const p = std.mem.printSentinel(&path_buf, "{s}{s}", .{ root, rel }, 0) catch return null;
-    const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const got = std.c.read(fd, buf.ptr, buf.len);
-    if (got <= 0) return null;
-    return buf[0..@intCast(got)];
-}
-
 fn parseNumber(value: []const u8) ParseError!f64 {
     const x = std.fmt.parseFloat(f64, value) catch return error.Malformed;
     if (!std.math.isFinite(x)) return error.Malformed;
@@ -541,6 +675,38 @@ fn parseModel(value: []const u8) ParseError!Model {
     }
     if (cols.next() != null) return error.Malformed;
     return row;
+}
+
+/// An `lu` row's value: the two keys in hex, `n`, `flops`, then the times.
+fn parseLu(value: []const u8) ParseError!Lu {
+    var cols = std.mem.splitScalar(u8, value, '\t');
+    var row: Lu = undefined;
+    row.host_key = try parseHex(cols.next());
+    row.image = try parseHex(cols.next());
+    row.n = std.fmt.parseInt(u32, cols.next() orelse return error.Malformed, 10) catch return error.Malformed;
+    row.flops = std.fmt.parseInt(u64, cols.next() orelse return error.Malformed, 10) catch return error.Malformed;
+    inline for (.{ "host_us", "host_par_us", "dev_us", "table_us" }) |name|
+        @field(row, name) = try parseNumber(cols.next() orelse return error.Malformed);
+    if (cols.next() != null or row.n == 0) return error.Malformed;
+    return row;
+}
+
+/// A `lane` row's value: the family's name, the image in hex, the width,
+/// then the times.
+fn parseLane(value: []const u8) ParseError!Lane {
+    var cols = std.mem.splitScalar(u8, value, '\t');
+    var row: Lane = undefined;
+    row.family = std.meta.stringToEnum(Family, cols.next() orelse return error.Malformed) orelse return error.Malformed;
+    row.image = try parseHex(cols.next());
+    row.width = std.fmt.parseInt(u32, cols.next() orelse return error.Malformed, 10) catch return error.Malformed;
+    row.tick_us = try parseNumber(cols.next() orelse return error.Malformed);
+    row.host_pt_us = try parseNumber(cols.next() orelse return error.Malformed);
+    if (cols.next() != null or row.width == 0) return error.Malformed;
+    return row;
+}
+
+fn parseHex(col: ?[]const u8) ParseError!u64 {
+    return std.fmt.parseInt(u64, col orelse return error.Malformed, 16) catch error.Malformed;
 }
 
 test "machine: format then parse is bit-exact, and parse refuses a short file" {
@@ -670,4 +836,97 @@ test "machine: write then load, a stale identity loads nothing, an empty cache r
     var moved = live;
     moved.threads += 1;
     try std.testing.expect(load(a, knobs, &moved) == null);
+}
+
+test "machine: lu, lane and identity-key rows round-trip; a refused file names its row" {
+    // Oracle: the round trip itself (format -> parse -> format) on values
+    // that need all 17 digits, and rows removed or broken by hand.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = try parse(a, test_hooks.fixture);
+    // A file without the new rows formats with none of them.
+    var old: std.Io.Writer.Allocating = .init(a);
+    try format(&m, &old.writer);
+    for ([_][]const u8{ "\ngpu\t", "\ncpu\t", "\ncpus\t", "\nbuild\t", "\nlu\t", "\nlane\t" }) |key|
+        try std.testing.expect(std.mem.indexOf(u8, old.written(), key) == null);
+    var keys: machine_keys.Keys = .{ .n_gpus = 2, .cpu = Text.init("Intel(R) Core(TM) i9-14900HX").?, .cpus = 32, .build = machine_keys.build(), .seen = 15 };
+    keys.gpus[0] = Text.init("NVIDIA GeForce RTX 4060 Laptop GPU").?;
+    keys.gpus[1] = Text.init("NVIDIA A100-SXM4-80GB").?;
+    m.keys = keys;
+    const lus = [_]Lu{.{ .host_key = 0xfeed, .image = 0xdeadbeef00c0ffee, .n = 25_600, .flops = 156_000_000, .host_us = 1.0 / 3.0, .host_par_us = 0.1 + 0.2, .dev_us = 15_100, .table_us = 4.8e5 }};
+    const lanes = [_]Lane{.{ .family = .tran, .image = 7, .width = 1024, .tick_us = 2.0 / 3.0, .host_pt_us = 1.78e3 }};
+    m.lus = &lus;
+    m.lanes = &lanes;
+    var w1: std.Io.Writer.Allocating = .init(a);
+    try format(&m, &w1.writer);
+    const back = try parse(a, w1.written());
+    try std.testing.expectEqual(lus[0], back.lus[0]);
+    try std.testing.expectEqual(lanes[0], back.lanes[0]);
+    try std.testing.expectEqual(@as(usize, 1), back.lus.len);
+    try std.testing.expectEqual(@as(u8, 2), back.keys.n_gpus);
+    try std.testing.expectEqualStrings("NVIDIA A100-SXM4-80GB", back.keys.gpus[1].slice());
+    try std.testing.expectEqualStrings(keys.cpu.slice(), back.keys.cpu.slice());
+    try std.testing.expectEqual(keys.cpus, back.keys.cpus);
+    try std.testing.expectEqualStrings(keys.build.slice(), back.keys.build.slice());
+    try std.testing.expectEqual(keys.seen, back.keys.seen);
+    var w2: std.Io.Writer.Allocating = .init(a);
+    try format(&back, &w2.writer);
+    try std.testing.expectEqualStrings(w1.written(), w2.written());
+    // A missing constant, the driver, or a broken row: `parseRows` names it.
+    const text = w1.written();
+    const Cut = struct { start: []const u8, row: []const u8, with: []const u8 };
+    for ([_]Cut{
+        .{ .start = "\nslowdown\t", .row = "slowdown", .with = "" },
+        .{ .start = "\ndriver\t", .row = "driver", .with = "" },
+        .{ .start = "\nlu\t", .row = "lu", .with = "lu\tfeed\n" },
+        .{ .start = "\nlane\t", .row = "lane", .with = "lane\tac\t7\t1024\t1\t1\n" },
+        .{ .start = "\ncpus\t", .row = "cpus", .with = "cpus\tmany\n" },
+    }) |c| {
+        const at = std.mem.indexOf(u8, text, c.start).? + 1;
+        const end = at + std.mem.indexOfScalar(u8, text[at..], '\n').? + 1;
+        const cut = try std.mem.concat(a, u8, &.{ text[0..at], c.with, text[end..] });
+        var row: []const u8 = "";
+        try std.testing.expectError(error.Malformed, parseRows(a, cut, &row));
+        try std.testing.expectEqualStrings(c.row, row);
+    }
+}
+
+test "machine: loadKeyed loads this machine's file and refuses another build's" {
+    // Oracle: the live machine's own keys written and read back, then one
+    // row changed by hand; HEAD's `load` beside it ignores the new rows.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [128]u8 = undefined;
+    const knobs: Knobs = .{ .xdg_cache_home = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const live = identity("", .nvidia);
+    try std.testing.expect(loadKeyed(a, knobs, &live, .nvidia) == null);
+    var m = try parse(a, test_hooks.fixture);
+    m.id = live;
+    m.keys = machine_keys.live("", .nvidia, &live);
+    try write(std.testing.allocator, &m, knobs);
+    const got = loadKeyed(a, knobs, &live, .nvidia) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.mem.toBytes(m.c), std.mem.toBytes(got.c));
+    // Another affinity thread count: HEAD's `stale` refuses, `p1` keeps it.
+    var pinned = live;
+    pinned.threads += 1;
+    try std.testing.expect(loadKeyed(a, knobs, &pinned, .nvidia) != null);
+    try std.testing.expect(load(a, knobs, &pinned) == null);
+    // A Debug binary's file prices nothing for this build; HEAD loads it.
+    m.keys.build = Text.init("Debug x86_64 abi0").?;
+    try write(std.testing.allocator, &m, knobs);
+    try std.testing.expect(loadKeyed(a, knobs, &live, .nvidia) == null);
+    try std.testing.expect(load(a, knobs, &live) != null);
+    // A file from before the keys: refused under `p1`, loaded by HEAD.
+    m.keys = .{};
+    try write(std.testing.allocator, &m, knobs);
+    try std.testing.expect(loadKeyed(a, knobs, &live, .nvidia) == null);
+    try std.testing.expect(load(a, knobs, &live) != null);
+}
+
+test {
+    _ = @import("machine_keys.zig");
 }

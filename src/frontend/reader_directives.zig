@@ -1,6 +1,6 @@
 //! Directive cards: analyses, `.options`, `.ic`, `.save`, `.probe`, `.step`,
 //! `.wcd`, `.mosra`, `.sample`, and the global `.param` fold.
-//! Cites: ngspice inp.c; HSPICE [CR] .SAVE, .PROBE, .SAMPLE, .MOSRA, [SA]
+//! Cites: ngspice inp.c, inpc_probe.c; HSPICE [CR] .SAMPLE, .MOSRA, [SA]
 //! Ch.29; #236-#240.
 //!
 //! Contents:
@@ -11,10 +11,8 @@
 //! - `pub fn isStep(line: []const u8) bool`
 //! - `pub fn isWcd(line: []const u8) bool`
 //! - `pub fn readDirective(r: *R, line: []const u8) Error!void`
-//! - `pub fn readProbe(r: *R, line: []const u8) Error!void`
 //! - `pub fn readMosra(r: *R, line: []const u8, args: []const Value) Error!Mosra`
 //! - `pub fn readSample(args: []const Value) Error!core.query.NoiseSample`
-//! - `pub fn readSaveOp(r: *R, line: []const u8, f: *F) Error!void`
 //! - `pub fn written(r: *const R, line: []const u8) []const u8`
 //! - `pub fn failed(r: *R, line: []const u8, err: Error) Error`
 //! - `pub fn liveParam(r: *R, name: []const u8) Error!?u32`
@@ -25,7 +23,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -162,8 +159,7 @@ pub fn Methods(comptime S: type) type {
             r.card = line;
             var f = F.init(line);
             const card = cardOf(f.next().?[1..]);
-            // Read once every analysis card is: HSPICE's untyped `.meas`
-            // takes the last one.
+            // Read after the walk (`readMeasures`).
             if (card != null and card.? == .meas) return r.meas_lines.append(r.arena, line);
             const c = card orelse return r.unsupported(line, "unsupported card");
             if (c == .wcd) {
@@ -172,10 +168,10 @@ pub fn Methods(comptime S: type) type {
                 return;
             }
             if (c == .ignored) {
-                if (r.dialect != .ngspice and std.ascii.startsWithIgnoreCase(line, ".probe")) try r.readProbe(line);
-                return;
+                if (!std.ascii.startsWithIgnoreCase(line, ".probe")) return;
+                return ngspiceProbe(r, line);
             }
-            if (c == .save and r.dialect == .hspice) return r.readSaveOp(line, &f);
+            if (c == .save and isSaveOp(line)) return readSaveOp(r, line, &f);
             // HSPICE `.store` checkpoints the process on a wall-clock
             // schedule for an OS-level restore [CR .STORE]; the results do not
             // depend on it.
@@ -188,9 +184,10 @@ pub fn Methods(comptime S: type) type {
             switch (c) {
                 .step => try r.steps.append(r.arena, r.readStep(args) catch |err| return r.failed(line, err)),
                 .analysis => |kind| {
-                    // HSPICE's `.temp t1 t2 ...` lists run temperatures; ngspice's
-                    // three-number form is a sweep.
-                    const temp_list = kind == .temp and args.len > 1 and r.dialect == .hspice;
+                    // Every `.temp` card is configuration, never an analysis:
+                    // analysis_options.zig folds the last one as ngspice 44.2
+                    // does (measured). A temperature sweep is `.dc temp`.
+                    if (kind == .temp) return r.config.append(r.arena, .{ .temp = true, .args = args, .line = r.written(line) });
                     var swept = r.readSweep(kind, args) catch |err| return r.failed(line, err);
                     const scaled = swept.sweep == .monte and swept.sweep.monte.scales.len != 0;
                     if (scaled != (fail.len != 0)) return r.unsupported(line, "SIGMA_SCALE= without FAIL=, or FAIL= without SIGMA_SCALE=");
@@ -200,11 +197,18 @@ pub fn Methods(comptime S: type) type {
                         if (kind == .dc and swept.args.len == 0) return r.unsupported(line, "SIGMA_SCALE on a .dc with no sweep of its own");
                         swept.sweep.monte.fail.text = fail;
                     }
-                    if (!temp_list) try appendAnalysis(r.arena, &r.analyses, .{ .kind = kind, .args = swept.args, .sweep = swept.sweep, .line = r.written(line), .dialect = r.dialect, .sn = isSn(line) });
-                    if (kind == .temp and (args.len == 1 or temp_list)) try r.config.append(r.arena, .{ .temp = true, .args = args, .line = r.written(line) });
+                    try appendAnalysis(r.arena, &r.analyses, .{ .kind = kind, .args = swept.args, .sweep = swept.sweep, .line = r.written(line), .sn = isSn(line) });
                 },
                 .options => try r.config.append(r.arena, .{ .temp = false, .args = args, .line = r.written(line) }),
-                .ic => try r.ic_cards.append(r.arena, args),
+                .ic, .nodeset => {
+                    // ngspice 44.2 reads `v(net)=value` pairs and `.nodeset
+                    // all=value`; HSPICE's bare `net value` is its `.ic syntax
+                    // error` (measured).
+                    var i: usize = 0;
+                    while (i < args.len) : (i += 2) if (args[i] != .group and !(c == .nodeset and std.ascii.eqlIgnoreCase(Value.nameAt(args, i) orelse "", "all")))
+                        return r.failed(line, error.ParseError);
+                    try (if (c == .ic) &r.ic_cards else &r.nodeset_cards).append(r.arena, args);
+                },
                 .sample => r.sample = readSample(args) catch |err| return r.failed(line, err),
                 .mosra => r.mosra = try r.readMosra(line, args),
                 .appendmodel => {
@@ -214,7 +218,6 @@ pub fn Methods(comptime S: type) type {
                         return r.unsupported(line, ".appendmodel other than `src mosra dst type`");
                     try r.appendmodels.append(r.arena, .{ .src = args[0].name, .dst = args[2].name });
                 },
-                .nodeset => try r.nodeset_cards.append(r.arena, args),
                 .global => for (args) |a| {
                     var buf: [24]u8 = undefined;
                     const name = nodeText(a, &buf) orelse return error.ParseError;
@@ -229,41 +232,8 @@ pub fn Methods(comptime S: type) type {
                     var bufs: [2][24]u8 = undefined;
                     try r.connect(nodeText(args[0], &bufs[0]) orelse return error.ParseError, nodeText(args[1], &bufs[1]) orelse return error.ParseError);
                 },
-                .save => for (args) |a| switch (a) {
-                    .group => |g| if (g.args().len == 1 and (std.ascii.eqlIgnoreCase(g.name(), "v") or std.ascii.eqlIgnoreCase(g.name(), "i"))) {
-                        var buf: [24]u8 = undefined;
-                        const name = nodeText(g.args()[0], &buf) orelse continue;
-                        const label = try r.arena.print("{c}({s})", .{ std.ascii.toLower(g.name()[0]), name });
-                        try r.saves.append(r.arena, std.ascii.lowerString(label, label));
-                    },
-                    .name => |n| if (std.ascii.eqlIgnoreCase(n, "all")) {
-                        r.save_all = true;
-                    } else if (n[0] == '@') {
-                        // A device operating-point variable (`@m1[gm]`, #236);
-                        // `prepare` resolves it or refuses the deck.
-                        const label = try r.arena.dupe(u8, n);
-                        try r.opvar_saves.append(r.arena, std.ascii.lowerString(label, label));
-                        // Holds `saves` non-empty, so the probes narrow.
-                        try r.saves.append(r.arena, label);
-                    },
-                    else => {},
-                },
+                .save => for (args) |a| try saveItem(r, line, a),
                 else => {},
-            }
-        }
-
-        /// HSPICE `.probe` [CR .PROBE], and Spectre's `save` as spectre.zig
-        /// rewrites it: `op` saves every device's operating-point variables
-        /// and an `isOpVar` name that one (#236). Every other output is
-        /// written anyway, as HSPICE does without `.option probe`.
-        pub fn readProbe(r: *R, line: []const u8) Error!void {
-            var it = std.mem.tokenizeAny(u8, line, " \t,");
-            _ = it.next(); // the card
-            while (it.next()) |t| {
-                const name = try std.ascii.allocLowerString(r.arena, t);
-                if (std.mem.eql(u8, name, "op")) {
-                    r.probe_op = true;
-                } else if (isOpVar(r.dialect, name)) try r.opvar_saves.append(r.arena, name);
             }
         }
 
@@ -315,36 +285,6 @@ pub fn Methods(comptime S: type) type {
             return s;
         }
 
-        /// HSPICE `.save [TYPE=NODESET|IC] [FILE=] [LEVEL=ALL|TOP|SELECT|NONE]
-        /// [TIME=]` [CR .SAVE]. SELECT saves every node, as ALL; NONE saves
-        /// nothing. The last card wins.
-        pub fn readSaveOp(r: *R, line: []const u8, f: *F) Error!void {
-            var save: core.SaveOp = .{};
-            var none_level = false;
-            while (f.next()) |key| {
-                if (!F.isWord(key) or !f.takeEq()) return r.failed(line, error.ParseError);
-                const Key = enum { type, file, level, time };
-                switch (std.meta.stringToEnum(Key, key) orelse return r.failed(line, error.ParseError)) {
-                    .file => save.file = try r.pathOf(f),
-                    .time => save.time = S.parseNum(f.next() orelse "") orelse return r.failed(line, error.ParseError),
-                    .type => {
-                        const v = f.next() orelse "";
-                        if (!std.mem.eql(u8, v, "ic") and !std.mem.eql(u8, v, "nodeset")) return r.failed(line, error.ParseError);
-                        save.ic = std.mem.eql(u8, v, "ic");
-                    },
-                    .level => {
-                        const v = f.next() orelse "";
-                        const levels = std.StaticStringMap(void).initComptime(.{ .{"all"}, .{"top"}, .{"select"}, .{"none"} });
-                        if (!levels.has(v)) return r.failed(line, error.ParseError);
-                        save.top_only = std.mem.eql(u8, v, "top");
-                        none_level = std.mem.eql(u8, v, "none");
-                    },
-                }
-            }
-            if (!(save.time >= 0)) return r.failed(line, error.ParseError);
-            r.save_op = if (none_level) null else save;
-        }
-
         /// `line` as the deck spells it: the original case when `line` is a
         /// slice of the parsed text, else the joined continuation as read.
         pub fn written(r: *const R, line: []const u8) []const u8 {
@@ -388,22 +328,42 @@ pub fn Methods(comptime S: type) type {
         /// live name is known, so each link of a chain reads its
         /// predecessor's number and `subst` recurses one level per read, not
         /// one per link (#110). A value that reads a live name, draws a
-        /// distribution or does not fold keeps its text, and an error stays
-        /// for the card that reads it.
+        /// distribution or reads `temper` keeps its text, and an error stays
+        /// for the card that reads it, except a refusal `subst` logged (an
+        /// unknown function) and a read of a name nothing defines or of the
+        /// circuit, which fail the deck read or not, as ngspice's numparam
+        /// does.
         pub fn foldGlobals(r: *R) Error!void {
             const top: Frame = .{ .scopes = &r.global_scopes };
             const was_in_card = r.in_card;
             r.in_card = true;
             defer r.in_card = was_in_card;
+            // A refusal names the parameter's text.
+            const card = r.card;
+            defer r.card = card;
             for (r.global_keys.items) |key| {
                 const entry = r.globals.getPtr(key).?;
                 if (entry.* != .text) continue;
                 const ops_mark = r.ops.items.len;
                 const consts_mark = r.consts.items.len;
                 const sites_mark = r.site_ops.items.len;
+                r.card = entry.text;
+                const logged = r.logged;
                 const v: ?Value = r.exprValue(entry.text, &top, false) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    else => null, // else: the reading card reports it
+                    else => if (r.logged and !logged) return err else null, // else: the reading card reports it
+                };
+                // numparam evaluates each .param where it stands and stops on
+                // a name it does not define, read or not: ngspice-44.2 says
+                // "Undefined parameter [hertz]", and so for time, temp, pi,
+                // w and v(a). Only `temper` (final `.ident` 3) waits for its
+                // reader: ngspice makes that .param a .func (inpcom.c
+                // inp_fix_temper_in_param), which runs where the reading card
+                // reads temper and stops elsewhere (temper_slots.zig).
+                if (v) |x| if (x == .expr) for (r.ops.items[x.expr.start..][0..x.expr.len]) |op| switch (op.code) {
+                    .ident => if (op.a != 3) return r.unsupported(entry.text, "a .param that reads a name no .param defines: ngspice-44.2 stops on it, read or not"),
+                    .vprobe, .iprobe => return r.unsupported(entry.text, "a .param that reads the circuit: ngspice-44.2 stops on it, read or not"),
+                    else => {}, // else: constants, operators, calls and live names
                 };
                 r.ops.shrinkRetainingCapacity(ops_mark);
                 r.consts.shrinkRetainingCapacity(consts_mark);
@@ -415,9 +375,22 @@ pub fn Methods(comptime S: type) type {
             }
         }
 
-        /// A swept name: a global `.param`, `temp`, or a card.
+        /// A swept name: `temp`, a top-level card, or a global `.param`. A
+        /// card wins over a `.param` of its name, as in ngspice, whose `.dc`
+        /// looks a name up among the resistors, the V and the I sources,
+        /// then as `temp` and `@inst[param]`, never among the parameters
+        /// (dctrcurv.c:156-247). Every sweep that names its quantity (`.dc`,
+        /// `.step`, a SWEEP tail, a `.data` column) resolves here. Cards
+        /// match case-insensitively, as `analysis_time.dcTarget` finds them.
+        // ponytail: a scan of the top-level cards per swept name; index
+        // them when a deck sweeps many names over millions of cards.
         pub fn stepTarget(r: *R, name: []const u8) Error!StepTarget {
             if (std.mem.eql(u8, name, "temp")) return .temp;
+            for (r.top_devices) |i| {
+                var f = F.init(r.lines.items[i]);
+                const head = f.next() orelse continue;
+                if (std.ascii.eqlIgnoreCase(head, name)) return .{ .card = name };
+            }
             if (try r.liveParam(name)) |k| return .{ .param = k };
             return .{ .card = name };
         }
@@ -450,6 +423,122 @@ pub fn Methods(comptime S: type) type {
             const n = try r.numbers(args[i..]);
             if (n.len != 3) return error.ParseError;
             return .{ .target = target, .values = try points(r.arena, grid, n[0], n[1], n[2], .per_unit) };
+        }
+
+        // ---- private ----
+
+        /// One item of an ngspice `.save`, as ngspice 44.2 saves it (manual
+        /// 11.6.1; measured with `-b -r`): `all` and `allv` save everything,
+        /// a node `n`, `v(n)`, `v(a, b)` and `vm`, `vp`, `vr`, `vdb` of nodes
+        /// each node, `i(x)` and `x#branch` the branch current, `@dev[p]`
+        /// the operating-point variable (#236), which `prepare` resolves or
+        /// refuses. `.save` narrows the output, so an item it cannot read
+        /// (`alli`, `vi(n)`, a quoted expression) refuses the card rather
+        /// than drop a vector. Two skips are ngspice's: the operator tail of
+        /// `v(a)/10`, which saves v(a), and a name nothing publishes, which
+        /// `prepare` drops (`keepSaved`) where ngspice saves nothing.
+        fn saveItem(r: *R, line: []const u8, a: Value) Error!void {
+            var buf: [24]u8 = undefined;
+            switch (a) {
+                .name => |n| if (std.ascii.eqlIgnoreCase(n, "all") or std.ascii.eqlIgnoreCase(n, "allv")) {
+                    r.save_all = true;
+                } else if (n[0] == '@') {
+                    const label = try r.arena.dupe(u8, n);
+                    try r.opvar_saves.append(r.arena, std.ascii.lowerString(label, label));
+                    // Holds `saves` non-empty, so the probes narrow.
+                    try r.saves.append(r.arena, label);
+                } else if (std.ascii.endsWithIgnoreCase(n, "#branch")) {
+                    try save(r, 'i', n[0 .. n.len - "#branch".len]);
+                } else if (std.ascii.eqlIgnoreCase(n, "alli")) {
+                    return r.unsupported(line, ".save alli: device terminal currents are not written");
+                } else if (!R.operatorLed(n)) try save(r, 'v', n),
+                .num => try save(r, 'v', nodeText(a, &buf) orelse return r.unsupported(line, "a .save number that names no node")),
+                .group => |g| {
+                    const voltage = std.StaticStringMap(void).initComptime(.{ .{"v"}, .{"vm"}, .{"vp"}, .{"vr"}, .{"vdb"} });
+                    var name_buf: [4]u8 = undefined;
+                    const fun = if (g.name().len <= name_buf.len) std.ascii.lowerString(&name_buf, g.name()) else "";
+                    const current = std.mem.eql(u8, fun, "i") and g.args().len == 1;
+                    if (!current and !voltage.has(fun)) return r.unsupported(line, "a .save function other than v, vm, vp, vr, vdb or i");
+                    for (g.args()) |arg| try save(r, if (current) 'i' else 'v', nodeText(arg, &buf) orelse return r.unsupported(line, "a .save argument that names no node or device"));
+                },
+                else => return r.unsupported(line, "a .save item other than a node, v(), i(), x#branch, @dev[p], all or allv"),
+            }
+        }
+
+        /// Appends the output label `kind(name)`, lowercased, to the saves.
+        fn save(r: *R, kind: u8, name: []const u8) Error!void {
+            const label = try r.arena.print("{c}({s})", .{ kind, name });
+            try r.saves.append(r.arena, std.ascii.lowerString(label, label));
+        }
+
+        /// ngspice's `.probe` (inpc_probe.c). `v(node)` saves the node as
+        /// `.save v(node)` does (:375-378); with no `.save` in the deck
+        /// ngspice adds `.save all` (:66-95), which every output already is.
+        /// `i()`, `vd()`, `p()`, `alli` and a bare `.probe` insert measuring
+        /// sources ESPice does not build, so they refuse the card by name
+        /// rather than lose its vectors. An item led by none of these is
+        /// skipped with a warning, as ngspice skips it (:118-128, :921-924).
+        fn ngspiceProbe(r: *R, line: []const u8) Error!void {
+            var rest = std.mem.trim(u8, line[".probe".len..], " \t");
+            var words = std.mem.tokenizeAny(u8, rest, " \t,()");
+            while (words.next()) |w| if (std.ascii.eqlIgnoreCase(w, "alli")) return r.unsupported(line, "ngspice .probe alli");
+            if (rest.len == 0) return r.unsupported(line, "a bare ngspice .probe, which is .probe alli");
+            const narrowed = for (r.lines.items) |l| {
+                if (std.ascii.startsWithIgnoreCase(l, ".save") and !isSaveOp(l)) break true;
+            } else false;
+            // Items end at their `)`, as ngspice cuts them (gettok_char).
+            while (rest.len != 0) {
+                const close = std.mem.indexOfScalar(u8, rest, ')') orelse rest.len - 1;
+                const item = std.mem.trim(u8, rest[0 .. close + 1], " \t");
+                rest = std.mem.trim(u8, rest[close + 1 ..], " \t");
+                if (std.ascii.startsWithIgnoreCase(item, "vd(") or std.ascii.startsWithIgnoreCase(item, "i(") or std.ascii.startsWithIgnoreCase(item, "p("))
+                    return r.unsupported(line, "an ngspice .probe of i(), vd() or p(): its measuring sources are not built");
+                if (!std.ascii.startsWithIgnoreCase(item, "v(") or item[item.len - 1] != ')') {
+                    if (!@import("builtin").is_test) std.log.warn("netlist: .probe item '{s}' skipped, as ngspice skips it (inpc_probe.c:118-128): {s}", .{ item, r.written(line) });
+                    continue;
+                }
+                var nodes = std.mem.tokenizeAny(u8, item[2 .. item.len - 1], " \t,");
+                if (narrowed) while (nodes.next()) |node| try save(r, 'v', node);
+            }
+        }
+
+        /// ESPice's operating-point `.save` (HSPICE's [CR .SAVE] spelling):
+        /// `.save [TYPE=NODESET|IC] [FILE=] [LEVEL=ALL|TOP|SELECT|NONE]
+        /// [TIME=]`. SELECT saves every node, as ALL; NONE saves nothing.
+        /// The last card wins. ngspice's `.save` vector list never carries a
+        /// `key=value` field, so one of these keys selects this reading.
+        fn readSaveOp(r: *R, line: []const u8, f: *F) Error!void {
+            var op: core.SaveOp = .{};
+            var none_level = false;
+            while (f.next()) |key| {
+                if (!F.isWord(key) or !f.takeEq()) return r.failed(line, error.ParseError);
+                const Key = enum { type, file, level, time };
+                switch (std.meta.stringToEnum(Key, key) orelse return r.failed(line, error.ParseError)) {
+                    .file => op.file = try r.pathOf(f),
+                    .time => op.time = S.parseNum(f.next() orelse "") orelse return r.failed(line, error.ParseError),
+                    .type => {
+                        const v = f.next() orelse "";
+                        if (!std.mem.eql(u8, v, "ic") and !std.mem.eql(u8, v, "nodeset")) return r.failed(line, error.ParseError);
+                        op.ic = std.mem.eql(u8, v, "ic");
+                    },
+                    .level => {
+                        const v = f.next() orelse "";
+                        const levels = std.StaticStringMap(void).initComptime(.{ .{"all"}, .{"top"}, .{"select"}, .{"none"} });
+                        if (!levels.has(v)) return r.failed(line, error.ParseError);
+                        op.top_only = std.mem.eql(u8, v, "top");
+                        none_level = std.mem.eql(u8, v, "none");
+                    },
+                }
+            }
+            if (!(op.time >= 0)) return r.failed(line, error.ParseError);
+            r.save_op = if (none_level) null else op;
+        }
+
+        /// True when the `.save` card `line` carries a `type=`, `file=`,
+        /// `level=` or `time=` key: the operating-point save, not ngspice's
+        /// vector list.
+        fn isSaveOp(line: []const u8) bool {
+            return setsKey(line, "type") or setsKey(line, "file") or setsKey(line, "level") or setsKey(line, "time");
         }
     };
 }

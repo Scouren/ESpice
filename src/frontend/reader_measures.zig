@@ -1,13 +1,12 @@
 //! `.meas`, `.check`, `.power` and `.stim` cards, the cards that read them
 //! (`FAIL=`, `.wcd`), and the measure callbacks measure.zig evaluates values
 //! through.
-//! Cites: ngspice com_measure2.c; HSPICE [CR] .MEASURE, .STIM, .POWER;
-//! #238-#240.
+//! Cites: ngspice measure.c, com_measure2.c, manual §11.6 (par());
+//! HSPICE [CR] .MEASURE, .STIM, .POWER; #238-#240.
 //!
 //! Contents:
 //! - `pub fn Methods(comptime S: type) type`
 //! - `pub fn readMeasures(r: *R) Error!void`
-//! - `pub fn skipBad(err: anyerror, line: []const u8) error{OutOfMemory}!void`
 //! - `pub fn readPower(r: *R, f: *F, serial: u32) Error!void`
 //! - `pub fn readStim(r: *R, f: *F, serials: *[2]u32) Error!void`
 //! - `pub fn sourcePower(r: *R, name: []const u8) Error![]const u8`
@@ -20,7 +19,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -34,11 +32,10 @@ const reader = @import("reader.zig");
 const card_rows = @import("card_rows.zig");
 const netlist_view = @import("netlist_view.zig");
 const reader_frame = @import("reader_frame.zig");
-const Kind = card_rows.Kind;
 const Error = card_rows.Error;
 const Wcd = card_rows.Wcd;
 const WcdSpec = card_rows.WcdSpec;
-const isGround = netlist_view.isGround;
+const isGroundName = netlist_view.isGroundName;
 const Frame = reader_frame.Frame;
 
 /// The stage's `Reader` methods over dialect syntax `S`; `Reader(S)`
@@ -48,42 +45,37 @@ pub fn Methods(comptime S: type) type {
     return struct {
         const R = reader.Reader(S);
 
-        /// Parses the `.meas` cards in deck order. ngspice reports a bad one
-        /// and simulates anyway.
+        /// Parses the `.meas` cards in deck order. A card that cannot be
+        /// read refuses the deck, naming it: a skipped card is an output
+        /// silently lost. A `.meas` card ngspice itself skips is skipped
+        /// with a warning (`ngspiceSkips`).
         pub fn readMeasures(r: *R) Error!void {
-            var last: ?Kind = null;
-            if (r.dialect == .hspice) for (r.analyses.items) |a| switch (a.kind) {
-                .tran, .ac, .dc => last = a.kind,
-                else => {},
-            };
             var jitters: u32 = 0;
             var checks: u32 = 0;
             var powers: u32 = 0;
             var stims: [2]u32 = @splat(0);
             var global_level: ?measure.Levels = null;
+            // `measureExpr` names `r.card` when it refuses one; the passes
+            // after this one read no one card.
+            defer r.card = "";
             for (r.meas_lines.items) |line| {
-                // HSPICE writes a measure's expression as `par('...')` or
-                // quoted; a brace is a name byte there, and a measure card
-                // holding one is refused, not skipped (#203). lower.zig
-                // `prescan` refuses the same.
-                if (r.dialect == .hspice and std.mem.indexOfScalar(u8, line, '{') != null)
-                    return r.unsupported(line, "a braced expression (HSPICE quotes expressions: '...')");
+                r.card = line;
                 var f = F.init(line);
                 var text = f.rest();
                 const head = f.next().?[1..];
                 if (std.mem.eql(u8, head, "check") or std.mem.eql(u8, head, "dout") or std.mem.eql(u8, head, "biaschk")) {
                     const n = r.measures.items.len;
-                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| try skipBad(err, line);
+                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| return refuse(r, line, err);
                     if (r.measures.items.len > n) checks += 1;
                     continue;
                 }
                 if (std.mem.eql(u8, head, "power")) {
                     powers += 1;
-                    r.readPower(&f, powers) catch |err| try skipBad(err, line);
+                    r.readPower(&f, powers) catch |err| return refuse(r, line, err);
                     continue;
                 }
                 if (std.mem.startsWith(u8, head, "stim")) {
-                    r.readStim(&f, &stims) catch |err| try skipBad(err, line);
+                    r.readStim(&f, &stims) catch |err| return refuse(r, line, err);
                     continue;
                 }
                 if (std.mem.eql(u8, head, "jitter")) {
@@ -95,23 +87,16 @@ pub fn Methods(comptime S: type) type {
                         try r.arena.print("{s} jitter jitter {s}", .{ kind, f.rest() })
                     else
                         try r.arena.print("{s} jitter{d} jitter {s}", .{ kind, jitters, f.rest() });
-                } else text = f.rest();
-                const m = measure.parse(r.arena, text, r, last, r.dialect == .hspice) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => {
-                        std.log.warn("netlist: ignoring malformed card '{s}'", .{line});
+                } else {
+                    text = f.rest();
+                    if (ngspiceSkips(text)) {
+                        if (!@import("builtin").is_test) std.log.warn("netlist: skipped, as ngspice skips an incomplete .meas card or one of an analysis it does not measure (measure.c:286-311): {s}", .{r.written(line)});
                         continue;
-                    },
-                };
+                    }
+                }
+                const m = measure.parse(r.arena, text, r, null, false) catch |err| return refuse(r, line, err);
                 try r.measures.append(r.arena, m);
             }
-        }
-
-        /// Logs a card `readMeasures` cannot take and goes on, as ngspice
-        /// does; only `OutOfMemory` fails the parse.
-        pub fn skipBad(err: anyerror, line: []const u8) error{OutOfMemory}!void {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line});
         }
 
         /// HSPICE `.power signal [REF=] [FROM=] [TO=]` [CR .POWER] as four
@@ -243,49 +228,88 @@ pub fn Methods(comptime S: type) type {
                 if (!std.mem.eql(u8, f.next() orelse continue, name)) continue;
                 const p = f.next() orelse return error.ParseError;
                 const n = f.next() orelse return error.ParseError;
-                if (isGround(r.dialect, n)) return r.arena.print("par('v({s})*i({s})')", .{ p, name });
+                if (isGroundName(n)) return r.arena.print("par('v({s})*i({s})')", .{ p, name });
                 return r.arena.print("par('(v({s})-v({s}))*i({s})')", .{ p, n, name });
             }
             return error.ParseError;
         }
 
-        /// A `PARAM=` or `par()` measure expression in postfix: names of
-        /// earlier `.meas` cards read their results, global parameters fold
-        /// to numbers, `v(a[,b])` and `i(x)` read result vectors, and
-        /// `soa_count()` the result's SOA excursions (#238). Arithmetic
-        /// only; anything else is a ParseError. The ops live in the arena.
+        /// A `PARAM=` or `par()` measure expression in postfix, read as
+        /// ngspice reads it: numparam over the deck's parameters and the
+        /// results so far (measure.c:459-466), a B source's expression for
+        /// `par()` (manual §11.6). Each largest part that reads no result
+        /// folds to a number now, as a `.param` value does, `.func` calls
+        /// and built-ins included. What stays reads earlier `.meas` results
+        /// by name, `v(a[,b])`, `i(x)`, `time` (the scale) and `soa_count()`
+        /// (#238), through arithmetic, comparisons, logic and `c ? a : b`.
+        /// A function, `%` or `\` of a result, or a name that is neither a
+        /// result nor a parameter, refuses the card `r.card`. The ops live
+        /// in the arena.
         pub fn measureExpr(r: *R, text: []const u8) Error![]const core.MeasureOp {
             const body = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text;
             const mark = r.scratch.mark();
             defer r.scratch.reset(mark);
             try expr.compileAll(S, r.arena, &r.scratch, body);
-            // Copies: folding a parameter below reuses the scratch.
+            // Copies: folding a part below appends to the scratch.
             const ops = try r.arena.dupe(expr.Op, r.scratch.ops.items[mark.ops..]);
             const names = try r.arena.dupe([]const u8, r.scratch.names.items);
-            const consts = try r.arena.dupe(f64, r.scratch.consts.items);
+            // Which ops read a result, and the op that takes each one.
+            const reads = try r.arena.alloc(bool, ops.len);
+            const parent = try r.arena.alloc(usize, ops.len);
+            var open: std.ArrayList(usize) = .empty;
+            for (ops, 0..) |op, k| {
+                reads[k] = switch (op.code) {
+                    .vprobe, .iprobe => true,
+                    .ident => measureIndex(r, names[op.a]) != null or std.mem.eql(u8, names[op.a], "time"),
+                    .ucall => op.b == 0 and std.ascii.eqlIgnoreCase(names[op.a], "soa_count"),
+                    else => false, // else: a constant, or an operator that reads what its operands read
+                };
+                for (0..expr.arity(op)) |_| {
+                    const c = open.pop().?;
+                    parent[c] = k;
+                    reads[k] = reads[k] or reads[c];
+                }
+                try open.append(r.arena, k);
+            }
+            assert(open.items.len == 1);
             var out: std.ArrayList(core.MeasureOp) = .empty;
-            for (ops) |op| try out.append(r.arena, switch (op.code) {
-                .num => .{ .num = consts[op.a] },
-                .vprobe, .iprobe => {
-                    const letter = if (op.code == .vprobe) "v" else "i";
-                    try out.append(r.arena, .{ .vector = try r.arena.print("{s}({s})", .{ letter, names[op.a] }) });
-                    if (op.b == expr.none) continue;
-                    try out.append(r.arena, .{ .vector = try r.arena.print("{s}({s})", .{ letter, names[op.b] }) });
-                    try out.append(r.arena, .sub);
+            for (ops, 0..) |op, k| {
+                if (!reads[k]) {
+                    if (k + 1 == ops.len or reads[parent[k]]) try out.append(r.arena, .{ .num = try foldPart(r, ops[expr.subtreeStart(ops, k) .. k + 1]) });
                     continue;
-                },
-                .ident => for (r.measures.items, 0..) |m, i| {
-                    if (std.mem.eql(u8, m.name, names[op.a])) break .{ .measure = @intCast(i) };
-                } else .{ .num = try r.measureValue(names[op.a]) },
-                .neg => .neg,
-                .add => .add,
-                .sub => .sub,
-                .mul => .mul,
-                .div => .div,
-                .pow => .pow,
-                .ucall => if (op.b == 0 and std.ascii.eqlIgnoreCase(names[op.a], "soa_count")) .soa_count else return error.ParseError,
-                else => return error.ParseError,
-            });
+                }
+                try out.append(r.arena, switch (op.code) {
+                    .vprobe, .iprobe => {
+                        const letter = if (op.code == .vprobe) "v" else "i";
+                        try out.append(r.arena, .{ .vector = try r.arena.print("{s}({s})", .{ letter, names[op.a] }) });
+                        if (op.b == expr.none) continue;
+                        try out.append(r.arena, .{ .vector = try r.arena.print("{s}({s})", .{ letter, names[op.b] }) });
+                        try out.append(r.arena, .sub);
+                        continue;
+                    },
+                    .ident => if (measureIndex(r, names[op.a])) |i| .{ .measure = i } else .{ .vector = "time" },
+                    .ucall => if (op.b == 0) .soa_count else return r.unsupported(r.card, try r.arena.print("a call of '{s}' on a .meas result or vector", .{names[op.a]})),
+                    .call => if (op.a == @backingInt(expr.Fn.ternary) and op.b == 3) .ternary else return r.unsupported(r.card, "a built-in function of a .meas result or vector"),
+                    .neg => .neg,
+                    .not => .not,
+                    .add => .add,
+                    .sub => .sub,
+                    .mul => .mul,
+                    .div => .div,
+                    .pow => .pow,
+                    .lt => .lt,
+                    .gt => .gt,
+                    .le => .le,
+                    .ge => .ge,
+                    .eq => .eq,
+                    .ne => .ne,
+                    .@"and" => .@"and",
+                    .@"or" => .@"or",
+                    .mod, .idiv => return r.unsupported(r.card, "% or \\ of a .meas result or vector"),
+                    // A number reads no result; only `subst` emits `live`.
+                    .num, .live => unreachable,
+                });
+            }
             return out.items;
         }
 
@@ -323,8 +347,6 @@ pub fn Methods(comptime S: type) type {
                 if (a.sweep != .monte or a.sweep.monte.scales.len == 0) continue;
                 for (r.analyses.items, 0..) |b, j| if (j != i and b.kind == a.kind and b.sweep == .monte)
                     return r.unsupported(a.line, "SIGMA_SCALE beside another MONTE card of its analysis");
-                // ponytail: one result per trial; a `.temp` list would give several.
-                for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(a.line, "SIGMA_SCALE with a .temp list");
                 const fail = &a.sweep.monte.fail;
                 const mark = r.scratch.mark();
                 defer r.scratch.reset(mark);
@@ -347,13 +369,11 @@ pub fn Methods(comptime S: type) type {
         /// The `.wcd` card `line` (#240), now that every `.meas` card is
         /// read: `name 'op number'` pairs, op one of `>=`, `>`, `<=`, `<`
         /// and the number as a `.meas` value, then `MAXITER=`, `TOL=` and
-        /// `TOP=`. Refuses a name of no `.meas` card, a card named twice,
-        /// SWEEP OPTIMIZE (whose variant table it would share) and an
-        /// HSPICE `.temp` list (one value per spec and point).
+        /// `TOP=`. Refuses a name of no `.meas` card, a card named twice and
+        /// SWEEP OPTIMIZE (whose variant table it would share).
         pub fn readWcd(r: *R, line: []const u8) Error!Wcd {
             r.card = line;
             if (r.optimize != null) return r.unsupported(line, ".wcd together with SWEEP OPTIMIZE");
-            for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(line, ".wcd with a .temp list");
             var w: Wcd = .{ .specs = &.{}, .line = r.written(line) };
             var specs: std.ArrayList(WcdSpec) = .empty;
             var f = F.init(line);
@@ -389,6 +409,50 @@ pub fn Methods(comptime S: type) type {
             if (specs.items.len == 0) return r.failed(line, error.ParseError);
             w.specs = specs.items;
             return w;
+        }
+
+        // ---- private ----
+
+        /// Refuses output card `line` with `err`, logging it unless a
+        /// refusal already named it.
+        fn refuse(r: *R, line: []const u8, err: Error) Error {
+            if (err == error.OutOfMemory or r.logged) return err;
+            return r.failed(line, err);
+        }
+
+        /// Whether ngspice skips the `.meas` card `text` (after `.meas`):
+        /// one missing its analysis type, result name or measurement type
+        /// ("Incomplete measurement statement ... ignored!",
+        /// measure.c:286-301), or one whose analysis type it does not
+        /// measure (measure.c:302-311). Words split as misc/string.c
+        /// gettok splits them, at blanks and commas. Analysis types
+        /// `measure.parse` reads beyond tran, ac, dc and sp are kept.
+        fn ngspiceSkips(text: []const u8) bool {
+            var words = std.mem.tokenizeAny(u8, text, " \t,");
+            const kind = words.next() orelse return true;
+            if (words.next() == null or words.next() == null) return true;
+            return !measure.knowsAnalysis(kind);
+        }
+
+        /// The index of the `.meas` card named `name` read so far.
+        fn measureIndex(r: *const R, name: []const u8) ?u32 {
+            for (r.measures.items, 0..) |m, i| if (std.mem.eql(u8, m.name, name)) return @intCast(i);
+            return null;
+        }
+
+        /// The number compiled ops `part` fold to, as a `.param` value
+        /// would; `part` indexes the scratch's names and constants. A name
+        /// that is no parameter refuses the card `r.card`.
+        fn foldPart(r: *R, part: []const expr.Op) Error!f64 {
+            const from = r.scratch.ops.items.len;
+            defer r.scratch.ops.shrinkRetainingCapacity(from);
+            try r.scratch.ops.appendSlice(r.arena, part);
+            const top: Frame = .{ .scopes = &r.global_scopes };
+            return switch (try r.fold(from, &top, false)) {
+                .num => |n| n,
+                // else: a name no scope defines leaves a kept expression
+                else => r.unsupported(r.card, "a .meas expression name that is no earlier .meas result and no .param"),
+            };
         }
     };
 }

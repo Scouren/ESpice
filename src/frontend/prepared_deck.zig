@@ -1,5 +1,5 @@
 //! The published deck tables. In: the parse arena's `.meas`, `.stim`,
-//! `.ic` and `.save` cards, the builder's AC overrides and card table, and
+//! `.ic` and `.save` cards, the builder's AC overrides, noise gaps and card table, and
 //! the frozen circuit. Out: the same rows copied into the session arena, on
 //! circuit rows and frozen batch positions, so the deck outlives the parse.
 //! Cites: none (house deck layout, core/deck.zig).
@@ -10,6 +10,7 @@
 //! - `pub fn nodeRows(arena: Allocator, nb: *const builder.NetBuilder, items: []const netlist.Ic) Allocator.Error![]const core.Ic`
 //! - `pub fn measures(arena: Allocator, cards: []const core.Measure) Allocator.Error![]const core.Measure`
 //! - `pub fn acOverrides(arena: Allocator, cards: []const requests.CardRef, names: []const []const u8, values: []const f64) error{ OutOfMemory, InvalidAcOverride }![]const core.AcOverride`
+//! - `pub fn noiseGaps(arena: Allocator, gaps: []const core.NoiseGap) Allocator.Error![]const core.NoiseGap`
 //! - `pub fn frozenIndices(scratch: Allocator, cards: []requests.CardRef, circuit: *const device.Circuit) !void`
 //! - `pub fn cardModels(sim_arena: Allocator, scratch: Allocator, nl: *const netlist.Netlist, cards: []const requests.CardRef) !requests.CardNames`
 //! - `pub fn portCounts(arena: Allocator, lib: *const device.Library, circuit: *const device.Circuit) ![]const u32`
@@ -113,6 +114,13 @@ pub fn acOverrides(
         } else return error.InvalidAcOverride;
     }
     return overrides;
+}
+
+/// The builder's noise gaps, card and key copied into `arena`.
+pub fn noiseGaps(arena: Allocator, gaps: []const core.NoiseGap) Allocator.Error![]const core.NoiseGap {
+    const out = try arena.alloc(core.NoiseGap, gaps.len);
+    for (gaps, out) |gap, *o| o.* = .{ .card = try arena.dupe(u8, gap.card), .key = try arena.dupe(u8, gap.key) };
+    return out;
 }
 
 /// Renumbers each card's `index` from its add ordinal to its instance's

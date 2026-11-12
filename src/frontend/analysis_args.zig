@@ -14,7 +14,6 @@
 //! - `pub fn count(comptime T: type, args: []const Value, i: usize, default: T) !T`
 //! - `pub fn arity(args: []const Value, min: usize, max: usize) !void`
 //! - `pub fn keyword(args: []const Value, i: usize, buf: []u8) ![]const u8`
-//! - `pub fn hasUic(args: []const Value) bool`
 //! - `pub fn outputNode(node: u32) !u32`
 //! - `pub fn outputNeg(node: u32) !u32`
 //! - `pub fn currentProbeName(args: []const Value, i: usize) ?[]const u8`
@@ -46,8 +45,8 @@ const Library = @import("device").Library;
 /// Unresolved or absent node row.
 pub const NO_NODE = netlist.none;
 
-/// What a card borrows from the rest of the deck: HSPICE's `.noise` and
-/// `.lstb` run over the `.ac` sweep, `.fft` and `.op <time>` over the `.tran`, and
+/// What a card borrows from the rest of the deck: `.acphasenoise`, `.acmatch`
+/// and `.lstb` run over the `.ac` sweep, `.fft` and `.op <time>` over the `.tran`, and
 /// `.snac`/`.snnoise`/`.snxf` at the `.sn` fundamental.
 pub const CardContext = struct {
     /// Owns the point lists and labels a card allocates.
@@ -98,16 +97,6 @@ pub fn keyword(args: []const Value, i: usize, buf: []u8) ![]const u8 {
     const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
     if (name.len > buf.len) return error.InvalidAnalysisArguments;
     return std.ascii.lowerString(buf[0..name.len], name);
-}
-
-/// `uic` is a trailing keyword, not a positional: `.tran 1n 100n uic` and
-/// `.tran 1n 100n 0 1n uic` are both legal, so scan rather than index.
-pub fn hasUic(args: []const Value) bool {
-    for (args) |a| switch (a) {
-        .name => |n| if (std.ascii.eqlIgnoreCase(n, "uic")) return true,
-        else => {},
-    };
-    return false;
 }
 
 pub fn outputNode(node: u32) !u32 {
@@ -163,7 +152,8 @@ pub fn checkStep(start: f64, stop: f64, step: f64) !void {
 }
 
 /// The `dec|oct|lin N fstart fstop` grid every frequency-domain card shares,
-/// read from `offset`. Only `lin` admits fstart = 0.
+/// read from `offset`. Only `lin` admits 0 Hz, at either end: `.ac lin 1
+/// 0Hz 0Hz` is ngspice's DC small-signal point (tests/regression/misc/ac-zero.sp).
 pub fn frequencySweep(args: []const Value, offset: usize) !numerics.FreqSweep {
     const mode = nameAt(args, offset) orelse return error.InvalidAnalysisArguments;
     const kinds = std.StaticStringMap(numerics.SweepKind).initComptime(.{
@@ -173,7 +163,7 @@ pub fn frequencySweep(args: []const Value, offset: usize) !numerics.FreqSweep {
     if (mode.len > lower.len) return error.UnsupportedFrequencySweep;
     const kind = kinds.get(std.ascii.lowerString(lower[0..mode.len], mode)) orelse return error.UnsupportedFrequencySweep;
     const first = if (kind == .lin) try number(args, offset + 2) else try positive(args, offset + 2);
-    const last = try positive(args, offset + 3);
+    const last = if (kind == .lin) try number(args, offset + 3) else try positive(args, offset + 3);
     if (first < 0 or last < first) return error.InvalidAnalysisArguments;
     return .{ .f_start = first, .f_stop = last, .points = try count(u32, args, offset + 1, 10), .kind = kind };
 }

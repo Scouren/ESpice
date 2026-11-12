@@ -8,7 +8,7 @@
 //! Contents:
 //! - `pub fn Methods(comptime S: type) type`
 //! - `pub fn replay(r: *R, rp: *const Replay, line: []const u8, head: []const u8, letter: u8, frame: *const Frame) Error!void`
-//! - `pub fn cardNodes(r: *const R, a: Allocator, f: *F, letter: u8, port_card: bool, nodes: *std.ArrayList([]const u8)) Error!?[]const u8`
+//! - `pub fn cardNodes(a: Allocator, f: *F, letter: u8, nodes: *std.ArrayList([]const u8)) Error!?[]const u8`
 //! - `pub fn readFields(comptime pure: bool, r: if (pure) *const R else *R, a: Allocator, line: []const u8, letter: u8, f: *F, frame: if (pure) void else *const Frame, fields: ?*std.ArrayList(ReplayField), kv_text: if (pure) void else *std.ArrayList([]const u8)) (if (pure) error{ OutOfMemory, Fallback } else Error)!void`
 //! - `pub fn scan(r: *const R, a: Allocator, row: usize, nodes: *std.ArrayList([]const u8), fields: *std.ArrayList(ReplayField)) ?*const Replay`
 //! - `pub fn scanCards(r: *R, rows: []const u32, opts: ParseOptions, arenas: *[scan_threads_max]std.heap.ArenaAllocator) Error!usize`
@@ -28,7 +28,6 @@ const Replay = reader_frame.Replay;
 const ReplayField = reader_frame.ReplayField;
 const ParseOptions = reader_frame.ParseOptions;
 const scan_threads_max = reader_frame.scan_threads_max;
-const bTransformationWanted = card_table.bTransformationWanted;
 
 comptime {
     // `scan` lays a Replay, its nodes and its fields end to end in one
@@ -46,7 +45,6 @@ pub fn Methods(comptime S: type) type {
     return struct {
         const R = reader.Reader(S);
         const fixedPins = R.fixedPins;
-        const mixedPort = R.mixedPort;
 
         /// Reads card `line` from the `Replay` its first read or `scan` kept: the
         /// nodes and literals reused, every other field re-read under `frame`
@@ -61,7 +59,7 @@ pub fn Methods(comptime S: type) type {
             var f = F.init(line);
             for (rp.fields) |field| {
                 f.pos = field.pos;
-                const value: Value = if (field.num) |n| .{ .num = n } else if (field.keyed) try r.kvValue(&f, frame, false) else try r.valueAt(field.word, &f, frame, true, false);
+                const value: Value = if (field.num) |n| .{ .num = n } else if (field.keyed) try r.kvValue(&f, frame, false) else if (namesModel(r, letter, field.word)) .{ .name = field.word } else try r.valueAt(field.word, &f, frame, true, false);
                 if (field.keyed) try r.card_kv.append(arena, .{ .key = field.word, .value = value }) else try r.positional.append(arena, value);
             }
             if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
@@ -72,7 +70,7 @@ pub fn Methods(comptime S: type) type {
         /// model or subcircuit word after them: the `(`-listed nodes and
         /// the word after the `)`, the fixed pins and null, or the words
         /// before the first value. Reads only the line (#230).
-        pub fn cardNodes(r: *const R, a: Allocator, f: *F, letter: u8, port_card: bool, nodes: *std.ArrayList([]const u8)) Error!?[]const u8 {
+        pub fn cardNodes(a: Allocator, f: *F, letter: u8, nodes: *std.ArrayList([]const u8)) Error!?[]const u8 {
             if ((f.nextByte() orelse return error.ParseError) == '(') {
                 _ = f.next();
                 while (true) {
@@ -87,9 +85,8 @@ pub fn Methods(comptime S: type) type {
                 return model;
             }
             if (fixedPins(letter)) |fixed| {
-                const count = if (port_card and mixedPort(f.*)) 3 else fixed;
-                try nodes.ensureUnusedCapacity(a, count);
-                for (0..count) |_| {
+                try nodes.ensureUnusedCapacity(a, fixed);
+                for (0..fixed) |_| {
                     const t = f.next() orelse return error.ParseError;
                     if (!F.isWord(t)) return error.ParseError;
                     nodes.appendAssumeCapacity(t);
@@ -107,7 +104,7 @@ pub fn Methods(comptime S: type) type {
                 try nodes.append(a, t);
             }
             // ngspice reads `X1 a b sub params: p=1` (numparam's subcircuit call).
-            if (letter == 'x' and r.dialect == .ngspice and nodes.items.len > 0 and std.mem.eql(u8, nodes.items[nodes.items.len - 1], "params:")) _ = nodes.pop();
+            if (letter == 'x' and nodes.items.len > 0 and std.mem.eql(u8, nodes.items[nodes.items.len - 1], "params:")) _ = nodes.pop();
             return nodes.pop() orelse return error.ParseError;
         }
 
@@ -134,7 +131,7 @@ pub fn Methods(comptime S: type) type {
                 if (F.isWord(t) and f.takeEq()) {
                     const start = f.pos;
                     if (pure) {
-                        const n = (r.literalValue(f) catch return error.Fallback) orelse return error.Fallback;
+                        const n = (R.literalValue(f) catch return error.Fallback) orelse return error.Fallback;
                         try fields.?.append(a, .{ .word = t, .keyed = true, .num = n, .pos = start });
                     } else {
                         try r.card_kv.append(a, .{ .key = t, .value = try r.kvValue(f, frame, false) });
@@ -143,7 +140,7 @@ pub fn Methods(comptime S: type) type {
                             // `kvValue` read it as a literal exactly when this does.
                             var probe = f.*;
                             probe.pos = start;
-                            try list.append(a, .{ .word = t, .keyed = true, .num = try r.literalValue(&probe), .pos = start });
+                            try list.append(a, .{ .word = t, .keyed = true, .num = try R.literalValue(&probe), .pos = start });
                         }
                     }
                 } else {
@@ -153,11 +150,11 @@ pub fn Methods(comptime S: type) type {
                         // a brace or quote as an expression `replay` folds;
                         // a `name(` group allocates.
                         const bare = F.isWord(t);
-                        if (r.operatorLed(t) or (bare and f.nextByte() == '(') or (!bare and t[0] != '{' and !F.isQuote(t[0]))) return error.Fallback;
-                        try fields.?.append(a, .{ .word = t, .keyed = false, .num = if (bare) S.parseNum(t) else null, .pos = at });
+                        if (R.operatorLed(t) or (bare and f.nextByte() == '(') or (!bare and t[0] != '{' and !F.isQuote(t[0]))) return error.Fallback;
+                        try fields.?.append(a, .{ .word = t, .keyed = false, .num = if (bare and !namesModel(r, letter, t)) S.parseNum(t) else null, .pos = at });
                     } else {
                         if (letter != 'x') try r.refuseOperatorField(line, t);
-                        try r.positional.append(a, try r.valueAt(t, f, frame, true, false));
+                        try r.positional.append(a, if (namesModel(r, letter, t)) .{ .name = t } else try r.valueAt(t, f, frame, true, false));
                         if (fields) |list| try list.append(a, .{ .word = t, .keyed = false, .num = null, .pos = at });
                     }
                 }
@@ -169,28 +166,23 @@ pub fn Methods(comptime S: type) type {
         /// result a whole read gives. Null for a card whose read takes
         /// another path, would refuse it, or holds a field `readFields`
         /// cannot scan; `readDevice` reads that one whole.
-        /// Reads only the dialect, the lines and their letters, fixed before
+        /// Reads only the lines and their letters, fixed before
         /// any device is read, so threads may share `r` (#230). `nodes`
         /// and `fields` are scratch.
         pub fn scan(r: *const R, a: Allocator, row: usize, nodes: *std.ArrayList([]const u8), fields: *std.ArrayList(ReplayField)) ?*const Replay {
             const line = r.lines.items[row];
-            // `readDevice` reads an HSPICE P card from a rewritten line.
-            if (r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p') return null;
             var f = F.init(line);
             const head = f.next() orelse return null;
             if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return null;
-            const kind = r.kindOf(row);
-            const letter = if (kind != 0) kind else std.ascii.toLower(head[0]);
+            const letter = std.ascii.toLower(head[0]);
             // The letters `readDevice` reads apart from the plain path, and
-            // an ngspice R card that may be a B source (`behaviouralResistor`
-            // tests a part of the line).
+            // an R, C or L card that is a B-source network (`lowersToB`).
             if (std.mem.indexOfScalar(u8, "bxefgh", letter) != null) return null;
-            if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "usw", letter) != null) return null;
-            if (letter == 'r' and r.dialect == .ngspice and bTransformationWanted(line)) return null;
+            if (R.lowersToB(letter, line) or card_table.isDataElement(letter, line)) return null;
             nodes.clearRetainingCapacity();
             fields.clearRetainingCapacity();
-            const model = r.cardNodes(a, &f, letter, false, nodes) catch return null;
-            if (model) |m| if (r.operatorLed(m)) return null;
+            const model = cardNodes(a, &f, letter, nodes) catch return null;
+            if (model) |m| if (R.operatorLed(m)) return null;
             readFields(true, r, a, line, letter, &f, {}, fields, {}) catch return null;
             // One block holds the record and both lists: each arena
             // allocation costs two locked instructions (Zig 0.18's arena is
@@ -249,6 +241,21 @@ pub fn Methods(comptime S: type) type {
             var nodes: std.ArrayList([]const u8) = .empty;
             var fields: std.ArrayList(ReplayField) = .empty;
             for (part) |i| out[i] = r.scan(s.allocator(), i, &nodes, &fields);
+        }
+
+        // ---- private ----
+
+        /// Whether value field `t` of a `letter` card is a `.model`'s name,
+        /// which it is even where it reads as a number: ngspice looks the
+        /// word after a D, Q, J, Z, M, S, O or W card's nodes up as a model
+        /// (INPlookMod, INPgetMod: inp2d.c:47-51, inp2q.c:56-60,
+        /// inp2j.c:47-49, inp2z.c:55-57, inp2m.c:76-84, inp2s.c:57-59,
+        /// inp2o.c:57-69, inp2w.c:54-56), so `J1 d g s 2SK170` names model
+        /// 2sk170, not the number 2. R, C and L read their value first
+        /// (inp2r.c:83-85). Models are all read before any device card, so
+        /// the scan threads read `isModel`'s tables as they stay.
+        fn namesModel(r: *const R, letter: u8, t: []const u8) bool {
+            return std.mem.indexOfScalar(u8, "dqjzmsow", letter) != null and r.isModel(t);
         }
     };
 }

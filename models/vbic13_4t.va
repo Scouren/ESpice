@@ -204,7 +204,9 @@
     //  ty       switch (integer only, values -1=n-type and +1=p-type)
     //
 
-        `define ALIAS(alias,paramName)
+        // ESPice: the aliases bind (ngspice vbic.c:25 dtemp); the CMC
+        // original leaves this macro empty.
+        `define ALIAS(alias,paramName) aliasparam alias = paramName ;
         `define OPP(name,uni,des) real name;
         `define MPRcc(name,def,uni,lwr,upr,des) parameter real    name=def from[lwr:upr];
         `define MPRco(name,def,uni,lwr,upr,des) parameter real    name=def from[lwr:upr);
@@ -236,7 +238,9 @@
         `define SHRINKL shrinkL  =  1.0-0.01*shrink;
         `define GMIN    gminMod  =  gmin;
         `define IMAX    imaxMod  =  imax;
-        `define MFACTOR_DEC mMod =  m;
+        // ESPice: ngspice scales every current and charge by area*m
+        // (vbicload.c:170 SCALE, applied at 4035-4127).
+        `define MFACTOR_DEC mMod =  m*area;
         `define MFACTOR_USE mMod
 
 `endif // haveIncludededCmcGeneralMacrosAndDefines
@@ -825,6 +829,14 @@ branch (xf2)          c_xf2;
 //
 
 `IPM
+// ESPice: ngspice instance parameters (vbic.c:19-25). area scales with m
+// (MFACTOR_DEC). A given temp replaces $temperature and trise (dtemp), as
+// ngspice's vbictemp.c:39-41 now does. ngspice 44.2 and 45 still added dtemp
+// to a given temp at every temperature update: temp=80 dtemp=30 solved its
+// OP at 110 degC and its AC at 140 degC (measured), so no single
+// temperature reproduces them.
+`IPRoo( area      ,   1.0     ,""                        , 0.0, inf, "emitter area factor")
+`IPRnb( temp      ,  27.0     ,"degC"                    , "instance ambient temperature, replaces $temperature")
 `IPRnb( trise     ,   0.0     ,"degC"                    , "local temperature delta to ambient (before self-heating)")
 `IPIsw( sw_noise  ,   1       ,""                        , "switch for including noise:   0=no and 1=yes")
 `IPIsw( sw_et     ,   1       ,""                        , "switch for self-heating:      0=no and 1=yes")
@@ -1062,12 +1074,30 @@ real Vbe,Vbc,Vrcx,Vrci,Vrbx,Vrbi,Vre,Vrbp,Vrs,Vcei,Vcep;
 real VBICtype;
 
 real scaleFac, shrinkL, gminMod, imaxMod, mMod;
+real tambK;   // ambient: card temp (vbicparam.c:45-48) or $temperature + trise
 //real ic,ib,ie,isub,powerT,powerD,Vce;
 //real Ircx_Vrcx,Irci_Vrci,Irbx_Vrbx,Irbi_Vrbi,Irbp_Vrbp,Ire_Vre,Irs_Vrs;
 //real tauTh,gci_eff,Iibk,Ibk,VcbFac;
 real Iibk,Ibk,VcbFac;
 
 real tVCrit;
+
+// ESPice: operating-point variables (LRM §3.2.1) under ngspice vbic.c's
+// names (#236), as vbicask.c reports them: npn-frame voltages, and the
+// partials and charges of area*m devices (vbicload.c:170 SCALE). gm and go
+// are Iciei's partials over Vbei and Vbci; with td > 0 ngspice's Itxf is
+// the excess-phase node (vbicload.c:747-756), so they keep Itzr's alone.
+(* desc = "B-E voltage", units = "V" *) real vbe;
+(* desc = "B-C voltage", units = "V" *) real vbc;
+(* desc = "Small signal transconductance dIc/dVbe", units = "S" *) real gm;
+(* desc = "Small signal output conductance dIc/dVbc", units = "S" *) real go;
+(* desc = "Small signal input conductance dIb/dVbe", units = "S" *) real gpi;
+(* desc = "Small signal conductance dIb/dVbc", units = "S" *) real gmu;
+(* desc = "Internal base to emitter capacitance", units = "F" *) real cbe;
+(* desc = "Internal base to collector capacitance", units = "F" *) real cbc;
+(* desc = "Charge storage B-E junction", units = "C" *) real qbe;
+(* desc = "Charge storage B-C junction", units = "C" *) real qbc;
+real Iciei_op;
 
 
 analog begin : analogBlock
@@ -1116,7 +1146,9 @@ analog begin : analogBlock
     `INITIAL_INSTANCE
     begin : initializeInstance
         `MFACTOR_DEC
-        tdevC    = $temperature+trise-`TABS_NIST2004;
+        tambK    = $temperature+trise;
+        if ($param_given(temp)) tambK = temp+`TABS_NIST2004;
+        tdevC    = tambK-`TABS_NIST2004;
         if (tdevC<tmin) begin
             $strobe("WARNING: ambient temperature is lower than allowed minimum");
         end
@@ -1234,7 +1266,7 @@ analog begin : analogBlock
         //  and not the initializeInstance block)
         //
         dt_et    =  Temp(b_rth);
-        tdevC    = $temperature+trise+dt_et-`TABS_NIST2004;
+        tdevC    = tambK+dt_et-`TABS_NIST2004;
         `CLIPB1p0(tdevC,tdevC,tminclip,tmaxclip)
         tdevK    =  tdevC+`TABS_NIST2004;
         vtv      = `KB_VBIC*tdevK/`QQ_VBIC;
@@ -1329,8 +1361,8 @@ analog begin : analogBlock
         //  the six junctions at the ambient vt, vcrit from the untempered IS.
         //  ponytail: ngspice also log-damps the thermal node beyond 100 K
         //  per iterate (DEVlimitlog); VerA's $limit has no such limiter yet.
-        vtlim    = 1.38064852e-23 / 1.6021766208e-19 * ($temperature+trise); // vbicload.c: CONSTKoverQ
-        vcrit    =  vtlim*ln(vtlim/(1.4142135623730951*is*m));
+        vtlim    = 1.38064852e-23 / 1.6021766208e-19 * tambK; // vbicload.c: CONSTKoverQ
+        vcrit    =  vtlim*ln(vtlim/(1.4142135623730951*is*`MFACTOR_USE)); // vbictemp.c:85 is*area*m
         Vbei     =  VBICtype*$limit(V(b_bei), "pnjlim", vtlim, vcrit, VBICtype);
         Vbex     =  VBICtype*$limit(V(b_bex), "pnjlim", vtlim, vcrit, VBICtype);
         Vbci     =  VBICtype*$limit(V(b_bci), "pnjlim", vtlim, vcrit, VBICtype);
@@ -1626,6 +1658,19 @@ analog begin : analogBlock
             Irs     =             `MFACTOR_USE * Irs;
         Ith     =             `MFACTOR_USE * Ith;
         Irth    =             `MFACTOR_USE * Irth;
+
+        // ESPice op vars (#236). Vbei and Vbci are type x V(bi,ei) and
+        // V(bi,ci), and the currents above carry type x m, so a partial
+        // over one alone, the other and the thermal node held, is minus a
+        // ddx over V(ei) or V(ci) (vbicask.c:117-128).
+        vbe      =  Vbei;
+        vbc      =  Vbci;
+        if (td > 0.0) Iciei_op = Itxf - Itzr;
+        else Iciei_op = Itzf - Itzr;
+        gm       = -ddx(Iciei_op, V(ei));
+        go       = -ddx(Iciei_op, V(ci));
+        gpi      = -ddx(Ibe, V(ei));
+        gmu      = -ddx(Ibc, V(ci));
     end // evaluateStatic
 
     //
@@ -1682,6 +1727,13 @@ analog begin : analogBlock
         Qbco    =             `MFACTOR_USE * Qbco;
             Qbcp    =  VBICtype * `MFACTOR_USE * Qbcp;
         Qcth    =             `MFACTOR_USE * Qcth;
+
+        // ESPice op vars (#236), vbicask.c:132-155: capbe = Qbe_Vbei,
+        // capbc = Qbc_Vbci, the charges in the npn frame.
+        qbe      =  VBICtype * Qbe;
+        qbc      =  VBICtype * Qbc;
+        cbe      = -ddx(Qbe, V(ei));
+        cbc      = -ddx(Qbc, V(ci));
     end // evaluateDynamic
 
     //
@@ -1734,14 +1786,15 @@ analog begin : analogBlock
     begin : noise
         if (sw_noise) begin
             // Ibe, Ibex, Itzf, Ibep, Iccp and Irci already carry MFACTOR_USE
-            // (scaled above), so their noise must not take it again.
+            // (scaled above), so their noise must not take it again. Flicker
+            // takes m alone, not area*m (vbicnoise.c:158-170).
             I(b_bei) <+ white_noise  (2*1.6021766208e-19*abs(Ibe),"Ibei shot noise");
-            I(b_bei) <+ flicker_noise(`MFACTOR_USE*kfn*pow(abs(Ibe/`MFACTOR_USE),afn),bfn,"Ibei flicker noise");
+            I(b_bei) <+ flicker_noise(m*kfn*pow(abs(Ibe/m),afn),bfn,"Ibei flicker noise");
             I(b_bex) <+ white_noise  (2*1.6021766208e-19*abs(Ibex),"Ibex shot noise");
-            I(b_bex) <+ flicker_noise(`MFACTOR_USE*kfn*pow(abs(Ibex/`MFACTOR_USE),afn),bfn,"Ibex flicker noise");
+            I(b_bex) <+ flicker_noise(m*kfn*pow(abs(Ibex/m),afn),bfn,"Ibex flicker noise");
             I(b_cei) <+ white_noise  (2*1.6021766208e-19*abs(Itzf),"transport current shot noise");
             I(b_bep) <+ white_noise  (2*1.6021766208e-19*abs(Ibep),"Ibep shot noise");
-            I(b_bep) <+ flicker_noise(`MFACTOR_USE*kfn*pow(abs(Ibep/`MFACTOR_USE),afn),bfn,"Ibep flicker noise");
+            I(b_bep) <+ flicker_noise(m*kfn*pow(abs(Ibep/m),afn),bfn,"Ibep flicker noise");
             I(b_rcx) <+ white_noise  (`MFACTOR_USE*4*1.38064852e-23*tdevK*Gcx,"rcx thermal noise");
             I(b_rci) <+ white_noise  (4*1.38064852e-23*tdevK*((abs(Irci)+`MFACTOR_USE*1.0e-10*Gci)/(abs(Vrci)+1.0e-10)),"rci thermal noise");
             I(b_rbx) <+ white_noise  (`MFACTOR_USE*4*1.38064852e-23*tdevK*Gbx,"rbx thermal noise");

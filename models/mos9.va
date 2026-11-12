@@ -36,6 +36,7 @@ module mos9(d, g, s, b);
     // ---- channel (modified level 3), ngspice names/defaults/units ---------
     parameter integer tpg    = 1 from [-1:1];            // gate type: +1 opposite, -1 same, 0 Al
     parameter real    vto    = 0.0;                      // zero-bias threshold (0: from wkfngs) [V]
+    aliasparam vt0 = vto;                    // ngspice mos9.c:116 IOPR spelling
     parameter real    delvto = 0.0;                      // threshold shift [V]
     aliasparam delvt0 = delvto;
     parameter real    nss    = 0.0 from [0:inf);         // surface state density [cm^-2]

@@ -112,20 +112,21 @@ pub fn resolveDeferred(self: *NetBuilder) !void {
     if (self.deferred.items.len == 0) return;
     try indexBranchNames(self);
     for (self.deferred.items) |dev| {
-        switch (dev.kind) {
-            'f' => try net_passive.addBranchRef(self, devices.cccs, dev, 1.0),
-            'h' => try net_passive.addBranchRef(self, devices.ccvs, dev, 0.0),
-            'w' => try net_passive.addBranchRef(self, devices.cswitch, dev, null),
-            'k' => try net_passive.addKinduc(self, dev),
+        const added = switch (dev.kind) {
+            'f' => net_passive.addBranchRef(self, devices.cccs, dev, 1.0),
+            'h' => net_passive.addBranchRef(self, devices.ccvs, dev, 0.0),
+            'w' => net_passive.addBranchRef(self, devices.cswitch, dev, null),
+            'k' => net_passive.addKinduc(self, dev),
             'b' => {},
             else => unreachable,
-        }
+        };
+        added catch |err| return self.failed(dev, err);
     }
     // H output branches, then each B's own as it lands, so a later B
     // reads an earlier one's i() as the scan did.
     try indexBranches(self);
     for (self.deferred.items) |dev| if (dev.kind == 'b') {
-        try net_card.addB(self, dev);
+        net_card.addB(self, dev) catch |err| return self.failed(dev, err);
         try indexBranches(self);
     };
 }

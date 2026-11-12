@@ -50,7 +50,6 @@ the sources down, as ngspice does.
 .dc src start stop step [src2 start2 stop2 step2]
 .dc src LIN|DEC|OCT N start stop
 .dc src POI N v1 v2 ...
-.dc src START=a STOP=b STEP=c
 .dc param start stop step
 .dc DATA=name | MONTE=n
 ```
@@ -155,16 +154,21 @@ response to every source's `AC` magnitude (`DC Incremental Analysis`).
 ### `.temp` { #temp }
 
 ```text
-.temp t                 one value: the circuit temperature, not an analysis
-.temp tstart tstop tstep    ngspice: a temperature sweep
-.temp t1 t2 t3 ...      HSPICE dialect: every analysis at each temperature
+.temp t
 ```
 
-The three-number form solves the operating point at each temperature in
-°C (plot `Temperature Sweep`).
+Sets the circuit temperature in °C. It is no analysis. As in ngspice
+44.2, the last `.temp` card wins over every `.options temp=`, whichever
+comes first. A `.temp` card with more than one value prints a warning and
+the circuit runs at 27 °C. That includes three values, which older
+ESPice read as a sweep. To sweep the temperature, use `.dc temp tstart
+tstop tstep` (plot `DC transfer characteristic`, first column
+`temp-sweep`). To run every analysis at a list of temperatures, use
+`.step temp list t1 t2 ...`. A temperature at or below −273.15 °C is
+refused.
 
 ```text
-.temp -40 125 5
+.dc temp -40 125 5
 ```
 
 ### `.mc` { #mc }
@@ -205,13 +209,12 @@ pattern.
 
 ```text
 .noise v(out[,ref]) [src] dec|oct|lin N fstart fstop [pts]
-.noise v(out) src [inter]          HSPICE: over the .ac sweep
-.acphasenoise v(out) vin [interval] carrier=f [LIST...=]
+.acphasenoise v(out) vin [interval] carrier=f [LIST...=]   over the .ac sweep
 ```
 
 Output noise and input-referred noise over frequency. `src` is a V or I
-source, the input reference. A nonzero `pts` (or HSPICE `inter`) adds each
-device's contribution as a column. Two plots: `Noise Spectral Density
+source, the input reference. A nonzero `pts` adds each device's
+contribution as a column. Two plots: `Noise Spectral Density
 Curves` (`onoise_spectrum`, `inoise_spectrum` in V/√Hz, and
 `onoise_<inst>_<generator>`, `onoise_<inst>` with contributions) and
 `Integrated Noise` (`v(onoise_total)`, `v(inoise_total)` in V rms; with an
@@ -227,7 +230,6 @@ Analysis`, `phnoise`). `.sample` folds the spectrum for sampled systems.
 
 ```text
 .pz in+ in- out+ out- vol|cur pol|zer|pz
-.pz v(out[,ref]) src          HSPICE: driven at the source's nodes, both
 .pz                           the circuit's natural poles
 ```
 
@@ -274,16 +276,16 @@ and `DISTORTION - 3rd harmonic`, or with two tones `DISTORTION - IM: f1+f2`,
 
 ```text
 .sp dec|oct|lin N fstart fstop
-.lin [SPARCALC=1] [NOISECALC=] [GDCALC=] [FORMAT=touchstone] [FILENAME=] [MIXEDMODE2PORT=dd|cc|sd|...]
+.lin [SPARCALC=1] [NOISECALC=] [GDCALC=] [FORMAT=touchstone] [FILENAME=] [MIXEDMODE2PORT=ss]
 .net v(out) src [RIN= ROUT=]     .net src [rin]
 ```
 
 S-parameters between the deck's ports. A port is a V card with
-`portnum n z0 Z` (HSPICE: a `P` card, `port=n z0=Z`). Plot `SP Analysis`
+`portnum n z0 Z`, its z0 in series in the circuit as in ngspice; every
+port is single-ended. Plot `SP Analysis`
 with complex `v(S_i_j)` columns. `.lin` and `.net` (HSPICE) run over the
-`.ac` sweep; `.lin` publishes `S(i,j)`, `Y(i,j)` and more, and with a
-3-node `P` card mixed-mode parameters. Write Touchstone or CITIfile with
-`--format`.
+`.ac` sweep; `.lin` publishes `S(i,j)`, `Y(i,j)` and more. Write
+Touchstone or CITIfile with `--format`.
 
 ```spice
 --8<-- "examples/two_port.sp"
@@ -325,7 +327,6 @@ own. Plots `Loop Stability Analysis` (`loop_gain`, `loop_gain_forward`,
 
 ```text
 .tran tstep tstop [tstart [tmax]] [uic]
-.tran s1 t1 s2 t2 ... [START=t] [uic]     HSPICE dialect: segments
 ```
 
 The time-domain response. `tstep` sets the default PULSE edges and, with
@@ -420,8 +421,8 @@ reads THD, SNR, SNDR, ENOB and SFDR from it.
 .trannoise v(out) [METHOD=mc|sde] [SEED=] [SAMPLES=] [FMIN=] [FMAX=] [SCALE=] [TIME=]
 ```
 
-A transient with every device's noise sources sampled (also spelled
-`.tran_noise`). The HSPICE form runs on the deck's `.tran` card;
+A transient with every device's noise sources sampled. The HSPICE form
+runs on the deck's `.tran` card;
 `SAMPLES=n` runs n independent noise transients, and `METHOD=sde`
 carries the noise covariance instead of sampling and publishes `onoise`.
 Plot `Transient Noise Analysis`.
@@ -436,7 +437,7 @@ Plot `Transient Noise Analysis`.
 .envelope tcarrier tstop
 ```
 
-Envelope-following transient (also `.envlp`): full carrier periods
+Envelope-following transient: full carrier periods
 integrated, the envelope stepped across them. Plot `Envelope Analysis`
 with per-output `peak(...)` and `rms(...)` columns.
 
@@ -464,6 +465,7 @@ Analysis`.
 ```text
 .pss f0 [points]
 .pss v(osc) f0guess [points [settle]]      autonomous oscillator
+.pss gfreq tstab oscnob points harms sciter steadycoeff [uic]     ngspice
 .sn TRES=t PERIOD=T  |  .sn TONE=f [NHARMS=n]     HSPICE shooting Newton
 .snosc v(osc) f0guess [points]
 ```
@@ -472,6 +474,17 @@ Periodic steady state by shooting Newton at fundamental `f0` (default 256
 points). With an oscillator node, `f0` is a first guess and the period is
 solved for. Plot `Periodic Steady State`: one period of every waveform,
 first column `time`.
+
+ngspice's form is always an oscillator. It settles for `tstab` seconds, from
+the `.ic` values under `uic`. `oscnob` is the phase node; when it names no
+net, the solve picks the net that swings most. The form also publishes
+ngspice's `Frequency Domain Periodic Steady State Analysis`: `harms` rows,
+first column `frequency`, each the DFT magnitude of that harmonic over the
+period (row 0 is the mean). `sciter` caps the shooting at `sciter + 1`
+residual tests. `steadycoeff` adds ngspice's test: every unknown's period
+residual must be within (swing·reltol + vntol, or abstol for a current)
+·trtol·steadycoeff. An oscillator that does not converge within the cap
+fails (`NoPeriodicSteadyState`); ngspice instead publishes its best cycle.
 
 ```text
 .pss 1k 256
@@ -550,7 +563,8 @@ Function Analysis`, `Harmonic Balance Noise Analysis` (`hbnoise_density`).
 ```
 
 S-parameters of the deck's ports around the `.hb` solution. Plot
-`Harmonic Balance LIN Analysis`, `S(i,j)` columns.
+`Harmonic Balance LIN Analysis`, `S(i,j)` columns. `NOISECALC=1` adds
+`NF`, the single-sideband noise figure from port 1 to port 2 at 290 K.
 
 ### `.phasenoise` { #phasenoise }
 
@@ -649,7 +663,7 @@ These wrap other analyses rather than being analyses themselves; see the
   steps again.
 - `SWEEP DATA=`, `SWEEP MONTE=` and `SWEEP OPTIMIZE=` on one card:
   `<plot> (monte=n)`, `(optimize=...)`.
-- An HSPICE `.temp` list: `<plot> (temp=t)`.
+- `.step temp`: `<plot> (temp=t)`.
 - `.mosra` adds `MOSRA Degradation` (aging per device) and reruns the
   aged circuit.
 - `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` estimates a failure rate too
@@ -693,8 +707,7 @@ made larger, where failures are common, and extrapolates back:
   all trials failed: the run's exit status is an error. `--measures`
   writes the same numbers as `{"kind": "sss", ...}`.
 - Seeds follow `.option seed`, so a run is reproducible. Refused:
-  `sampling_method=lhs` (its counts are not binomial), `.alter`, an
-  HSPICE `.temp` list, a second `MONTE` card of the same analysis,
+  `sampling_method=lhs` (its counts are not binomial), `.alter`, a second `MONTE` card of the same analysis,
   `MONTE=list(...)`, and a bare `.dc MONTE=n`.
 
 ### Worst-case distance { #wcd }
@@ -741,7 +754,7 @@ statements without 10⁹ samples:
   `{"kind": "wcd", ...}`.
 - β_w is local: a spec that fails on both sides (an offset's magnitude)
   has a design point on each; write one spec per side.
-- Refused: `.alter`, `SWEEP OPTIMIZE`, an HSPICE `.temp` list, a `limit`
+- Refused: `.alter`, `SWEEP OPTIMIZE`, a `limit`
   or a multiplier draw that moves a parameter, a deck with no statistical
   parameter, a point that changes the topology (a parameter a B source
   reads), and a spec whose analysis runs only under a `SWEEP DATA` card.

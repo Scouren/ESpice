@@ -8,11 +8,14 @@
 //! Contents:
 //! - `pub const Op = struct`
 //! - `pub const Dc = struct`, `Dc.SweepTarget = union(enum)`, `SweepTarget.Param`,
-//!   `Dc.hasOuter(self: Dc) bool`
+//!   `Dc.hasOuter(self: Dc) bool`, `Dc.split`, `Dc.Segment = struct`,
+//!   `Dc.segments(self: Dc) u32`, `Dc.segment(self: Dc, s: u32) Segment`
 //! - `pub const Dcinc = struct`
 //! - `pub const Mc = struct`, `Mc.VariantRange = struct`
 //! - `pub const Temp = struct`
 
+const std = @import("std");
+const assert = std.debug.assert;
 const Tolerances = @import("../numerics.zig").Tolerances;
 const DeviceType = @import("../ids.zig").DeviceType;
 
@@ -64,6 +67,60 @@ pub const Dc = struct {
     /// Read every device terminal's current at the sweep's first point into
     /// `Result.emir`, as `Op.emir` reads the OP's (#237).
     emir: bool = false,
+    /// Solve only segment `lane` of `segments()`: one row of a sweep the
+    /// session split (analysis/dc/segments.zig stitches the rows). Null
+    /// solves the whole sweep.
+    lane: ?u32 = null,
+
+    /// How a single-axis sweep splits: at least `points` points per
+    /// segment and at most `max` segments. Each segment adds one cold
+    /// operating point and one overlap point to the sweep's work: 16
+    /// points keep that a small share of a segment, and 64 bound it for a
+    /// sweep of any length while leaving more segments than a host has
+    /// workers or lanes.
+    /// ponytail: both unmeasured; set them from the wall times of a long
+    /// `.dc` on a big circuit (a BSIM4 chain).
+    pub const split: struct { points: u32, max: u32 } = .{ .points = 16, .max = 64 };
+
+    /// One segment's points: segment s of k over n points owns s·n/k up
+    /// to (s+1)·n/k, and s > 0 starts one point earlier, at segment s-1's
+    /// last point (its overlap, solved cold and dropped from its rows).
+    pub const Segment = struct { first: usize, len: usize };
+
+    /// How many segments the session runs this sweep as, each its own row:
+    /// n / `split.points` capped at `split.max` for a single-axis sweep of
+    /// n points without tangent rows or `emir`, else 0, as below 2 (one
+    /// row). A function of the sweep alone, so every run splits it alike;
+    /// `lane` does not count. Reads unvalidated options: a NaN or huge span
+    /// stays one row.
+    pub fn segments(self: Dc) u32 {
+        if (self.hasOuter() or self.tangents.len != 0 or self.emir) return 0;
+        const k = @min(self.innerCount() / split.points, split.max);
+        return if (k >= 2) @intCast(k) else 0;
+    }
+
+    /// Segment `s` of `segments()`. Asserts that `s` is one.
+    pub fn segment(self: Dc, s: u32) Segment {
+        const k = self.segments();
+        assert(s < k);
+        const n = self.innerCount();
+        const lo = @as(usize, s) * n / k;
+        const hi = (@as(usize, s) + 1) * n / k;
+        const first = if (s == 0) lo else lo - 1;
+        assert(first < hi);
+        return .{ .first = first, .len = hi - first };
+    }
+
+    /// The inner sweep's points as analysis/dc/Sweep.zig steps them
+    /// (`points`, else DCTsetup's start to stop by step, stop included);
+    /// 0 for a span no u32 counts (NaN, inf, backwards), which validation
+    /// refuses.
+    fn innerCount(self: Dc) usize {
+        if (self.points.len > 0) return self.points.len;
+        const intervals = (self.stop - self.start) / self.step;
+        if (!(intervals >= 0 and intervals < std.math.maxInt(u32))) return 0;
+        return @as(usize, @intFromFloat(@floor(intervals + 1e-6))) + 1;
+    }
 
     /// The device parameter, or the temperature, a `.dc` sweep drives.
     pub const SweepTarget = union(enum) {

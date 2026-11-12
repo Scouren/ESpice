@@ -724,6 +724,9 @@ module hisim2_va(d, g, s, b);
     `IPRco( SB        , 0.0        , "m"                  ,   0 , inf , "Distance from STI edge to Gate edge  ")
     `IPRco( SD        , 0.0        , "m"                  ,   0 , inf , "Distance from Gate edge to Gate edge  ")
     `IPRnb( DTEMP     , 0.0        , "degC"                           , "Device temperature change")
+    // ESPice: ngspice's instance TEMP (hsm2.c:71) in degC (hsm2set.c:1010);
+    // DTEMP still adds to it (hsm2temp.c:539-544).
+    `IPRnb( TEMP      , 27.0       , "degC"                           , "Device temperature, replaces the circuit's")
     `IPRnb( SCA       , 0.0        , "-"                              , "Layout characterization factor" )
     `IPRnb( SCB       , 0.0        , "-"                              , "Layout characterization factor" )
     `IPRnb( SCC       , 0.0        , "-"                              , "Layout characterization factor" )
@@ -2673,7 +2676,9 @@ end
             //-----------------------------------------------------------*
             //* Temperature dependent constants.
             //*-----------------//
-            TTEMP = $temperature + DTEMP ;
+            TTEMP = $temperature ;
+            if ($param_given(TEMP)) TTEMP = TEMP + 273.15 ;
+            TTEMP = TTEMP + DTEMP ;
 
             // Band gap //
             Tdiff = TTEMP -  KTNOM ;

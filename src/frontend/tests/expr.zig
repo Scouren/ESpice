@@ -1,13 +1,14 @@
 //! Differential tests for expr.zig: a random expression tree, printed as
-//! ngspice or HSPICE text with only the parentheses its precedence needs,
-//! compiled and folded by expr.zig, against the tree's value computed by a
-//! naive recursive f64 evaluator written from expr.zig's doc comments
-//! (operator meanings, `%`/`\`, `nint`'s half-to-even, HSPICE's Table 10-1
-//! functions). Equal means both NaN, `==`, or at most 1 ULP apart. Also:
+//! ngspice text with only the parentheses its precedence needs, compiled
+//! and folded by expr.zig, against the tree's value computed by a naive
+//! recursive f64 evaluator written from expr.zig's doc comments (operator
+//! meanings, `%`/`\`, `nint`'s half-to-even). Equal means both NaN, `==`, or at most 1 ULP apart. Also:
 //! raw bytes through `compileAll` and `fold` (no panic, only the declared
-//! errors), and allocation failure through `compileAll` and `fold`.
+//! errors), allocation failure through `compileAll` and `fold`, and the
+//! generator's function names against expr_ops.zig `fns`.
 const std = @import("std");
 const expr = @import("../expr.zig");
+const expr_ops = @import("../expr_ops.zig");
 const lines = @import("../lines.zig");
 const Smith = std.testing.Smith;
 const Seeded = @import("seeded.zig").Seeded;
@@ -21,7 +22,7 @@ const text_max = 1 << 15;
 const literals = [_][]const u8{ "0", "1", "2", "3", "7", "10", "0.5", "2.5", ".25", "0.1", "1e3", "2.5e-3", "1e-300", "1e300", "123.456" };
 
 const BinOp = struct { text: []const u8, prec: u8 };
-/// Every binary operator `compile` reads; the last two are refused in HSPICE.
+/// Every binary operator `compile` reads.
 const bin_ops = [_]BinOp{
     .{ .text = "||", .prec = 1 }, .{ .text = "&&", .prec = 2 }, .{ .text = "<", .prec = 3 },  .{ .text = ">", .prec = 3 },
     .{ .text = "<=", .prec = 3 }, .{ .text = ">=", .prec = 3 }, .{ .text = "==", .prec = 3 }, .{ .text = "!=", .prec = 3 },
@@ -29,19 +30,18 @@ const bin_ops = [_]BinOp{
     .{ .text = "/", .prec = 5 },  .{ .text = "^", .prec = 6 },  .{ .text = "**", .prec = 6 }, .{ .text = "%", .prec = 5 },
     .{ .text = "\\", .prec = 5 },
 };
-const hspice_bin_ops = bin_ops.len - 2;
 
 const Func = struct { name: []const u8, arity: u8 };
 const funcs = [_]Func{
-    .{ .name = "sqrt", .arity = 1 },  .{ .name = "abs", .arity = 1 },     .{ .name = "min", .arity = 2 },         .{ .name = "max", .arity = 2 },
-    .{ .name = "pow", .arity = 2 },   .{ .name = "pwr", .arity = 2 },     .{ .name = "exp", .arity = 1 },         .{ .name = "ln", .arity = 1 },
-    .{ .name = "log", .arity = 1 },   .{ .name = "log10", .arity = 1 },   .{ .name = "sin", .arity = 1 },         .{ .name = "cos", .arity = 1 },
-    .{ .name = "tan", .arity = 1 },   .{ .name = "atan", .arity = 1 },    .{ .name = "arctan", .arity = 1 },      .{ .name = "floor", .arity = 1 },
-    .{ .name = "ceil", .arity = 1 },  .{ .name = "ternary", .arity = 3 }, .{ .name = "ternary_fcn", .arity = 3 }, .{ .name = "tanh", .arity = 1 },
-    .{ .name = "sqr", .arity = 1 },   .{ .name = "int", .arity = 1 },     .{ .name = "nint", .arity = 1 },        .{ .name = "sgn", .arity = 1 },
-    .{ .name = "sinh", .arity = 1 },  .{ .name = "cosh", .arity = 1 },    .{ .name = "asin", .arity = 1 },        .{ .name = "acos", .arity = 1 },
-    .{ .name = "asinh", .arity = 1 }, .{ .name = "acosh", .arity = 1 },   .{ .name = "atanh", .arity = 1 },       .{ .name = "agauss", .arity = 3 },
-    .{ .name = "gauss", .arity = 2 }, .{ .name = "unif", .arity = 2 },    .{ .name = "aunif", .arity = 4 },       .{ .name = "limit", .arity = 2 },
+    .{ .name = "sqrt", .arity = 1 },  .{ .name = "abs", .arity = 1 },         .{ .name = "min", .arity = 2 },    .{ .name = "max", .arity = 2 },
+    .{ .name = "pow", .arity = 2 },   .{ .name = "pwr", .arity = 2 },         .{ .name = "exp", .arity = 1 },    .{ .name = "ln", .arity = 1 },
+    .{ .name = "log", .arity = 1 },   .{ .name = "log10", .arity = 1 },       .{ .name = "sin", .arity = 1 },    .{ .name = "cos", .arity = 1 },
+    .{ .name = "tan", .arity = 1 },   .{ .name = "atan", .arity = 1 },        .{ .name = "arctan", .arity = 1 }, .{ .name = "floor", .arity = 1 },
+    .{ .name = "ceil", .arity = 1 },  .{ .name = "ternary_fcn", .arity = 3 }, .{ .name = "tanh", .arity = 1 },   .{ .name = "sqr", .arity = 1 },
+    .{ .name = "int", .arity = 1 },   .{ .name = "nint", .arity = 1 },        .{ .name = "sgn", .arity = 1 },    .{ .name = "sinh", .arity = 1 },
+    .{ .name = "cosh", .arity = 1 },  .{ .name = "asin", .arity = 1 },        .{ .name = "acos", .arity = 1 },   .{ .name = "asinh", .arity = 1 },
+    .{ .name = "acosh", .arity = 1 }, .{ .name = "atanh", .arity = 1 },       .{ .name = "agauss", .arity = 3 }, .{ .name = "gauss", .arity = 2 },
+    .{ .name = "unif", .arity = 2 },  .{ .name = "aunif", .arity = 4 },       .{ .name = "limit", .arity = 2 },
 };
 
 const Tag = enum { num, neg, plus, not, bin, tern, call };
@@ -51,7 +51,6 @@ const Node = struct { tag: Tag, op: u8 = 0, n: u8 = 0, kids: [4]u16 = undefined 
 const Tree = struct {
     nodes: [nodes_max]Node = undefined,
     len: u16 = 0,
-    hspice: bool,
 
     fn add(t: *Tree, n: Node) u16 {
         t.nodes[t.len] = n;
@@ -68,13 +67,9 @@ const Tree = struct {
         var n: Node = .{ .tag = tag };
         switch (tag) {
             .num => unreachable,
-            .neg, .plus => n.n = 1,
-            .not => {
-                if (t.hspice) return t.gen(src, depth); // HSPICE has no unary `!`.
-                n.n = 1;
-            },
+            .neg, .plus, .not => n.n = 1,
             .bin => {
-                n.op = @intCast(src.index(if (t.hspice) hspice_bin_ops else bin_ops.len));
+                n.op = @intCast(src.index(bin_ops.len));
                 n.n = 2;
             },
             .tern => n.n = 3,
@@ -155,17 +150,19 @@ const Tree = struct {
             .plus => v[0],
             .not => if (v[0] == 0) 1 else 0,
             .tern => if (v[0] == 0) v[2] else v[1],
-            .bin => binary(bin_ops[n.op].text, v[0], v[1], t.hspice),
-            .call => call(funcs[n.op].name, v[0..n.n], t.hspice),
+            .bin => binary(bin_ops[n.op].text, v[0], v[1]),
+            .call => call(funcs[n.op].name, v[0..n.n]),
         };
     }
 };
+
+// ---- private ----
 
 fn truth(b: bool) f64 {
     return if (b) 1 else 0;
 }
 
-fn binary(op: []const u8, x: f64, y: f64, hspice: bool) f64 {
+fn binary(op: []const u8, x: f64, y: f64) f64 {
     const eq = std.mem.eql;
     if (eq(u8, op, "||")) return truth(x != 0 or y != 0);
     if (eq(u8, op, "&&")) return truth(x != 0 and y != 0);
@@ -181,29 +178,21 @@ fn binary(op: []const u8, x: f64, y: f64, hspice: bool) f64 {
     if (eq(u8, op, "/")) return x / y;
     if (eq(u8, op, "%")) return x - y * @trunc(x / y);
     if (eq(u8, op, "\\")) return @trunc(@abs(x / y));
-    // `^` and `**`: |x|^y in ngspice; HSPICE rounds a negative base's
-    // exponent and takes 0 to any power as 0.
-    if (!hspice) return std.math.pow(f64, @abs(x), y);
-    if (x < 0) return std.math.pow(f64, x, @round(y));
-    if (x == 0) return 0;
-    return std.math.pow(f64, x, y);
+    // `^` and `**`: |x|^y, as ngspice's PTpower.
+    return std.math.pow(f64, @abs(x), y);
 }
 
-fn call(name: []const u8, a: []const f64, hspice: bool) f64 {
+fn call(name: []const u8, a: []const f64) f64 {
     const eq = std.mem.eql;
     const x = a[0];
     const m = std.math;
-    if (hspice) {
-        if (eq(u8, name, "sqrt")) return if (x < 0) -@sqrt(-x) else @sqrt(x);
-        if (eq(u8, name, "log")) return if (x < 0) -@log(-x) else @log(x);
-        if (eq(u8, name, "log10")) return if (x < 0) -@log10(-x) else @log10(x);
-        if (eq(u8, name, "pow")) return m.pow(f64, x, @trunc(a[1]));
-    }
     if (eq(u8, name, "sqrt")) return @sqrt(x);
     if (eq(u8, name, "abs")) return @abs(x);
     if (eq(u8, name, "min")) return @min(x, a[1]);
     if (eq(u8, name, "max")) return @max(x, a[1]);
-    if (eq(u8, name, "pow") or eq(u8, name, "pwr")) return m.pow(f64, @abs(x), a[1]);
+    // numparam's pow is C's pow, its pwr |x|^y (xpressn.c XFU_POW, XFU_PWR).
+    if (eq(u8, name, "pow")) return m.pow(f64, x, a[1]);
+    if (eq(u8, name, "pwr")) return m.pow(f64, @abs(x), a[1]);
     if (eq(u8, name, "exp")) return @exp(x);
     if (eq(u8, name, "ln") or eq(u8, name, "log")) return @log(x);
     if (eq(u8, name, "log10")) return @log10(x);
@@ -213,7 +202,7 @@ fn call(name: []const u8, a: []const f64, hspice: bool) f64 {
     if (eq(u8, name, "atan") or eq(u8, name, "arctan")) return m.atan(x);
     if (eq(u8, name, "floor")) return @floor(x);
     if (eq(u8, name, "ceil")) return @ceil(x);
-    if (eq(u8, name, "ternary") or eq(u8, name, "ternary_fcn")) return if (x == 0) a[2] else a[1];
+    if (eq(u8, name, "ternary_fcn")) return if (x == 0) a[2] else a[1];
     if (eq(u8, name, "tanh")) return m.tanh(x);
     if (eq(u8, name, "sqr")) return x * x;
     if (eq(u8, name, "int")) return @trunc(x);
@@ -253,7 +242,7 @@ fn same(a: f64, b: f64) bool {
 }
 
 fn checkOne(src: anytype) !void {
-    var tree: Tree = .{ .hspice = src.eosWeightedSimple(3, 1) };
+    var tree: Tree = .{};
     const root = tree.gen(src, 0);
     var buf: [text_max]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -265,7 +254,7 @@ fn checkOne(src: anytype) !void {
     defer arena.deinit();
     const a = arena.allocator();
     var s: expr.Scratch = .{};
-    (if (tree.hspice) expr.compileAll(lines.hspice, a, &s, text) else expr.compileAll(lines.ngspice, a, &s, text)) catch |err| {
+    expr.compileAll(lines.ngspice, a, &s, text) catch |err| {
         std.debug.print("{s} for `{s}`\n", .{ @errorName(err), text });
         return err;
     };
@@ -273,7 +262,11 @@ fn checkOne(src: anytype) !void {
     const folded = try expr.fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
     const evaluated = try expr.eval(a, &stack, s.ops.items, s.consts.items, &.{}, null);
     if (!folded.known or !same(folded.num, want) or !same(evaluated, want)) {
-        std.debug.print("`{s}`: reference {e}, fold {e} (known {}), eval {e}\n", .{ text, want, folded.num, folded.known, evaluated });
+        // An unknown fold holds no number: its `num` is a 0 nothing reads.
+        if (folded.known)
+            std.debug.print("`{s}`: reference {e}, fold {e}, eval {e}\n", .{ text, want, folded.num, evaluated })
+        else
+            std.debug.print("`{s}`: reference {e}, fold left it unknown, eval {e}\n", .{ text, want, evaluated });
         return error.TestUnexpectedResult;
     }
     // The whole postfix is one subtree.
@@ -284,6 +277,41 @@ fn fuzzReference(_: void, s: *Smith) anyerror!void {
     try checkOne(s);
 }
 
+fn rawCheck(gpa: std.mem.Allocator, text: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var s: expr.Scratch = .{};
+    expr.compileAll(lines.ngspice, a, &s, text) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ParseError => return,
+    };
+    // A compiled expression is one complete postfix tree.
+    var stack: std.ArrayList(expr.Val) = .empty;
+    _ = try expr.fold(a, &stack, s.ops.items, s.consts.items, true, &.{});
+    _ = try expr.eval(a, &stack, s.ops.items, s.consts.items, &.{}, null);
+    try std.testing.expectEqual(0, expr.subtreeStart(s.ops.items, s.ops.items.len - 1));
+}
+
+fn fuzzRaw(_: void, s: *Smith) anyerror!void {
+    var buf: [1 << 12]u8 = undefined;
+    try rawCheck(std.testing.allocator, buf[0..s.slice(&buf)]);
+}
+
+fn compileFold(gpa: std.mem.Allocator, text: []const u8) !void {
+    var s: expr.Scratch = .{};
+    defer {
+        s.ops.deinit(gpa);
+        s.consts.deinit(gpa);
+        s.names.deinit(gpa);
+    }
+    try expr.compileAll(lines.ngspice, gpa, &s, text);
+    var stack: std.ArrayList(expr.Val) = .empty;
+    defer stack.deinit(gpa);
+    _ = try expr.fold(gpa, &stack, s.ops.items, s.consts.items, false, &.{});
+    _ = try expr.eval(gpa, &stack, s.ops.items, s.consts.items, &.{}, null);
+}
+
 test "fuzz expr: fold and eval against a recursive reference evaluator" {
     try std.testing.fuzz({}, fuzzReference, .{});
 }
@@ -292,6 +320,51 @@ test "expr: 5000 seeded expressions match the reference evaluator" {
     var prng: std.Random.DefaultPrng = .init(0xe4b5_0001);
     var src: Seeded = .{ .r = prng.random() };
     for (0..5000) |_| try checkOne(&src);
+}
+
+test "expr: the generator calls the built-ins a deck can spell, and no other" {
+    // Name lists, both ways, against expr_ops.zig `fns` but its TABLE,
+    // which only reader_behavioural.zig writes. Red before: `ternary`,
+    // which ngspice-44.2 refuses ("Undefined parameter [ternary]") and
+    // `fns` dropped, stayed here, so the reference evaluated a call the
+    // fold leaves unknown (the seeded loop, unit7 17:10).
+    const gpa = std.testing.allocator;
+    var differ: std.ArrayList(u8) = .empty;
+    defer differ.deinit(gpa);
+    for (funcs) |f| if (!expr_ops.fns.has(f.name)) try differ.print(gpa, "generator only: {s}\n", .{f.name});
+    for (expr_ops.fns.keys()) |name| {
+        if (std.mem.eql(u8, name, "TABLE")) continue;
+        for (funcs) |f| {
+            if (std.mem.eql(u8, f.name, name)) break;
+        } else try differ.print(gpa, "fns only: {s}\n", .{name});
+    }
+    try std.testing.expectEqualStrings("", differ.items);
+}
+
+test "expr: a NaN condition takes the true branch, as ngspice-44.2 reads it" {
+    // ngspice-44.2 -b printed 0.25 for each text as `.param p={...}` read by
+    // `vp p 0 {p}`, and for the first two as `b1 o 0 v=...`: acosh(0) is
+    // NaN, and NaN is not 0. The third is the seeded loop's failing case
+    // (unit7 17:10) with ternary_fcn; spelled `ternary(` it stops ngspice
+    // ("Undefined parameter [ternary]") and stays unknown here. A guard:
+    // fold and eval already read NaN as true, as the reference does.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var stack: std.ArrayList(expr.Val) = .empty;
+    const seeded = "acosh(TERNARY(-0.5,+acosh(2.5e-3 <= 2),exp(3/.25%!123.456))) ? .25 : abs(0.5)";
+    const texts = [_][]const u8{ "acosh(0) ? .25 : .5", "ternary_fcn(acosh(0), .25, .5)", try std.mem.replaceOwned(u8, a, seeded, "TERNARY", "ternary_fcn") };
+    for (texts) |text| {
+        var s: expr.Scratch = .{};
+        try expr.compileAll(lines.ngspice, a, &s, text);
+        const folded = try expr.fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
+        try std.testing.expect(folded.known);
+        try std.testing.expectEqual(0.25, folded.num);
+        try std.testing.expectEqual(0.25, try expr.eval(a, &stack, s.ops.items, s.consts.items, &.{}, null));
+    }
+    var bare: expr.Scratch = .{};
+    try expr.compileAll(lines.ngspice, a, &bare, try std.mem.replaceOwned(u8, a, seeded, "TERNARY", "ternary"));
+    try std.testing.expect(!(try expr.fold(a, &stack, bare.ops.items, bare.consts.items, false, &.{})).known);
 }
 
 test "expr: the precedence the printer assumes, by hand" {
@@ -315,53 +388,11 @@ test "expr: literals read as std.fmt.parseFloat reads them" {
     for (literals) |text| {
         const want = try std.fmt.parseFloat(f64, text);
         try std.testing.expectEqual(want, lines.ngspice.parseNum(text).?);
-        try std.testing.expectEqual(want, lines.hspice.parseNum(text).?);
     }
-}
-
-fn rawCheck(gpa: std.mem.Allocator, text: []const u8, dialect: u8) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var s: expr.Scratch = .{};
-    const r = switch (dialect % 3) {
-        0 => expr.compileAll(lines.ngspice, a, &s, text),
-        1 => expr.compileAll(lines.hspice, a, &s, text),
-        else => expr.compileAll(lines.spectre, a, &s, text), // else: 2, the rest of `% 3`
-    };
-    r catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        error.ParseError, error.UnsupportedCard => return,
-    };
-    // A compiled expression is one complete postfix tree.
-    var stack: std.ArrayList(expr.Val) = .empty;
-    _ = try expr.fold(a, &stack, s.ops.items, s.consts.items, true, &.{});
-    _ = try expr.eval(a, &stack, s.ops.items, s.consts.items, &.{}, null);
-    try std.testing.expectEqual(0, expr.subtreeStart(s.ops.items, s.ops.items.len - 1));
-}
-
-fn fuzzRaw(_: void, s: *Smith) anyerror!void {
-    var buf: [1 << 12]u8 = undefined;
-    const dialect = s.value(u8);
-    try rawCheck(std.testing.allocator, buf[0..s.slice(&buf)], dialect);
 }
 
 test "fuzz expr: raw bytes compile or fail with a declared error" {
     try std.testing.fuzz({}, fuzzRaw, .{ .corpus = &.{ "1+2*3", "v(a,b)*i(v1)", "f(1,2)?x:-y", "((1))", "1e3k**2", "!a<>b", "'1'+\"2\"" } });
-}
-
-fn compileFold(gpa: std.mem.Allocator, text: []const u8) !void {
-    var s: expr.Scratch = .{};
-    defer {
-        s.ops.deinit(gpa);
-        s.consts.deinit(gpa);
-        s.names.deinit(gpa);
-    }
-    try expr.compileAll(lines.ngspice, gpa, &s, text);
-    var stack: std.ArrayList(expr.Val) = .empty;
-    defer stack.deinit(gpa);
-    _ = try expr.fold(gpa, &stack, s.ops.items, s.consts.items, false, &.{});
-    _ = try expr.eval(gpa, &stack, s.ops.items, s.consts.items, &.{}, null);
 }
 
 test "expr: compile, fold and eval fail cleanly at every allocation" {

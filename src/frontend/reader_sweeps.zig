@@ -17,7 +17,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -66,13 +65,15 @@ pub fn Methods(comptime S: type) type {
                 (std.mem.eql(u8, args[0].name, "data") or std.mem.eql(u8, args[0].name, "monte"))) at = 0;
             // HSPICE `.dc param start stop incr` [CR .DC]: a swept `.param`
             // and no source. Its points are the DC sweep, as `.dc DATA=`'s
-            // rows are (#94).
-            if (at == null and kind == .dc and args.len == 4 and args[0] == .name) {
-                if (try r.liveParam(args[0].name)) |k| {
+            // rows are (#94). A card of the name is swept instead
+            // (`stepTarget`).
+            if (at == null and kind == .dc and args.len == 4 and args[0] == .name) switch (try r.stepTarget(args[0].name)) {
+                .param => |k| {
                     const n = try r.numbers(args[1..]);
                     return .{ .args = args[0..0], .sweep = .{ .step = .{ .target = .{ .param = k }, .values = try points(r.arena, .lin, n[0], n[1], n[2], .per_unit) } } };
-                }
-            }
+                },
+                .temp, .card => {},
+            };
             const i = at orelse return .{ .args = args, .sweep = .none };
             const tail = args[i + @intFromBool(args[i] == .name and std.mem.eql(u8, args[i].name, "sweep")) ..];
             if (tail.len < 2 or tail[0] != .name) return error.ParseError;

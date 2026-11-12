@@ -156,7 +156,9 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
                 p.out[l] = run(&p.ctxs[l], p.opts);
                 return;
             }
+            const steps = r.sim.steps;
             const v = r.sim.end(&p.atts[l], p.nr[l].result, p.d.laneOps(l)) catch |e| return Lane.kill(p.runs, p.live, p.out, l, e);
+            if (p.opts.snapshot and r.sim.steps != steps) Lane.keepRow(&r.sim, p.d.laneOps(l).accepted(&r.sim));
             switch (v) {
                 .go => {},
                 .stop => {
@@ -228,6 +230,8 @@ fn gpuLaneRefusal(ckt: *const root.Circuit, opts: Options) ?[]const u8 {
     if (!gpu_lanes.available) return "no GPU images";
     if (opts.uic or opts.snapshot or opts.sources_at_zero or opts.tangents.len != 0) return "uic, snapshot, OPtran or tangents";
     if (integrator.order(opts.method) > 2) return "gear-3..6";
+    // The lane kernels add the whole update: `.options dv` is the host loop's.
+    if (opts.tol.dv != null) return "a Newton voltage bound (dv)";
     if (ckt.vpi != null or ckt.display != null or ckt.load_check != null) return "VPI, display tasks or a load check";
     if (ckt.minDelay() != null) return "a delay line";
     if (ckt.has_charge and (ckt.knobs.no_qtape or ckt.qTapeLen() == 0)) return "no charge tape";

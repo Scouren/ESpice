@@ -6,8 +6,8 @@
 //! Contents:
 //! - `allocator`, `n`, `nnz`, `col_ptr`, `row_idx`, `diag_slots`, `batches`,
 //!   `batch_types`, `current_row`, `intern_bytes`, `intern_offs`, `bbd`,
-//!   `ac_dyn_slots`, `has_charge`, `has_state_q`, `needs_tran_op`, `vpi`,
-//!   `param_starts`, `column_order` (fields)
+//!   `ac_dyn_slots`, `has_charge`, `has_state_q`, `linear`, `needs_tran_op`,
+//!   `vpi`, `param_starts`, `column_order` (fields)
 //! - `pub const ColumnOrder = struct`, with `get`, `share`, `destroy`
 //! - `pub const Facts = struct`
 //! - `pub const FreezeError = error{...}`
@@ -59,6 +59,13 @@ has_charge: bool,
 /// Some charge-bearing batch also keeps accepted-step state, so a transient
 /// must restamp q after `update_state`/`commit_state`.
 has_state_q: bool,
+/// Every batch's stamp is independent of x (C3,
+/// docs/perf_research/04-levers-cpu.md): a whole constant Jacobian
+/// (VerA's `constant.g`, and `constant.c` with a charge), no limiter, no
+/// Newton history, no convergence veto, no accepted-step state, no digital
+/// engine and no VPI host. Time-varying sources qualify. Conservative: a
+/// fact the hooks cannot show reads as nonlinear.
+linear: bool = false,
 /// The builder found a node with only capacitors to it, so the operating
 /// point falls back to ngspice's OPtran. From `Facts` at the freeze.
 needs_tran_op: bool = false,
@@ -222,6 +229,8 @@ const FakeProto = struct {
         try t.expectEqualStrings("", ckt.nodeName(2));
         try t.expect(!ckt.has_charge);
         try t.expect(!ckt.has_state_q);
+        // A constant Jacobian and no other hook: x-independent.
+        try t.expect(ckt.linear);
     }
 };
 
@@ -288,14 +297,17 @@ pub fn freeze(
     for (protos) |proto| proto.destroy(proto.ctx, allocator);
     var has_charge = false;
     var has_state_q = false;
+    var linear = facts.vpi == null;
     for (batches, batch_types) |*b, t| {
         const i: usize = @backingInt(t);
         b.digital = t != .unset and i < facts.digital.len and facts.digital[i];
         has_charge = has_charge or b.has_charge;
         has_state_q = has_state_q or (b.has_charge and
             (b.hooks.update_state != null or b.hooks.commit_state != null));
+        linear = linear and xIndependent(b.*);
     }
     if (has_state_q) assert(has_charge);
+    if (linear) assert(!has_state_q);
     return .{
         .needs_tran_op = facts.needs_tran_op,
         .vpi = facts.vpi,
@@ -314,6 +326,7 @@ pub fn freeze(
         .ac_dyn_slots = ac_dyn_slots,
         .has_charge = has_charge,
         .has_state_q = has_state_q,
+        .linear = linear,
         .column_order = column_order,
     };
 }
@@ -382,6 +395,16 @@ pub fn findSlot(self: Circuit, row: u32, col: u32) ?u32 {
 }
 
 // ---- private ----
+
+/// Whether batch `b`'s stamp cannot depend on x within a solve: `linear`'s
+/// per-batch half, read off what the hooks and `has_const_jacobian` show.
+fn xIndependent(b: abi.Batch) bool {
+    const h = b.hooks;
+    return b.has_const_jacobian and !b.digital and
+        h.apply_limits == null and h.limit_range == null and
+        h.advance_iteration == null and h.check_convergence == null and
+        h.update_state == null and h.commit_state == null and h.state_ctl == null;
+}
 
 /// The CSC pattern of every diagonal plus each proto's entries, into
 /// `col_ptr_out` and `row_idx_out` (owned by `allocator`); returns nnz. The

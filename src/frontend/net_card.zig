@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const core = @import("core");
-const requests = core.query;
 const numerics = core.numerics;
 const devices = @import("spice.zig");
 const sparam = @import("sparam.zig");
@@ -21,7 +20,6 @@ const Netlist = netlist.Netlist;
 const Device = Netlist.View;
 const Model = netlist.Model;
 const Kv = netlist.Kv;
-const Value = netlist.Value;
 const Op = netlist.expr.Op;
 const batch = device.abi;
 const Library = device.Library;
@@ -56,6 +54,13 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
         return;
     }
     const letter = dev.kind;
+    // ngspice takes no `m=` on these letters: their parameter tables refuse
+    // it, and inpcom.c:4253-4257 leaves them out when an X card's m spreads
+    // over a subcircuit. Read as a $mfactor it would mislabel a branch
+    // current; dropped it would be a silent wrong number.
+    if (std.mem.indexOfScalar(u8, "vehkopstuwy", letter) != null) for (dev.kv) |item| {
+        if (std.mem.eql(u8, item.key, "m")) return net_cards.refuse(dev, letter, "m= is not a parameter of this element");
+    };
     // 'u' (URC) has no DeviceId behind it: the card expands into
     // resistor/capacitor/diode lumps in addUrc, like ngspice's URCsetup.
     if (letter != 'u' and devices.letter_map.get(&.{letter}) == null) {
@@ -66,17 +71,21 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
     switch (letter) {
         'c' => try net_topology.topoMark(self, dev, .cap, 0),
         'i' => try net_topology.topoMark(self, dev, .cur, 0),
-        // A V source shorts its pair at its DC value; an inductor at 0 V.
-        // A P card's series z0 keeps n+ off the short.
-        'v' => if (net_cards.isPortCard(dev)) try net_topology.topoMark(self, dev, .dc, 0) else try net_topology.topoMark(self, dev, .short, net_cards.sourceDc(dev) orelse 0),
+        // A V source shorts its pair at its DC value; an inductor at 0 V. A
+        // portnum V has its z0 in series, so it is a DC path, not a short.
+        'v' => if (try net_cards.sourcePort(dev) == null)
+            try net_topology.topoMark(self, dev, .short, net_cards.sourceDc(dev) orelse 0)
+        else
+            try net_topology.topoMark(self, dev, .dc, 0),
         'l' => try net_topology.topoMark(self, dev, .short, 0),
         else => try net_topology.topoMark(self, dev, .dc, 0),
     }
 
     switch (letter) {
-        'r' => _ = try net_passive.addPassive(self, devices.resistor, dev, "r", "resist"),
+        // The value's ngspice spellings: res.c, cap.c and ind.c's IOPP names.
+        'r' => _ = try net_passive.addPassive(self, devices.resistor, dev, "r", &.{ "resistance", "resist" }),
         'c' => {
-            _ = try net_passive.addPassive(self, devices.capacitor, dev, "c", "cap");
+            _ = try net_passive.addPassive(self, devices.capacitor, dev, "c", &.{ "capacitance", "cap" });
             // ponytail: a floating C sets its n+ node, not only its own
             // charge as ngspice's CAPload under MODEUIC does, so another
             // charge on that node starts charged too. Exact for a grounded
@@ -87,10 +96,8 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
             }
         },
         'l' => {
-            const br = try net_passive.addPassive(self, devices.inductor, dev, "l", "inductance");
+            const br = try net_passive.addPassive(self, devices.inductor, dev, "l", &.{"inductance"});
             if (try net_cards.numericParameter(dev.kv, "ic")) |ic| try self.dev_ic.append(self.arena, .{ .node = br, .value = ic });
-            try self.l.append(self.arena, .{ .name = dev.name, .branch = br, .value = Value.numberAt(dev.positional, 0) orelse
-                net_cards.kvNumber(dev.kv, "inductance") orelse net_cards.kvNumber(dev.kv, "l") orelse 0 });
         },
         'v' => {
             if (comptime !@hasDecl(devices.vsource, "eval")) return error.UnsupportedDevice;
@@ -98,47 +105,30 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
             var nodes = try net_devices.deviceNodes(self, devices.vsource, dev);
             const pos = nodes[0];
             const sensors: u32 = if (self.sensors.fetchRemove(dev.name)) |kv| kv.value else 0;
-            const port = if (sensors != 0) null else try net_cards.sourcePort(dev);
-            // An HSPICE P card keeps its z0 in series in every analysis
-            // [SA Ch.17]: a noiseless resistor from n+ to a hidden node the
-            // source drives. ngspice's portnum V stays ideal.
-            const series = port != null and net_cards.isPortCard(dev);
+            const port = try net_cards.sourcePort(dev);
             const neg = nodes[1];
-            var port_branch: u32 = undefined;
-            var balanced: ?requests.Port.Leg = null;
-            if (series and dev.pins.len == 3) {
-                // Mixed mode [SA Ch.17]: the card's value V drives a hidden
-                // node m against ref, and each leg is V/2 or -V/2 against
-                // ref (a VCVS on m) behind its own z0.
-                const ref = try self.rowOf(dev.pins[2]);
-                nodes = .{ try self.b.addNode(), ref };
-                var legs: [2]requests.Port.Leg = undefined;
-                for (&legs, [2]u32{ pos, neg }, [2]f64{ 0.5, -0.5 }) |*leg, pin, gain| {
-                    const h = try self.b.addNode();
-                    try self.b.addDevice(devices.resistor, dev.name, &.{ .r = port.?.z0, .noisy = 0 }, &.{}, [2]u32{ pin, h });
-                    try self.b.addDevice(devices.vcvs, dev.name, &.{ .gain = gain }, &.{}, [4]u32{ h, ref, nodes[0], ref });
-                    leg.* = .{ .node = pin, .branch = net_devices.internalRow(devices.vcvs, "flowZ28pZ2cnZ29", self.b.n) };
-                }
-                port_branch = legs[0].branch;
-                balanced = legs[1];
-            } else if (series) {
+            // ngspice's portnum V has its z0 in series in every analysis, and
+            // noiseless: vsrcload.c stamps 1/z0 from n+ to an internal
+            // `#res` node the ideal source drives (44.2: v(a) = 0.5 for 1 V
+            // into 50 ohm, and no z0 term in .noise). The node publishes as
+            // ngspice's does, `v(<source>#res)` (vsrcset.c:56 CKTmkVolt
+            // "res"). The R is an internal add, unnamed: `.dc v1` and
+            // `@v1[...]` still find the source, and `.noise` and `.sens`
+            // give it no row, as ngspice's vsrc has none.
+            if (port) |p| {
                 nodes[0] = try self.b.addNode();
-                try self.b.addDevice(devices.resistor, dev.name, &.{ .r = port.?.z0, .noisy = 0 }, &.{}, [2]u32{ pos, nodes[0] });
+                self.b.node_labels.items[nodes[0]] = try std.fmt.allocPrint(self.arena, "{s}#res", .{dev.name});
+                try self.b.addDevice(devices.resistor, "", &.{ .r = p.z0, .noisy = 0 }, &.{}, [2]u32{ pos, nodes[0] });
             }
             // A PWL past the table's capacity continues in sources of its
             // later segments, in series between the card's source and n-.
             const tail = try net_waves.pwlTail(devices.vsource, self.arena, dev);
-            if (tail.len != 0 and series) {
-                if (!@import("builtin").is_test) std.log.err("{s}: a PWL past {d} points on a port source", .{ dev.name, comptime net_waves.pwlCapacity(devices.vsource.Model) });
-                return error.UnsupportedCard;
-            }
             // A sensed source ends at a hidden tap; addBranchRef chains
             // its sensors from there to n- (see `VCard.tap`).
             if (sensors != 0) nodes[1] = try self.b.addNode();
             const chain_end = nodes[1];
             if (tail.len != 0) nodes[1] = try self.b.addNode();
             const br = self.b.n;
-            if (balanced == null) port_branch = br;
             try self.b.addDevice(devices.vsource, dev.name, &bound[0], &bound[1], nodes);
             var from = nodes[1];
             for (tail, 0..) |seg, k| {
@@ -156,20 +146,24 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
                 .distof1 = net_cards.sourceDisto(dev, "distof1"),
                 .distof2 = net_cards.sourceDisto(dev, "distof2"),
             });
+            // The port reads v(n+) outside its z0, which the circuit holds,
+            // so `.sp`, `.lin` and `.hblin` add no termination of their own.
             if (port) |p| try self.ports.append(self.arena, .{ .num = p.num, .port = .{
                 .node = pos,
                 .neg = chain_end,
-                .branch = port_branch,
+                .branch = br,
                 .z0 = p.z0,
                 .band = p.band,
-                .series_z0 = series,
-                .balanced = balanced,
             } });
             if (self.source_branch == GROUND) {
-                self.source_node = if (series) pos else nodes[0];
+                self.source_node = pos;
                 self.source_branch = br;
             }
-            if (net_cards.sourceAc(dev)) |ac| try self.ac.append(self.arena, .{ .pos = GROUND, .neg = br, .re = ac.re, .im = ac.im });
+            // Every V and I card has an `ac` row: one with no AC spec drives
+            // nothing (amplitude 0, phase 0) but still has its `.sens ... ac`
+            // `_acmag` and `_acphase` columns, as in ngspice (vsrc.c:14-15).
+            const ac = net_cards.sourceAc(dev) orelse net_cards.SourceAc{ .re = 0, .im = 0, .unit = .{ 1, 0 } };
+            try self.ac.append(self.arena, .{ .name = dev.name, .pos = GROUND, .neg = br, .re = ac.re, .im = ac.im, .unit = ac.unit });
         },
         'i' => {
             if (comptime !@hasDecl(devices.isource, "eval")) return error.UnsupportedDevice;
@@ -181,17 +175,21 @@ pub fn addDevice(self: *NetBuilder, card: Device) !void {
             try self.b.addDevice(devices.isource, dev.name, &bound[0], &bound[1], nodes);
             // A PWL past the table's capacity: its later segments in parallel.
             for (try net_waves.pwlTail(devices.isource, self.arena, dev)) |seg| try self.b.addDevice(devices.isource, dev.name, &seg, &.{ .mfactor = m }, nodes);
-            if (net_cards.sourceAc(dev)) |ac| try self.ac.append(self.arena, .{ .pos = nodes[0], .neg = nodes[1], .re = m * ac.re, .im = m * ac.im });
+            const ac = net_cards.sourceAc(dev) orelse net_cards.SourceAc{ .re = 0, .im = 0, .unit = .{ 1, 0 } };
+            try self.ac.append(self.arena, .{ .name = dev.name, .pos = nodes[0], .neg = nodes[1], .re = m * ac.re, .im = m * ac.im, .unit = .{ m * ac.unit[0], m * ac.unit[1] } });
             try self.i.append(self.arena, .{ .name = dev.name, .pos = nodes[0], .neg = if (nodes.len > 1) nodes[1] else GROUND });
             try self.topo_isrc.append(self.arena, .{ .pos = nodes[0], .neg = if (nodes.len > 1) nodes[1] else GROUND, .dc = bound[0].dc });
         },
-        'w' => if (self.nl.deck.dialect == .hspice) try net_lines.addWline(self, dev) else try self.deferred.append(self.arena, dev),
-        's' => if (self.nl.deck.dialect == .hspice) try net_lines.addSparam(self, dev) else try addByLetter(self, letter, dev),
         'f', 'h', 'k' => try self.deferred.append(self.arena, dev),
+        // A W or S card with `key=value` fields is ESPice's RLGC line or
+        // N-port (card_table.isDataElement); ngspice's switch has none.
+        'w' => if (dev.kv.len != 0) try net_lines.addWline(self, dev) else try self.deferred.append(self.arena, dev),
+        's' => if (dev.kv.len != 0) try net_lines.addSparam(self, dev) else try addByLetter(self, letter, dev),
         // A tape that reads i() waits until every branch row exists.
         'b' => if (net_tape.readsCurrent(self.nl, dev)) try self.deferred.append(self.arena, dev) else try addB(self, dev),
         'p' => try net_lines.addCpl(self, dev),
         'o' => try net_lines.addLossyLine(self, dev),
+        't' => try net_lines.addTline(self, dev),
         'y' => try net_lines.addTxl(self, dev),
         'u' => try net_lines.addUrc(self, dev),
         'e', 'g' => if (net_cards.kvNumber(dev.kv, "laplace") != null) {
@@ -231,8 +229,7 @@ pub fn addByLetter(self: *NetBuilder, letter: u8, dev: Device) !void {
 /// unknown either way; the I-mode one stays unprobed rather than
 /// published as a column ngspice never writes.
 pub fn addB(self: *NetBuilder, dev: Device) !void {
-    if (try net_tape.addBsource(self, dev))
-        try net_branches.addBranchProbe(self, dev.name, net_devices.internalRow(devices.bsource, "flowZ28pZ2cnZ29", self.b.n));
+    if (try net_tape.addBsource(self, dev)) |row| try net_branches.addBranchProbe(self, dev.name, row);
 }
 
 // ---- private ----

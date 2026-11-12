@@ -1,13 +1,13 @@
-//! The netlist reader's state. In: a deck's logical lines in one dialect.
+//! The netlist reader's state. In: an ngspice deck's logical lines.
 //! Out: the `Reader` row store the three walks fill (declarations, devices
 //! with subcircuits expanded, analysis nets), and `run`, the spine that
 //! calls them in order and freezes the result into a `Netlist`. The walks'
 //! methods live in the reader_*.zig stage files.
 //! Cites: ngspice inpcom.c, inp.c (recifeval), subckt.c; HSPICE [SA], [CR].
 //!
-//! `Reader` is generic over `S` (axis: the dialect's line syntax; three
-//! cases today: ngspice, hspice, spectre), so each dialect's comptime line
-//! rules fold into its walks.
+//! `Reader` is generic over `S`, the line syntax (lines.zig), so its
+//! comptime rules fold into the walks. One case is left, ngspice's: the
+//! HSPICE and Spectre syntaxes went to SpiceRack (src/spicerack.zig).
 //!
 //! Contents:
 //! - `pub fn Reader(comptime S: type) type`
@@ -24,7 +24,7 @@
 //! - `pub const Hit`
 //! - `pub const Size`
 //! - `pub fn add(a: *Size, b: Size) void`
-//! - `pub fn init(arena: Allocator, orig: []const u8, text: []const u8, dialect: Dialect) Allocator.Error!R`
+//! - `pub fn init(arena: Allocator, orig: []const u8, text: []const u8) Allocator.Error!R`
 //! - `pub const run`
 //! - `pub const nodeValues`
 //! - `pub const declarations`
@@ -33,7 +33,6 @@
 //! - `pub const pathOf`
 //! - `pub const readFunc`
 //! - `pub const paramText`
-//! - `pub const checkBare`
 //! - `pub const readModel`
 //! - `pub const unresolved`
 //! - `pub const namesParam`
@@ -51,10 +50,8 @@
 //! - `pub const isStep`
 //! - `pub const isWcd`
 //! - `pub const readDirective`
-//! - `pub const readProbe`
 //! - `pub const readMosra`
 //! - `pub const readSample`
-//! - `pub const readSaveOp`
 //! - `pub const written`
 //! - `pub const failed`
 //! - `pub const liveParam`
@@ -87,7 +84,6 @@
 //! - `pub const operatorLed`
 //! - `pub const nameValue`
 //! - `pub const readMeasures`
-//! - `pub const skipBad`
 //! - `pub const readPower`
 //! - `pub const readStim`
 //! - `pub const sourcePower`
@@ -110,10 +106,9 @@
 //! - `pub const connect`
 //! - `pub const joined`
 //! - `pub const netOf`
-//! - `pub const mixedPort`
 //! - `pub const fixedPins`
-//! - `pub const behaviouralResistor`
-//! - `pub const kindOf`
+//! - `pub const lowersToB`
+//! - `pub const behaviouralPassive`
 //! - `pub const readDevice`
 //! - `pub const replay`
 //! - `pub const cardNodes`
@@ -124,14 +119,13 @@
 //! - `pub const behaviouralCard`
 //! - `pub const wrapped`
 //! - `pub const exprRest`
+//! - `pub const unbraced`
 //! - `pub const word`
 //! - `pub const numberAt`
 //! - `pub const controlText`
-//! - `pub const tableText`
+//! - `pub const tablePoints`
 //! - `pub const polyText`
-//! - `pub const readDataElement`
 //! - `pub const dataPath`
-//! - `pub const portLine`
 //! - `pub const isModel`
 //! - `pub const splitTerminals`
 //! - `pub const commit`
@@ -148,7 +142,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -174,8 +167,8 @@ const reader_measures = @import("reader_measures.zig");
 const reader_nets = @import("reader_nets.zig");
 const reader_devices = @import("reader_devices.zig");
 const reader_behavioural = @import("reader_behavioural.zig");
+const reader_rcl = @import("reader_rcl.zig");
 const reader_replay = @import("reader_replay.zig");
-const Dialect = card_rows.Dialect;
 const VertexId = card_rows.VertexId;
 const none = card_rows.none;
 const Span = card_rows.Span;
@@ -194,7 +187,7 @@ const Config = card_rows.Config;
 const Foreign = card_rows.Foreign;
 const Mosra = card_rows.Mosra;
 const AppendModel = card_rows.AppendModel;
-const isGround = netlist_view.isGround;
+const isGroundName = netlist_view.isGroundName;
 const cards = card_table.cards;
 const Entry = reader_frame.Entry;
 const Scope = reader_frame.Scope;
@@ -203,14 +196,15 @@ const ModelRow = reader_frame.ModelRow;
 const LocalModel = reader_frame.LocalModel;
 const Replay = reader_frame.Replay;
 
-/// The netlist reader over dialect syntax `S` (lines.zig): every walk's
+// ponytail: `S` has one case now; flatten `Methods(S)` to concrete code once
+// the frontend's concurrent edits land (a mechanical pass over every stage).
+/// The netlist reader over line syntax `S` (lines.zig): every walk's
 /// state, and its methods, which live in the reader_*.zig stage files.
 pub fn Reader(comptime S: type) type {
     return struct {
         const R = @This();
 
         arena: Allocator,
-        dialect: Dialect,
         orig: []const u8,
         text: []const u8,
         /// The card a walk is reading: a refusal no reader logged names it (#144).
@@ -267,17 +261,12 @@ pub fn Reader(comptime S: type) type {
         wcd_line: ?[]const u8 = null,
         /// `.global` names: one net at every subcircuit level.
         global_nets: std.StringHashMapUnmanaged(void) = .empty,
-        /// Per `lines` row, the device letter `spectre.translate` gave a
-        /// card whose name does not carry it (0: none); empty outside the
-        /// Spectre dialect.
-        kinds: []const u8 = &.{},
         /// `.func` and `.param f(x)=` definitions, by name.
         funcs: std.StringHashMapUnmanaged(Func) = .empty,
         /// The formals of the user functions `subst` is inside, innermost last.
         bindings: std.ArrayList(Binding) = .empty,
         saves: std.ArrayList([]const u8) = .empty,
         opvar_saves: std.ArrayList([]const u8) = .empty,
-        probe_op: bool = false,
         save_all: bool = false,
         save_op: ?core.SaveOp = null,
         stims: std.ArrayList(core.Stim) = .empty,
@@ -300,6 +289,9 @@ pub fn Reader(comptime S: type) type {
         /// Swept global parameters, registered before any device is read.
         live_names: std.StringArrayHashMapUnmanaged(void) = .empty,
         live_nominal: std.ArrayList(f64) = .empty,
+        /// The top-level device cards' `lines` rows, from walk 1, so a
+        /// swept name a card carries resolves to it (`stepTarget`).
+        top_devices: []const u32 = &.{},
         /// `Live.bins`, column by column.
         bin_edges: std.ArrayList(u32) = .empty,
         bin_starts: std.ArrayList(u32) = .empty,
@@ -309,6 +301,10 @@ pub fn Reader(comptime S: type) type {
         /// A device or model value is being read: one that reads a live name
         /// or (under `monte`) a distribution keeps its postfix.
         in_card: bool = false,
+        /// A B, E or G expression is being read: `subst` gives its calls,
+        /// and those of the `.func` bodies it calls, the B parser's
+        /// meaning (`expr.bsourceFn`); a parameter's text keeps numparam's.
+        bsource: bool = false,
         /// A live name may appear outside a card (a live name's own value).
         live_ok: bool = false,
         /// Some card runs Monte Carlo.
@@ -351,10 +347,9 @@ pub fn Reader(comptime S: type) type {
         pub const NetLookup = struct {
             pool: *const InternPool,
             net_of: []const u32,
-            dialect: Dialect,
             /// The net `name` names, 0 for ground, `none` for no net.
             pub fn node(self: NetLookup, name: []const u8) u32 {
-                if (isGround(self.dialect, name)) return 0;
+                if (isGroundName(name)) return 0;
                 const n = self.pool.find(name) orelse return none;
                 return self.net_of[n.index()];
             }
@@ -390,8 +385,8 @@ pub fn Reader(comptime S: type) type {
             }
         };
 
-        pub fn init(arena: Allocator, orig: []const u8, text: []const u8, dialect: Dialect) Allocator.Error!R {
-            var r: R = .{ .arena = arena, .dialect = dialect, .orig = orig, .text = text, .hg = try .init(arena) };
+        pub fn init(arena: Allocator, orig: []const u8, text: []const u8) Allocator.Error!R {
+            var r: R = .{ .arena = arena, .orig = orig, .text = text, .hg = try .init(arena) };
             const zero = try r.pool.intern(arena, "0");
             _ = r.hg.addVertex(arena, .{ .name = zero }) catch return error.OutOfMemory;
             try r.net_of.append(arena, 0);
@@ -408,7 +403,6 @@ pub fn Reader(comptime S: type) type {
         pub const pathOf = reader_walk.Methods(S).pathOf;
         pub const readFunc = reader_walk.Methods(S).readFunc;
         pub const paramText = reader_walk.Methods(S).paramText;
-        pub const checkBare = reader_walk.Methods(S).checkBare;
         pub const readModel = reader_models.Methods(S).readModel;
         pub const unresolved = reader_models.Methods(S).unresolved;
         pub const namesParam = reader_models.Methods(S).namesParam;
@@ -426,10 +420,8 @@ pub fn Reader(comptime S: type) type {
         pub const isStep = reader_directives.Methods(S).isStep;
         pub const isWcd = reader_directives.Methods(S).isWcd;
         pub const readDirective = reader_directives.Methods(S).readDirective;
-        pub const readProbe = reader_directives.Methods(S).readProbe;
         pub const readMosra = reader_directives.Methods(S).readMosra;
         pub const readSample = reader_directives.Methods(S).readSample;
-        pub const readSaveOp = reader_directives.Methods(S).readSaveOp;
         pub const written = reader_directives.Methods(S).written;
         pub const failed = reader_directives.Methods(S).failed;
         pub const liveParam = reader_directives.Methods(S).liveParam;
@@ -462,7 +454,6 @@ pub fn Reader(comptime S: type) type {
         pub const operatorLed = reader_values.Methods(S).operatorLed;
         pub const nameValue = reader_values.Methods(S).nameValue;
         pub const readMeasures = reader_measures.Methods(S).readMeasures;
-        pub const skipBad = reader_measures.Methods(S).skipBad;
         pub const readPower = reader_measures.Methods(S).readPower;
         pub const readStim = reader_measures.Methods(S).readStim;
         pub const sourcePower = reader_measures.Methods(S).sourcePower;
@@ -485,10 +476,9 @@ pub fn Reader(comptime S: type) type {
         pub const connect = reader_nets.Methods(S).connect;
         pub const joined = reader_nets.Methods(S).joined;
         pub const netOf = reader_nets.Methods(S).netOf;
-        pub const mixedPort = reader_nets.Methods(S).mixedPort;
         pub const fixedPins = reader_nets.Methods(S).fixedPins;
-        pub const behaviouralResistor = reader_devices.Methods(S).behaviouralResistor;
-        pub const kindOf = reader_devices.Methods(S).kindOf;
+        pub const lowersToB = reader_rcl.Methods(S).lowersToB;
+        pub const behaviouralPassive = reader_rcl.Methods(S).behaviouralPassive;
         pub const readDevice = reader_devices.Methods(S).readDevice;
         pub const replay = reader_replay.Methods(S).replay;
         pub const cardNodes = reader_replay.Methods(S).cardNodes;
@@ -499,14 +489,13 @@ pub fn Reader(comptime S: type) type {
         pub const behaviouralCard = reader_behavioural.Methods(S).behaviouralCard;
         pub const wrapped = reader_behavioural.Methods(S).wrapped;
         pub const exprRest = reader_behavioural.Methods(S).exprRest;
+        pub const unbraced = reader_behavioural.Methods(S).unbraced;
         pub const word = reader_behavioural.Methods(S).word;
         pub const numberAt = reader_behavioural.Methods(S).numberAt;
         pub const controlText = reader_behavioural.Methods(S).controlText;
-        pub const tableText = reader_behavioural.Methods(S).tableText;
+        pub const tablePoints = reader_behavioural.Methods(S).tablePoints;
         pub const polyText = reader_behavioural.Methods(S).polyText;
-        pub const readDataElement = reader_behavioural.Methods(S).readDataElement;
         pub const dataPath = reader_behavioural.Methods(S).dataPath;
-        pub const portLine = reader_behavioural.Methods(S).portLine;
         pub const isModel = reader_devices.Methods(S).isModel;
         pub const splitTerminals = reader_devices.Methods(S).splitTerminals;
         pub const commit = reader_devices.Methods(S).commit;

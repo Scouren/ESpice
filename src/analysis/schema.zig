@@ -39,9 +39,11 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
         .pxf => |o| 1 + (1 + 2 * @as(usize, o.n_harmonics)) * topology.n,
         .hbxf => |o| 1 + try hbSidebands(allocator, o) * topology.n,
         .hblin => |o| 1 + o.ports.len * o.ports.len + @intFromBool(o.noise and o.ports.len >= 2),
-        .sp => |o| @import("ac/sp.zig").columns(@import("ac/sp.zig").modeCount(o.ports), o.lin),
-        // The parameters `.sens` lists, which isSensParam narrows (#154).
-        .sens => try countParams(allocator, topology, @import("sweep/sens.zig").isSensParam),
+        .sp => |o| @import("ac/sp.zig").columns(@max(o.ports.len, 1), o),
+        // The parameters `.sens` lists, which isSensParam narrows (#154); the
+        // AC form adds the frequency and two columns per AC source.
+        .sens => |o| try countParams(allocator, topology, @import("sweep/sens.zig").isSensParam) +
+            (if (o.ac == null) 0 else 1 + 2 * o.ac_sources.len),
         .dcmatch, .dcsens, .acmatch => blk: {
             const groups = switch (query) {
                 inline .dcmatch, .dcsens, .acmatch => |o| o.variations.starts.len -| 1,

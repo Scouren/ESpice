@@ -1,5 +1,5 @@
 // Junction diode: Shockley law with series resistance, recombination,
-// high injection, breakdown, depletion charge and temperature map.
+// high injection, breakdown, tunnelling, depletion charge and temperature map.
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.
 // Based on: ngspice D element (dio/dioload.c, diotemp.c, diosetup.c,
@@ -28,15 +28,32 @@
 // the metal and poly plate caps. A given JSW with NS is its own sidewall
 // diode, without NS it merges into IS, as dioload.c does.
 //
-// ponytail: no tunnel (JTUN/NTUN/XTITUN/KEG), no TTT1/TTT2 transit-time
-// tempco, no `.options scale`. Add when a deck needs one.
+// Self-heating is the variant diode_t (ports a, c, tj), this file with the
+// SELFHEATING macro defined (build.zig model_variants), which the netlist reader
+// builds where ngspice heats: a third node, the `thermal` flag and a
+// non-zero RTH0 (diodefs.h:31-33). tj carries the rise in kelvin over the
+// instance ambient (dioload.c:331), so the whole temperature map runs at
+// the junction temperature; the dissipated power (dioload.c:796) flows into
+// tj, out through RTH0 and into CTH0 (dioload.c:874). Off the macro the
+// file is the isothermal `diode`, unchanged.
+//
+// ponytail: no TTT1/TTT2 transit-time tempco, no `.options scale`. Add
+// when a deck needs one.
 
 `include "constants.vams"
 `include "disciplines.vams"
 
+`ifdef SELFHEATING
+module diode_t(a, c, tj);
+    inout a, c, tj;
+    electrical a, c, ai;
+    thermal tj;
+    branch (tj) br_th;
+`else
 module diode(a, c);
     inout a, c;
     electrical a, c, ai;
+`endif
     branch (a, ai) rsb;
 
     parameter real is   = 1e-14  from (0:inf);  // A    saturation current
@@ -56,6 +73,11 @@ module diode(a, c);
     parameter real ikr  = 0.0    from [0:inf);  // A    reverse knee (0 = off)
     aliasparam js = is;
     aliasparam mj = m;
+    aliasparam vb = bv;   // dio.c IOPR spellings, bound on this model only
+    aliasparam ik = ikf;
+    aliasparam cj0 = cjo;
+    aliasparam cj = cjo;
+    aliasparam pb = vj;
 
     // ---- geometry: instance values, model defaults (dio.c / diosetup.c) ----
     parameter integer level = 1 from [1:3];      //      3: AREA and PJ from W and L
@@ -87,6 +109,13 @@ module diode(a, c);
     parameter real ctp  = 0.0;                   // 1/K  CJP linear temp coeff (TLEVC=1)
     parameter real tphp = 0.0;                   // V/K  PHP linear temp coeff (TLEVC=1)
 
+    // ---- tunnelling (dio.c:102-106, defaults diosetup.c:178-192) ----------
+    parameter real jtun   = 0.0  from [0:inf);   // A    bottom tunnelling saturation current (x AREA)
+    parameter real jtunsw = 0.0  from [0:inf);   // A    sidewall tunnelling saturation current (x PJ)
+    parameter real ntun   = 30.0 from (0:inf);   //      tunnelling emission coefficient
+    parameter real xtitun = 3.0;                 //      tunnelling saturation current temperature exponent
+    parameter real keg    = 1.0;                 //      EG correction factor for tunnelling
+
     // ---- temperature (diotemp.c / diosetup.c defaults) --------------------
     // tnom is in degC, like the ngspice TNOM/TREF card (diompar.c).
     parameter real tnom = $simparam("tnom");     // degC .model TNOM / TREF
@@ -106,8 +135,26 @@ module diode(a, c);
     parameter real tpb  = 0.0;                   // V/K   VJ linear temp coeff (TLEVC=1)
     parameter real trs  = 0.0;                   // 1/K   RS linear temp coeff
     parameter real trs2 = 0.0;                   // 1/K^2 RS quadratic temp coeff
+    // dio.c IOPR spellings (dio.c:57, 68-72).
+    aliasparam tref = tnom;
+    aliasparam trs1 = trs;
+    aliasparam ctc = cta;
+    aliasparam tvj = tpb;
+`ifdef SELFHEATING
+    // ---- self-heating (dio.c:130-131, defaults diosetup.c:281-285) ------
+    // The reader builds diode_t only for a given, non-zero RTH0.
+    parameter real rth0 = 1.0    from (0:inf);   // K/W  thermal resistance, tj to ambient
+    parameter real cth0 = 1e-5   from [0:inf);   // J/K  thermal capacitance
+`endif
 
-    real vt, vte, vd, vcrit, u, ulim, id, ihi, wb, wlim, qj, f1, f2, f3, vfc;
+    // Operating-point variables (LRM §3.2.1) under dio.c's names (#236):
+    // the junction's voltage, conductance and capacitance (gmin and the
+    // diffusion charge included) and its charge, as dioask.c reports them.
+    (* desc = "Diode voltage", units = "V" *) real vd;
+    (* desc = "Diode conductance", units = "S" *) real gd;
+    (* desc = "Diode capacitance", units = "F" *) real cd;
+    (* desc = "Diode capacitor charge", units = "C" *) real charge;
+    real vt, vte, vcrit, u, ulim, id, ihi, wb, wlim, qj, f1, f2, f3, vfc;
     real vterec, ur, urlim, genfac, irec;
     // bias-independent temperature prep (diotemp.c)
     real tk, tnomk, ratio, dtk, vtnom, egp, nbvx, vtebrk;
@@ -115,13 +162,28 @@ module diode(a, c);
     real pbo, gmaold, gmanew, mt, vj_t, cjo_t, is_t, isr_t, bv_t, rs_t, xbv;
     real ae, pe, issw_t, isep_t, vtsw, usw, ihisw, pbosw, gmaswold, gmaswnew, php_t, cjp_t;
     real ibvx, vfcs, ccox, epsox;
+    real vtt, ftun, itun_t, itunsw_t, ut, utlim, itun;
+`ifdef SELFHEATING
+    real tamb, vte_a, is_a, pwr;
+`endif
 
     analog begin
         // ==== diotemp.c: bias-independent temperature map ===================
         // Device temperature: the instance TEMP, else the circuit's plus
         // DTEMP (DIOtemp).
+`ifdef SELFHEATING
+        // Plus the rise on tj (dioload.c:331). The floor keeps a wild Newton
+        // iterate finite. Dissipation is never negative, so only an external
+        // network on tj can hold a solution's rise below -tamb/2, where
+        // ngspice computes at a temperature this floor does not.
+        if ($param_given(temp)) tamb = temp + 273.15;
+        else tamb = $temperature + dtemp;
+        tk = tamb + Temp(br_th);
+        if (tk < 0.5 * tamb) tk = 0.5 * tamb;
+`else
         if ($param_given(temp)) tk = temp + 273.15;
         else tk = $temperature + dtemp;
+`endif
         tnomk = tnom + 273.15;
         ratio = tk / tnomk;                // diotemp.c Temp/DIOnomTemp
         dtk   = tk - tnomk;                // diotemp.c:48 `dt`
@@ -233,6 +295,18 @@ module diode(a, c);
         else
             isr_t = isr * ae * exp((ratio - 1.0) * egp / vterec + (xti / nr) * ln(ratio));
 
+        // diotemp.c:130-139 (TLEV 0/1) and 165-174 (TLEV 2): JTUN(T) and
+        // JTUNSW(T) share one factor, KEG scaling the gap term and
+        // XTITUN/NTUN the power of T/Tnom, vtt = NTUN*vt at the operating
+        // temperature. JTUN scales with AREA, JTUNSW with PJ.
+        vtt = ntun * vt;
+        if (tlev == 2)
+            ftun = exp(keg * egfet1 / (ntun * vtnom) - keg * egfet / vtt + (xtitun / ntun) * ln(ratio));
+        else
+            ftun = exp((ratio - 1.0) * keg * egp / vtt + (xtitun / ntun) * ln(ratio));
+        itun_t   = jtun * ae * ftun;
+        itunsw_t = jtunsw * pe * ftun;
+
         // diotemp.c: BV(T); TLEV 0 is subtractive, TLEV 1/2 scaling.
         if (tlev == 0) bv_t = bv - tcv * dtk;
         else           bv_t = bv * (1.0 - tcv * dtk);
@@ -259,8 +333,19 @@ module diode(a, c);
         // ==== bias-dependent ================================================
         // pnjlim first, where dioload.c runs it. The tangent continuation
         // below guards evaluations at unlimited voltage.
+`ifdef SELFHEATING
+        // At the ambient, as ngspice limits (dioload.c:108-109) and seeds
+        // (dioload.c:164-168): limiter arguments stay off the solution.
+        vte_a = n * 1.38064852e-23 / 1.6021766208e-19 * tamb;
+        is_a  = is * ae * exp((tamb / tnomk - 1.0) * egp / vte_a + (xti / n) * ln(tamb / tnomk));
+        // ponytail: the TLEV 0/1 IS(T) and no sidewall; vcrit only steers
+        // Newton, never the answer.
+        vcrit = vte_a * ln(vte_a / (1.4142135623730951 * is_a));
+        vd  = $limit(V(ai, c), "pnjlim", vte_a, vcrit);
+`else
         vcrit = vte * ln(vte / (1.4142135623730951 * (is_t + isep_t)));   // diotemp.c
         vd  = $limit(V(ai, c), "pnjlim", vte, vcrit);
+`endif
 
         // Forward/reverse ideal current, tangent-continued past 80*vte.
         // Clamped in ratio space so the finiteness prover sees exp's argument
@@ -308,10 +393,29 @@ module diode(a, c);
             ihisw = -isep_t * exp(wlim) * (1.0 + (wb - wlim));
         end
 
+        // Tunnelling (dioload.c:352-372): the bottom and sidewall currents
+        // each gain -Itun(T)*(exp(-vd/vtt) - 1) when their JTUN/JTUNSW is
+        // given, in every region, breakdown included, ahead of the IKF/IKR
+        // roll-off. A JTUN or JTUNSW left out is 0 and adds nothing.
+        // ponytail: tangent-continued past -vd/vtt = 80, which ngspice does
+        // not do: it calls exp(-vd/vtetun) unclamped. The two part below
+        // vd = -80*NTUN*vt, at 27 degC -20.69 V for NTUN = 10 and -62.08 V
+        // for NTUN = 30 (scaling with T). The current there is already
+        // Itun(T)*e^80, 6e19 A for gf180's np_3p3 at 100 um^2, so only an unlimited
+        // evaluation (a Newton iterate pnjlim does not limit in reverse)
+        // reaches it.
+        itun = 0.0;
+        if ($param_given(jtun) || $param_given(jtunsw)) begin
+            ut    = -vd / vtt;
+            utlim = min(ut, 80.0);
+            itun  = -(itun_t + itunsw_t) * ((exp(utlim) * (1.0 + (ut - utlim))) - 1.0);
+        end
+
         // Knee roll-off (dioload.c): cd / (1 + sqrt(cd/(IKF*AREA))) on the
-        // total forward current, recombination and sidewall included; IKR
-        // likewise below -3*vte. IKF/IKR have no temperature coefficient.
-        ihi = id + ihisw + irec;
+        // total forward current, recombination, sidewall and tunnelling
+        // included; IKR likewise below -3*vte. IKF/IKR have no temperature
+        // coefficient.
+        ihi = id + ihisw + irec + itun;
         if (ikf > 0.0 && ihi > 0.0)
             ihi = ihi / (1.0 + sqrt(ihi / (ikf * ae)));
         if (ikr > 0.0 && vd < -3.0 * vte && ihi < -1.0e-18)
@@ -362,6 +466,9 @@ module diode(a, c);
         // including the gmin shunt, so its small-signal cap is TT*gd.
         if (tt > 0.0) qj = qj + tt * (ihi + gmin * vd);
         I(ai, c) <+ ddt(qj);
+        gd = ddx(ihi + gmin * vd, V(ai));
+        cd = ddx(qj, V(ai));
+        charge = qj;
 
         // Guard on the raw rs: node collapse is a topology decision and must
         // not depend on temperature. rs_t is floored above.
@@ -370,7 +477,33 @@ module diode(a, c);
         // contributes nothing, as in ngspice.
         if (rs > 0.0) begin
             I(rsb) <+ V(rsb) / rs_t;
+`ifdef SELFHEATING
+            // dionoise.c:88-95: the heated conductance at the instance ambient.
+            I(rsb) <+ white_noise(4.0 * 1.38064852e-23 * tamb / rs_t, "rs");
+`else
             I(rsb) <+ white_noise(4.0 * 1.38064852e-23 * tk / rs_t, "rs");
+`endif
         end else V(rsb) <+ 0.0;
+`ifdef SELFHEATING
+
+        // ==== self-heating (dioload_44.c:527-571) ===========================
+        // Heat into tj, Ith = vd*cd + vrs^2*gspr (dioload_44.c:530), ngspice's
+        // cd being the junction current with its gmin shunt (ihi + gmin*vd
+        // here). It leaves through 1/RTH0 and charges CTH0
+        // (dioload_44.c:571, :495), neither scaled by m (dioload.c:874; on
+        // ngspice 44.2 m=2 area=3 gives v(tj) = rth0 * P): the host scales
+        // every row by $mfactor, so the network divides it back out.
+        // diotrunc.c:23 leaves the thermal charge out of the LTE.
+        // ponytail: ngspice's cd also holds the junction capacitor's current
+        // in transient (dioload.c:708), heat vd*dq/dt left out here. Its
+        // integral is the stored energy, at most about tt*I*V (7e-9 J for
+        // 10 ns, 1 A, 0.7 V) against the default CTH0 of 1e-5 J/K: under
+        // 1e-3 K. If a transient golden disagrees, pwr = V(a, c)*V(rsb)/rs_t
+        // (rs > 0) is ngspice's Ith at convergence.
+        pwr = vd * (ihi + gmin * vd);
+        if (rs > 0.0) pwr = pwr + V(rsb) * V(rsb) / rs_t;
+        Pwr(br_th) <+ Temp(br_th) / (rth0 * $mfactor) - pwr;
+        (* vera_lte = 0 *) Pwr(br_th) <+ ddt(cth0 / $mfactor * Temp(br_th));
+`endif
     end
 endmodule

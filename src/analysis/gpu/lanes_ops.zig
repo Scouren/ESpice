@@ -13,6 +13,7 @@ const device_ir = @import("device").abi;
 const devices = @import("devices.zig");
 const lanes = @import("lanes.zig");
 const lanes_round = @import("lanes_round.zig");
+const lk = @import("solver").lane_kernels;
 const SimState = device_ir.SimState;
 const StateCtlOp = device_ir.StateCtlOp;
 const backend = devices.backend;
@@ -32,13 +33,16 @@ pub const Ops = struct {
             .backward_euler => 0,
             .trapezoidal => 1,
             .gear_2 => 2,
-            else => unreachable, // gear-3..6 are not lane-eligible
+            .gear_3 => 3,
+            .gear_4 => 4,
+            .gear_5 => 5,
+            .gear_6 => 6,
         };
     }
 
     /// Queues lane l into the next round with the step `a` that `Sim` `s`
-    /// attempts: its scalars, `SimState` and LTE inputs. Gear-3..6 is
-    /// unreachable.
+    /// attempts: its scalars, `SimState` and LTE inputs, and in a
+    /// gear-3..6 run its `LaneGear` (ag only at order 3 and up).
     pub fn attempt(o: Ops, s: anytype, a: anytype) void {
         const g = o.g;
         const promote = methodCode(s.promoteMethod());
@@ -50,7 +54,7 @@ pub const Ops = struct {
             .ag1 = a.c.ag1,
             .ag2 = a.c.ag2,
             .method = methodCode(a.method),
-            .flags = 1 | (promote << 4),
+            .flags = 1 | (promote << 4) | (if (g.gear.len != 0) lk.gear_run else 0),
             .sq = @splat(0),
             .sqt = @splat(0),
         };
@@ -59,6 +63,7 @@ pub const Ops = struct {
         // results (`tran.gpuLaneRefusal` takes no UIC or OPtran start).
         g.sims[o.l].analog_initial = false;
         g.lte_in[o.l] = .{ .dt = s.dt, .dt1 = s.dt_old[0], .dt2 = s.dt_old[1], .reltol = s.options.tol.reltol, .abstol = s.options.tol.abstol, .chgtol = s.options.tol.chgtol, .trtol = s.options.tol.trtol, .ag0 = a.c.ag0, .ag1 = a.c.ag1, .ag2 = a.c.ag2 };
+        if (g.gear.len != 0) g.gear[o.l] = .{ .ag = if (a.gear_hi) a.ag else @splat(0), .dts = a.dts, .top = s.top_order };
         g.round[o.l] = 1;
     }
     /// Queues the latch revert of a rejected step for `GpuLanes.apply`.
@@ -87,9 +92,14 @@ pub const Ops = struct {
         // probe (the only other order <= 2 call).
         return if (method == a.method) out[0] else out[1];
     }
-    /// Unreachable: gear-3..6 are not lane-eligible.
-    pub fn boundGear(_: Ops, _: anytype, _: anytype, _: anytype, _: anytype) f64 {
-        unreachable;
+    /// The gear bound `probe` computed for `method`: the step's own, or
+    /// the order control's one order down or up (`lte_gear`).
+    pub fn boundGear(o: Ops, _: anytype, a: anytype, method: anytype, _: anytype) f64 {
+        const k = methodCode(method);
+        const own = methodCode(a.method);
+        if (k == own) return o.g.lte_out[o.l][0];
+        assert(k + 1 == own or k == own + 1);
+        return o.g.lte_gear[o.l][@intFromBool(k > own)];
     }
     /// Rotates lane l's history permutations (`queueAccept`).
     pub fn advance(o: Ops, _: anytype, _: anytype) void {

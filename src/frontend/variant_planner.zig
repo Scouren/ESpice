@@ -255,13 +255,17 @@ pub const Planner = struct {
 
     /// `.alter` run `k`. Without variants of its own, a run whose circuit
     /// matches the nominal one becomes a row; otherwise it is a rebuild
-    /// that plans its own variants.
+    /// that plans its own variants. A run with a value over `temper` is a
+    /// rebuild too: each temperature move rewrites such values from its
+    /// own run's expressions (`Deck.temper`), which a row would leave at
+    /// the main run's.
     pub fn addAlter(p: *Planner, text: []const u8, k: usize, own: bool) !void {
         const label = try std.fmt.allocPrint(p.sim, "alter={d}", .{k});
         const alt = try p.scratch.create(Netlist);
-        alt.* = try netlist.parse(p.scratch, text, p.nl.deck.dialect);
+        alt.* = try netlist.parse(p.scratch, text);
         alt.soa_ratings = p.nl.soa_ratings;
-        if (!own and variant_circuit.sameCards(p.nl, alt)) {
+        const tempered = p.nl.temper.count() != 0 or alt.temper.count() != 0;
+        if (!own and !tempered and variant_circuit.sameCards(p.nl, alt)) {
             var arena = std.heap.ArenaAllocator.init(core.gpa);
             defer arena.deinit();
             var c = try variant_circuit.circuitOf(p.lib, arena.allocator(), arena.allocator(), alt);

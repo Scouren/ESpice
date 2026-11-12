@@ -19,7 +19,8 @@
 //!
 //! Cites ngspice NIiter (maths/ni/niiter.c), NIconvTest (maths/ni/niconv.c)
 //! and CKTload's nodeset hold (cktload.c); dev/solvers/gpu-lu.md (the device
-//! factor); #3, #53, #152 (the runaway bound and the branch-row gate).
+//! factor); #3, #53, #152 (the runaway bound and the branch-row gate);
+//! docs/perf_research/04-levers-cpu.md C3 (`confirm.zig`).
 //!
 //! Contents:
 //! - `pub const SolverPin = enum`
@@ -54,6 +55,7 @@ const assert = std.debug.assert;
 const direct = @import("direct.zig");
 const Gmres = @import("gmres.zig").Gmres;
 const num = @import("core").numerics;
+const Levers = @import("core").perf.Levers;
 const BbdInfo = num.BbdInfo;
 const Execution = num.Execution;
 const lanes = @import("lane/lanes.zig");
@@ -62,6 +64,7 @@ const LaneSolver = @import("lane/solver.zig").LaneSolver;
 const newton_sys = @import("newton_sys.zig");
 const newton_workspace = @import("newton_workspace.zig");
 const jfnk_mod = @import("jfnk.zig");
+const confirm = @import("confirm.zig");
 
 /// `ESPICE_SOLVER` overrides `run`'s choice: direct, jfnk (LU-preconditioned
 /// GMRES) or jfnk-nolu (Jacobi-preconditioned, no factorization at all).
@@ -86,6 +89,9 @@ pub const Knobs = struct {
     opdbg: bool = false,
     /// `ZP_NEWTON_DEBUG`: trace every Newton iterate.
     newton_debug: bool = false,
+    /// `ESPICE_PERF`: the levers under evaluation; all off is the shipped
+    /// path.
+    perf: Levers = .{},
 };
 
 /// Per-circuit Newton scratch (`newton_workspace.zig`).
@@ -127,6 +133,13 @@ pub const Options = struct {
     /// `.nodeset` nodes during MODEINITJCT/INITFIX (cktload.c). Direct Newton
     /// only.
     force: []const Force = &.{},
+    /// `.options dv`, volts: HSPICE's maximum iteration-to-iteration change
+    /// of every node voltage, DC and transient [Star-Hspice 1998, ch. 6,
+    /// DV]. Each potential's update (a row outside `current_row`) is
+    /// clamped to [-dv, dv] before it is added, flows untouched, and an
+    /// iteration that clamped is limited, so never accepted (`clampUpdate`).
+    /// inf, the option absent, is no bound: today's loop.
+    dv: f64 = inf,
 };
 
 /// Conductance, in siemens, of a `Force` hold.
@@ -159,7 +172,7 @@ pub const test_access = if (@import("builtin").is_test) .{ .updateAndNorm = stru
     fn f(x: []f64, dx: []const f64, x_old: []f64, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64) f64 {
         return updateAndNorm(1, x, dx, x_old, current_row, reltol, abstol, vntol, true);
     }
-}.f } else {};
+}.f, .clampUpdate = clampUpdate, .finalizeStep = finalizeStep } else {};
 
 /// Which gate refused an iterate, for the `ZP_OPDBG` trace. ngspice's
 /// NIconvTest (maths/ni/niconv.c) has only the delta test, the first-iterate
@@ -192,6 +205,7 @@ pub fn optionsFromTolerances(tol: Tolerances, max_iter_override: ?u16) Options {
         // Diagonal gmin is opt-in (the op gmin-stepping rung). ngspice's
         // NIiter loads none; junction gmin lives in the device models.
         .gmin = 0,
+        .dv = if (comptime @hasField(Tolerances, "dv")) tol.dv orelse inf else inf,
     };
 }
 
@@ -273,6 +287,9 @@ pub fn newtonLanes(
     // The lanes' outcomes; void at W = 1, which returns from the loop.
     var out: if (W == 1) void else LaneResult(W) = if (W == 1) {} else .{ .converged = L.none, .singular = L.none, .iterations = @splat(opts.max_iter) };
     var limit: L.V = L.splat(x_plausible);
+    // `.options dv`, tested once per iteration on this.
+    assert(opts.dv > 0);
+    const bounded = opts.dv < inf;
     if (comptime @hasDecl(S, "beginSolve")) sys.beginSolve();
     // Before the loop: an allocation failure here returns, where one inside
     // `finalizeStep` could not.
@@ -302,10 +319,13 @@ pub fn newtonLanes(
         const load_ok: L.Mask = if (comptime @hasDecl(S, "loadCheck")) sys.loadCheck(x, v, sys.rhs[0..sys.n], opts.reltol, opts.abstol) else L.every;
         prof.lap(.load);
         if (W == 1) {
+            // Lever c3 may settle dx with no factor (`confirm.zig`); with it
+            // off `settled` is false and this is today's path.
+            const settled = confirm.settle(ws, v, iter, init_fix);
             // The device LU (dev/solvers/gpu-lu.md) is bitwise this factor and
             // solve; false leaves both to the host.
-            const on_device = if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false;
-            if (!on_device) {
+            const on_device = !settled and (if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false);
+            if (!settled and !on_device) {
                 slv.factor(v, newton_sys.executionOf(sys)) catch |e| {
                     if (ws.knobs.opdbg) {
                         var nan_cnt: usize = 0;
@@ -328,10 +348,11 @@ pub fn newtonLanes(
             if (!L.any(active)) break;
         }
         prof.lap(.solve);
+        const clamped: L.Mask = if (bounded) clampUpdate(W, dx[0..sys.n], sys.current_row[0..sys.n], opts.dv, active) else L.none;
         // The INITFIX pass does not stage: its converged iterate is not the
         // answer, and staging there restarted a Newton-history limiter from a
         // stale value, so the extra pass solved F(lim(x)) = 0 (#53).
-        const st = finalizeStep(W, sys, hook, x, dx, x_old, sys.rhs, v, iter, t, opts, limit, load_ok, L.not(init_fix), active);
+        const st = finalizeStep(W, sys, hook, x, dx, x_old, sys.rhs, v, iter, t, opts, limit, load_ok, L.not(init_fix), active, clamped);
         prof.lap(.update);
         if (W == 1) if (ws.knobs.opdbg) {
             var fi: usize = 0;
@@ -344,6 +365,11 @@ pub fn newtonLanes(
             const name_di = newton_sys.sysNodeName(sys, @intCast(di));
             std.debug.print("  newton it={d} |F|={e:.3}@{d}({s}) dx={e:.3}@{d}({s}) x={e:.3} scaled={e:.3} conv={} why={s}\n", .{ iter, norm_f, fi, name_fi, dx[di], di, name_di, x[di], st.scaled, L.any(st.converged), @tagName(st.why) });
         };
+        // Lever c3 stage 2 (`confirm.linearAccept`): a linear circuit's
+        // solve ends at x_1 as the confirming iteration would end it, and
+        // reports that iteration's count.
+        if (W == 1) if (ws.knobs.perf.c3 and iter == 0 and !ws.knobs.perf.n3 and st.why == .first_iter and plausible(x[0..sys.n], limit) and confirm.linearAccept(ws, sys, x[0..sys.n], init_fix, opts.max_iter))
+            return .{ .converged = true, .iterations = 2 };
         // INITFIX lanes that passed switch to INITFLOAT; the rest are done.
         // The loop exit (class B): at W = 1 the INITFIX pass or the
         // return; above, each lane that passed leaves INITFIX or freezes.
@@ -432,7 +458,8 @@ pub fn run(
     defer if (comptime @hasDecl(S, "clearLimits")) sys.clearLimits();
 
     const pin = ws.knobs.pin;
-    if ((pin == .jfnk or pin == .jfnk_nolu) and sys.n > 0) {
+    // JFNK takes its own damped step and cannot honour `dv`: direct runs it.
+    if ((pin == .jfnk or pin == .jfnk_nolu) and sys.n > 0 and !(opts.dv < inf)) {
         if (jfnk_mod.jfnk(sys, ws, x, t, opts, hook)) |r| {
             if (r.converged) return r;
         } else |err| if (err == error.QueryCancelled) return err;
@@ -499,6 +526,28 @@ pub fn updateAndNorm(comptime W: usize, x: []Lanes(W).V, dx: []const Lanes(W).V,
 /// score; `why` names the first gate that refused, read by the W = 1 trace.
 fn Step(comptime W: usize) type {
     return struct { converged: Lanes(W).Mask, scaled: Lanes(W).V, why: Reject = .converged };
+}
+
+/// `.options dv`: clamps each potential's update in `dx` (a row outside
+/// `current_row`) to [-dv, dv], flows untouched, and returns the `active`
+/// lanes in which any was clamped. A NaN update compares false and passes
+/// as it is, for the gates to refuse; an infinite one is clamped. Asserts
+/// a positive `dv` and a `current_row` covering `dx`.
+fn clampUpdate(comptime W: usize, dx: []Lanes(W).V, current_row: []const bool, dv: f64, active: Lanes(W).Mask) Lanes(W).Mask {
+    const L = Lanes(W);
+    assert(dv > 0);
+    assert(current_row.len >= dx.len);
+    const hi = L.splat(dv);
+    const lo = L.splat(-dv);
+    var clamped: L.Mask = L.none;
+    for (dx, current_row[0..dx.len]) |*d, cur| {
+        if (cur) continue;
+        const over = L.cmp(.gt, d.*, hi);
+        const under = L.cmp(.lt, d.*, lo);
+        d.* = L.select(over, hi, L.select(under, lo, d.*));
+        clamped = L.either(clamped, L.either(over, under));
+    }
+    return L.both(clamped, active);
 }
 
 /// `num.normInf` per lane: the max of |x_i|'s bit patterns, NaN winning.
@@ -604,6 +653,7 @@ fn finalizeStep(
     load_ok: Lanes(W).Mask,
     stage: Lanes(W).Mask,
     active: Lanes(W).Mask,
+    clamped: Lanes(W).Mask,
 ) Step(W) {
     const L = Lanes(W);
     const S = newton_sys.Deref(@TypeOf(sys));
@@ -619,7 +669,9 @@ fn finalizeStep(
         if ((iter == 0 or scaled >= 1.0) and iter + 1 < opts.max_iter) sys.evalFollows(x, t, false);
     };
 
-    const limited: L.Mask = if (comptime @hasDecl(S, "applyLimits")) sys.applyLimits(x, x_old) else L.none;
+    const device_limited: L.Mask = if (comptime @hasDecl(S, "applyLimits")) sys.applyLimits(x, x_old) else L.none;
+    // A `dv` clamp counts as a device limiter's veto (`clampUpdate`).
+    const limited = L.either(device_limited, clamped);
 
     var ok = L.both(active, L.not(limited));
     if (!L.any(ok)) return .{ .converged = L.none, .scaled = scaled, .why = .limited };
@@ -656,6 +708,12 @@ fn finalizeStep(
     assert(iter > 0);
     assert(!L.any(L.both(ok, L.cmp(.gte, scaled, L.splat(1.0)))));
     return .{ .converged = ok, .scaled = scaled };
+}
+
+test {
+    _ = confirm;
+    _ = @import("dv_tests.zig");
+    _ = @import("lane_extras_tests.zig");
 }
 
 test "plausible and residualMisses match a scalar oracle at every length, NaN and inf included" {

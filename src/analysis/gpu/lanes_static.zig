@@ -8,7 +8,10 @@
 //! Contents:
 //! - `pub fn initStatic(gpa: std.mem.Allocator, ckts: []const *Circuit, xs: []const []const f64) !*GpuLanes`
 //! - `pub fn reload(self: *GpuLanes, xs: []const []const f64, limits_live: bool) !void`
+//! - `pub fn refreshModels(self: *GpuLanes) !void`
 //! - `pub fn solveStatic(self: *GpuLanes, xs: []const []f64, opts: converger.Options, out: []LaneNewton) !void`
+//! - `pub fn solveStaticEach(self: *GpuLanes, xs: []const []f64, opts: converger.Options, each: lanes_newton.Each, out: []LaneNewton) !void`
+//! - `pub fn putX(self: *GpuLanes, xs: []const []const f64) !void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -108,6 +111,33 @@ pub fn reload(self: *GpuLanes, xs: []const []const f64, limits_live: bool) !void
     }
 }
 
+/// Every lane's Model rows from its host batch, as `reload` uploads them,
+/// and nothing else: the ladder's `Circuit.setHomotopy` writes
+/// `gmin__` and `source_scale__` there, while the device's Instance and
+/// State rows stay live. Invalidates the captured graphs when the Model
+/// table grew.
+pub fn refreshModels(self: *GpuLanes) !void {
+    if (comptime !available) return error.BackendUnavailable;
+    const gpa = self.gpa;
+    const ps = try gpa.alloc(device_ir.GpuPayload, self.n_lanes);
+    defer gpa.free(ps);
+    try self.stream.synchronize();
+    for (self.batches, 0..) |*b, bi| {
+        if (b.count == 0) continue;
+        for (ps, self.ckts) |*p, c| p.* = c.batches[bi].hooks.gpu_payload.?(c.batches[bi].ctx);
+        const pk = try lanes_batch.pack(gpa, ps);
+        defer pk.deinit(gpa);
+        if (pk.models.len > b.d_models.bytes) {
+            const m = try lanes_batch.upload(&self.k.refactor, pk.models);
+            b.d_models.free();
+            b.d_models = m;
+            lanes_newton.clearGraphs(self);
+            self.graph_opts = null;
+        } else if (pk.models.len > 0) try b.d_models.upload(pk.models.ptr, pk.models.len);
+        try b.d_model_of.upload(pk.model_of.ptr, pk.model_of.len * 4);
+    }
+}
+
 /// Newton for the lanes of `round` (every lane after `initStatic` and
 /// `reload`), each from its x in `d_x` at its circuit's `SimState`, as
 /// `converger.newton` solves an operating point or a `.dc` point: no
@@ -119,6 +149,13 @@ pub fn reload(self: *GpuLanes, xs: []const []const f64, limits_live: bool) !void
 /// Asserts one row of `xs` and `out` per lane and a static batch.
 pub fn solveStatic(self: *GpuLanes, xs: []const []f64, opts: converger.Options, out: []LaneNewton) !void {
     if (comptime !available) return error.BackendUnavailable;
+    return solveStaticEach(self, xs, opts, .{}, out);
+}
+
+/// `solveStatic` with the ladder's per-lane INITFIX and homotopy
+/// (`lanes_newton.Each`).
+pub fn solveStaticEach(self: *GpuLanes, xs: []const []f64, opts: converger.Options, each: lanes_newton.Each, out: []LaneNewton) !void {
+    if (comptime !available) return error.BackendUnavailable;
     const N: usize = self.n_lanes;
     const n: usize = self.n;
     assert(xs.len == N);
@@ -129,7 +166,7 @@ pub fn solveStatic(self: *GpuLanes, xs: []const []f64, opts: converger.Options, 
     for (self.sc) |*s| s.flags = 1;
     try self.put(self.buf(.sc), self.sc);
     self.prof.rounds += 1;
-    try lanes_newton.newton(self, opts, out);
+    try lanes_newton.newtonEach(self, opts, each, out);
     const query = 1 + @as(u8, @backingInt(StateCtlOp.query));
     for (self.ops, self.round, out) |*o, on, r| o.* = if (on != 0 and r.result.converged and !r.singular) query else 0;
     try self.put(self.buf(.ops), self.ops);
@@ -149,10 +186,11 @@ pub fn solveStatic(self: *GpuLanes, xs: []const []f64, opts: converger.Options, 
     };
 }
 
-// ---- private ----
-
-/// Each lane's start `xs[l]` into `d_x`.
-fn putX(self: *GpuLanes, xs: []const []const f64) !void {
+/// Each lane's x `xs[l]` into `d_x`, as the next `solveStatic` starts
+/// from it: the host's restore of a lane whose `.nodeset` step failed
+/// (`op.forceNodeset`). Asserts one row of `xs` per lane.
+pub fn putX(self: *GpuLanes, xs: []const []const f64) !void {
+    if (comptime !available) return error.BackendUnavailable;
     const N: usize = self.n_lanes;
     const n: usize = self.n;
     assert(xs.len == N);

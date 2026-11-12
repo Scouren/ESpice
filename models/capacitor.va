@@ -1,6 +1,20 @@
-// Capacitor: linear, i(p,n) = c * d/dt V(p,n).
+// Capacitor: linear, i(p,n) = d/dt (C(T) * V(p,n)).
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.
+// Based on: ngspice capacitor (cap/captemp.c).
+//   ngspice: Copyright Regents of the University of California and others,
+//   modified BSD license.
+//
+// Temperature (captemp.c:39-52, 77-94):
+//   dt   = (temp + dtemp) - tnom
+//   C(T) = c * (1 + tc1*dt + tc2*dt^2)
+// Instance `temp` replaces the circuit temperature, and `dtemp` is then
+// ignored; otherwise `dtemp` offsets the circuit's. `tnom` is the host's
+// `.options tnom` unless a card gives it.
+//
+// The value (the card's, or its model's CAP or CJ/CJSW geometry) and the
+// `scale`/`m` factors are resolved by the host (frontend builder addPassive)
+// before the value reaches `c`.
 
 `include "constants.vams"
 `include "disciplines.vams"
@@ -8,7 +22,24 @@
 module capacitor(p, n);
     inout p, n;
     electrical p, n;
-    parameter real c = 1e-12 from [0:inf);  // F  capacitance
+    // `c` must stay the first parameter, the device's principal one for
+    // `.sens`/`.mc` (analysis/eval.zig appendParams).
+    parameter real c     = 1e-12 from [0:inf);   // F         capacitance
+    parameter real tnom  = $simparam("tnom");    // degC      nominal temperature
+    parameter real temp  = 27.0;                 // degC      absolute override
+    parameter real dtemp = 0.0;                  // degC      offset, unless temp
+    parameter real tc1   = 0.0;                  // 1/degC    linear tempco
+    parameter real tc2   = 0.0;                  // 1/degC^2  quadratic tempco
 
-    analog I(p, n) <+ c * ddt(V(p, n));
+    // ngspice's `capacitance` is this times m (captemp.c:91-94, capask.c:35-37).
+    (* desc = "Capacitance at the device temperature", units = "F" *) real capacitance;
+    real tdev, dt;
+
+    analog begin
+        tdev = $temperature - 273.15 + dtemp;
+        if ($param_given(temp)) tdev = temp;
+        dt = tdev - tnom;
+        capacitance = c * (1.0 + dt * (tc1 + tc2 * dt));
+        I(p, n) <+ ddt(capacitance * V(p, n));
+    end
 endmodule

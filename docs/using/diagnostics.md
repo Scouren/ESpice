@@ -14,14 +14,19 @@ Error: bad_args.sp: InvalidAnalysisArguments
 
 | Error | Cause | Fix |
 |---|---|---|
-| `FileNotFound` | the deck, an `.include`, a `.lib` file or a data file does not exist | paths resolve against the directory of the file that names them |
+| `FileNotFound` | the deck, an `.include`, a `.lib` file or a data file does not exist | a relative path is looked for in the working directory, then beside the file that names it, then beside the top deck |
 | `ParseError` | a card ESPice cannot read: a missing node or value, an unbalanced parenthesis, a keyword where a node belongs, a block close (`.ends`, `.endif`, `.enddata`, `.end_variation`) with no block open; the card is printed | check the card's syntax in the [reference](reference.md) |
 | `UnsupportedCard` | a dot card or element form ESPice does not simulate, or an analysis card inside a `.subckt`; the line is printed | see [what is not supported](dialects.md#what-is-not-supported-or-differs) |
-| `UnresolvedParameter` | an `R`, `C` or `L` value names a parameter no `.param` defines | define it, or check its spelling and scope |
+| `UnresolvedParameter` | a device value, a source value or an `E`, `F`, `G` or `H` gain does not evaluate to a number: it names a parameter no `.param` defines, a source value reads the circuit, or a `V`, `I` or linear `E` or `G` value reads `temper` (ngspice stops on each) | define it, or check its spelling and scope; read the circuit or `temper` in a `B` source |
 | `OsdiUnsupported` | `pre_osdi` or `.osdi_include` | load the Verilog-A source with `.hdl`; see [Verilog-A](devices.md#osdi-is-not-loaded) |
 | `UnsupportedDevice` | a `.model` LEVEL with no built-in model; a warning names it | see the [LEVEL tables](devices.md#model-type-and-level) |
+| `UnsupportedSelfHeating` | a card ngspice would self-heat on a model ESPice runs isothermal: a VDMOS with a thermal node, or with `thermal` and `rthjc`; a B3SOI-FD or -DD with `shmod=1` and a non-zero `rth0`. A diode self-heats ([diode self-heating](devices.md#diode-self-heating)) | drop the thermal node, the flag or `rth0` to run it isothermal |
 | `LibrarySectionNotFound`, `InvalidLibrarySection` | `.lib file section` names a section the file does not have | check the section names inside the library |
 | `IncludeDepthExceeded` | includes nested more than 32 deep, usually a file including itself | |
+| `SpiceRackNotFound` | a deck in another dialect than ngspice, and no `spice2rack` to translate it: not at `--spicerack`, `$ESPICE_SPICERACK` or on `PATH` | install SpiceRack, or name it with `--spicerack=PATH`; `--tokenizer=ngspice` reads the deck as written. See [Dialects](dialects.md#other-dialects-spicerack) |
+| `SpiceRackFailed` | `spice2rack` refused the deck (its reason is the stderr line before), exited with an error, or wrote past 64 KiB of stdout or 1 MiB of stderr | fix what SpiceRack names, or report the construct to SpiceRack |
+| `SpiceRackNoEntry` | `spice2rack` succeeded but printed no single path of a translated deck that exists | a SpiceRack without `--to espice --kit`: update it |
+| `SpiceRackNeedsFile` | a deck in another dialect came through a pipe or FIFO (`/dev/stdin`, `<(...)`): spice2rack opens the deck by path, with no stdin, and would read nothing | save it to a file first |
 
 ```text
 error: netlist: cannot read the card: .subckt
@@ -39,10 +44,11 @@ Error: bad_level.sp: UnsupportedDevice
 ```
 
 A common `ParseError`: in an E, F, G or H card the word right after the
-output nodes is first checked against the behavioural keywords (`poly`,
-`value`, `table`, `laplace`, `pole`, `delay`, `vcr`, `vccap`, `vol`,
-`cur`, ...). A control node named `pole` turns the card into a POLE source
-and the rest of the line no longer parses. Rename the node.
+output nodes names a behavioural form when one is a keyword (`poly`,
+`table`, `laplace`, `pole`, `delay`, `vcr`, `vol`, ...) and the card is no
+linear one; on a linear card (`E1 o 0 pole 0 2`) it is a node, as in
+ngspice. `value` and `table` are forms wherever they stand: a control node
+named `table` makes the rest of the line no longer parse. Rename the node.
 
 ## Building the circuit
 
@@ -53,7 +59,7 @@ and the rest of the line no longer parses. Rename the node.
 | `NonuniqueOperatingPoint` | voltage sources alone form a loop that agrees with KVL, such as two equal sources in parallel: no equation fixes the current around it |
 | `CurrentSourceCutset` | current sources drive a group of nodes with no DC path to ground and their currents do not cancel |
 | `InvalidParameterValue` | a value out of its allowed range, such as a URC model's `K` |
-| `UnknownParameter`, `WrongNodeCount` | an instance card sets a parameter its device (built-in or Verilog-A) does not declare, such as `ww=10u` for `w=10u`, or a Verilog-A instance has more nodes than its module has ports |
+| `UnknownParameter`, `WrongNodeCount` | an instance card sets a parameter its device (built-in or Verilog-A) does not declare, such as `ww=10u` for `w=10u`; an `S` or `W` card has a word other than `ON` or `OFF` after its model; an `O` card sets a key other than `v1`, `v2`, `i1`, `i2` or `ic`, such as `len=` (the line's length is its model's `len=`); or a Verilog-A instance has more nodes than its module has ports |
 
 ```text
 error: topology: a node has no DC path to ground (capacitor-only island) — the operating point is not unique
@@ -73,8 +79,8 @@ Error: bad_short.sp: VoltageSourceLoop
 | `UnsupportedFrequencySweep` | a sweep type other than `dec`, `oct`, `lin` (or `poi`) |
 | `AnalysisNodeNotFound` | the card's output node does not exist, or is ground |
 | `AnalysisSourceNotFound` | the card names a source (or probe) the deck does not have |
-| `MissingAnalysisCard` | an HSPICE form that borrows another card's settings, and that card is missing: `.noise v(out) src` needs an `.ac`, `.fft` a `.tran`, `.snac` an `.sn` |
-| `UnsupportedAnalysisOutput` | an output form the analysis cannot give, such as `i(...)` in `.pz v(out) src` |
+| `MissingAnalysisCard` | a card that borrows another card's settings, and that card is missing: `.acphasenoise` needs an `.ac`, `.fft` a `.tran`, `.snac` an `.sn` |
+| `UnsupportedAnalysisOutput` | an output form the analysis cannot give, such as `i(...)` in `.fft` |
 
 ```text
 error: analysis: .tf v(b) V9: AnalysisSourceNotFound
@@ -91,6 +97,7 @@ Error: bad_source.sp: AnalysisSourceNotFound
 | `HbDidNotConverge`, `QpssDidNotConverge`, `PzDidNotConverge`, `EnvelopeDidNotConverge`, `PacDidNotConverge` | the named analysis did not converge |
 | `MatexDidNotConverge` | a `.matex` step needed a Krylov space larger than its limit, or came out non-finite (stiffness beyond the exponential integrator); run `.tran` instead |
 | `OscillatorDidNotStart` | an autonomous `.pss` or `.hbosc` found no oscillation |
+| `NoPeriodicSteadyState` | an autonomous `.pss` or `.hbosc` started oscillating but its shooting found no periodic orbit. The line before it gives the residual and the swing's factor per period over the start-up: below 1, the oscillation decays to its operating point and has no steady state to publish |
 
 For convergence trouble:
 
@@ -142,22 +149,19 @@ See [Verilog-A](devices.md#your-own-verilog-a) for the requirements.
 
 **It works in ngspice.** Check, in this order:
 
-1. Is it written for HSPICE? Run it with `--tokenizer=hspice`. Quoted
-   expressions, `.alter`, `.data`, `P` ports and `$` comments after a blank
-   are HSPICE habits.
-2. Does it load OSDI, or rely on a `.control` script? ESPice runs the
+1. Does it load OSDI, or rely on a `.control` script? ESPice runs the
    analysis cards only; replace the OSDI line with `.hdl` and move the
    script's analyses into the deck as cards.
-3. Does it use a model LEVEL ESPice does not have? The warning names it.
-4. Look up the card in [what is not supported, or differs](dialects.md#what-is-not-supported-or-differs).
+2. Does it use a model LEVEL ESPice does not have? The warning names it.
+3. Look up the card in [what is not supported, or differs](dialects.md#what-is-not-supported-or-differs).
 
 **The numbers differ from ngspice.** Small differences in the last digits
 are normal for any two simulators: time steps, iteration counts and
 rounding differ. Large ones are worth a look. The
 [dialects page](dialects.md#what-is-not-supported-or-differs) lists every
-place ESPice deliberately does something else. Two to check first: the
-HSPICE dialect runs the circuit at 25 °C by default, not 27 °C, and ESPice
-uses `.ic` only with `uic`.
+place ESPice deliberately does something else. Two to check first: an
+HSPICE deck runs at 25 °C by default, not 27 °C, which SpiceRack's
+translation must carry, and ESPice uses `.ic` only with `uic`.
 
 **A model name is misspelled.** Check that every element names a model
 that exists: in testing, a `D` card naming an undefined model ran with

@@ -21,6 +21,9 @@
     conformance.url = "github:OpenFAT/VAMS-Conformance-Suite";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
+    # TODO(spicerack-kit): the spice2rack input lands with the first SpiceRack
+    # rev that ships `--to espice --kit` (P1-062), pinned by rev in flake.lock;
+    # until then ESPICE_SPICERACK or --spicerack points at a spice2rack binary.
   };
 
   outputs =

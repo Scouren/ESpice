@@ -1,18 +1,16 @@
-//! Bytes to logical lines to fields, per dialect, plus SPICE number
-//! literals. In: a deck's bytes and its dialect. Out: the dialect's
-//! comptime syntax (`Syntax`): its line iterator, field splitter, number
-//! reader and expression flags. Each dialect is a file (lines_*.zig) over a
-//! shared physical-line layer (physical_lines.zig).
-//! Cites: tests/frontend/grammar/{ngspice,hspice,spectre}_lines.peg;
-//! dev/research/{ngspice,hspice,spectre}-syntax.md; ngspice inpeval.c.
+//! Bytes to logical lines to fields, plus SPICE number literals. In: a
+//! deck's bytes. Out: ngspice's comptime syntax: its line iterator, field
+//! splitter, number reader and expression flags (lines_ngspice.zig), over
+//! the physical-line layer (physical_lines.zig). Other dialects reach the
+//! library translated by SpiceRack (src/spicerack.zig).
+//! Cites: tests/frontend/grammar/ngspice_lines.peg;
+//! dev/research/ngspice-syntax.md; ngspice inpeval.c.
 //!
 //! Contents:
-//! - `pub const Dialect = enum { ngspice, hspice, spectre }`
-//! - `pub const ngspice, hspice, spectre` (lines_ngspice.zig, lines_hspice.zig, lines_spectre.zig)
+//! - `pub const ngspice` (lines_ngspice.zig)
 //! - `pub const Fields` (fields.zig)
 //! - `pub const plainNumber` (spice_number.zig)
 //! - `pub const normalize` (physical_lines.zig)
-//! - `pub fn Syntax(comptime d: Dialect) type`
 
 const std = @import("std");
 const fields = @import("fields.zig");
@@ -21,34 +19,12 @@ const physical_lines = @import("physical_lines.zig");
 
 /// ngspice: title line, case folded, `*` comments, `$`/`;` tails, `+` continuation.
 pub const ngspice = @import("lines_ngspice.zig");
-/// HSPICE: like ngspice, but `"` also quotes, `$` starts a comment only after
-/// a separator or a number, and a trailing `\` or `\\` continues the line
-/// (tests/frontend/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
-/// dev/research/hspice-syntax.md).
-pub const hspice = @import("lines_hspice.zig");
-/// Spectre: the title line, case kept, `*` comment lines, `//` comments, `\`
-/// or `+` continuation, and HSPICE's rules in a `simulator lang=spice`
-/// region (tests/frontend/grammar/spectre_lines.peg is the spec; § cite
-/// dev/research/spectre-syntax.md).
-pub const spectre = @import("lines_spectre.zig");
 /// A field splitter over one line (fields.zig).
 pub const Fields = fields.Fields;
 /// A plain decimal or scientific number (spice_number.zig).
 pub const plainNumber = spice_number.plainNumber;
 /// Lowercases a deck and counts its newlines (physical_lines.zig).
 pub const normalize = physical_lines.normalize;
-
-/// Input syntax.
-pub const Dialect = enum { ngspice, hspice, spectre };
-
-/// The comptime syntax a dialect selects.
-pub fn Syntax(comptime d: Dialect) type {
-    return switch (d) {
-        .ngspice => ngspice,
-        .hspice => hspice,
-        .spectre => spectre,
-    };
-}
 
 test "number literals read as ngspice's INPevaluate" {
     const n = ngspice.parseNum;
@@ -64,10 +40,7 @@ test "number literals read as ngspice's INPevaluate" {
     try std.testing.expectEqual(5, n("5v").?); // an unknown suffix scales by 1
     try std.testing.expectEqual(2e-18, n("2a").?); // atto (#121)
     try std.testing.expectEqual(1000, n("1d3").?); // `d` exponent (#121)
-    try std.testing.expectEqual(2.5e-3, hspice.parseNum("2.5D-3").?);
-    try std.testing.expectEqual(1, spectre.parseNum("1d3").?); // not a Spectre exponent
     try std.testing.expectEqual(1, n("1x").?);
-    try std.testing.expectEqual(1e6, hspice.parseNum("1x").?);
     try std.testing.expectApproxEqRel(25.4e-6, n("1mil").?, 1e-15);
     try std.testing.expectEqual(1.0000000000000001e23, n("1e23").?); // glibc's pow(10, 23)
     try std.testing.expect(1.0000000000000001e23 != 1e23);
@@ -80,12 +53,6 @@ test "number literals read as ngspice's INPevaluate" {
     try std.testing.expectEqual(0, n("0e400").?);
     try std.testing.expect(std.math.isInf(n("1e400").?));
     for ([_][]const u8{ "", "-", ".", "abc", "e5", "1e+" }) |bad| try std.testing.expectEqual(null, n(bad));
-    // Spectre suffixes are case-sensitive and read through parseFloat.
-    try std.testing.expectEqual(1e6, spectre.parseNum("1M").?);
-    try std.testing.expectEqual(1e-3, spectre.parseNum("1m").?);
-    try std.testing.expectEqual(1e-3, spectre.parseNum("1meg").?);
-    try std.testing.expectEqual(0.5, spectre.parseNum("50%").?);
-    try std.testing.expectEqual(1e5, spectre.parseNum("1E5").?);
 }
 
 test {

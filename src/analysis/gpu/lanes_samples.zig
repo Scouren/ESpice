@@ -6,6 +6,7 @@
 //!
 //! Contents:
 //! - `pub const Samples = struct (`init`, `deinit`, `evaluate`)`
+//! - `pub fn refusal(c: *const Circuit) ?[]const u8`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +21,7 @@ const Circuit = root.Circuit;
 const SimState = device_ir.SimState;
 const backend = devices.backend;
 const Error = lanes.Error;
+const Raw = lanes_batch.Raw;
 const Buffer = lanes_batch.Buffer;
 const Stream = lanes_batch.Stream;
 const LaneBatch = lanes_batch.LaneBatch;
@@ -49,6 +51,9 @@ pub const Samples = struct {
     d_sims: Buffer,
     d_active: Buffer,
     d_limw: Buffer,
+    /// Per batch, its own `SimState` per lane when a lane's host batch
+    /// holds its `analog initial` results (`laneSims`); null: `d_sims`.
+    bsims: []?Buffer,
 
     const buffers = .{ "d_x", "d_f", "d_q", "d_g", "d_c", "d_sims", "d_active", "d_limw" };
 
@@ -61,7 +66,9 @@ pub const Samples = struct {
     /// State is unused, its state hooks null. Fails with
     /// `error.InvalidSamples` on no lanes or a nonfinite time or step,
     /// `error.IncompatibleSamples` across patterns, `Error.NoLaneImage`, or
-    /// the driver's error. Free with `deinit`.
+    /// the driver's error. A batch whose host copy holds its `analog
+    /// initial` results evaluates with `analog_initial` false, as the host
+    /// does (`laneSims`). Free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, times: []const f64, dt: f64) !*Samples {
         if (comptime backend == null) return Error.NoLaneImage;
         if (ckts.len == 0 or times.len == 0 or !std.math.isFinite(dt) or dt <= 0) return error.InvalidSamples;
@@ -89,10 +96,22 @@ pub const Samples = struct {
             }
         }
         if (c0.batches.len == 0) return Error.NoLaneImage;
+        const sims = try gpa.alloc(SimState, N);
+        defer gpa.free(sims);
+        for (sims, 0..) |*s, lane_id| s.* = .{
+            .t = times[lane_id / ckts.len],
+            .dt = dt,
+            .kind = .tran,
+            .iteration = ckts[lane_id % ckts.len].sim.iteration,
+        };
         const batches = try gpa.alloc(LaneBatch, c0.batches.len);
         errdefer gpa.free(batches);
         var n_batches: usize = 0;
         errdefer for (batches[0..n_batches]) |*b| b.deinit(gpa);
+        const bsims = try gpa.alloc(?Buffer, c0.batches.len);
+        errdefer gpa.free(bsims);
+        @memset(bsims, null);
+        errdefer for (bsims) |*o| if (o.*) |*b| b.free();
         const ps = try gpa.alloc(device_ir.GpuPayload, N);
         defer gpa.free(ps);
         for (c0.batches, 0..) |b0, bi| {
@@ -107,6 +126,7 @@ pub const Samples = struct {
             var name: [160]u8 = undefined;
             var eval = try hdl.kernel(backend.?, @ptrCast(b0.hooks.gpu_payload.?), lanes_batch.laneName(&name, p0.kernel, "eval") orelse return Error.NoLaneImage);
             errdefer eval.deinit();
+            bsims[bi] = try laneSims(gpa, &eval, sims, ps);
             const Bufs = struct {
                 models: Buffer,
                 model_of: Buffer,
@@ -177,6 +197,7 @@ pub const Samples = struct {
             .d_sims = undefined,
             .d_active = undefined,
             .d_limw = undefined,
+            .bsims = bsims,
         };
         errdefer self.stream.deinit();
         const sizes = .{
@@ -192,14 +213,6 @@ pub const Samples = struct {
             @field(self, f) = try lanes_batch.zeros(&batches[0].eval, sizes[j]);
             made += 1;
         }
-        const sims = try gpa.alloc(SimState, N);
-        defer gpa.free(sims);
-        for (sims, 0..) |*s, lane_id| s.* = .{
-            .t = times[lane_id / ckts.len],
-            .dt = dt,
-            .kind = .tran,
-            .iteration = ckts[lane_id % ckts.len].sim.iteration,
-        };
         try self.d_sims.upload(sims.ptr, N * @sizeOf(SimState));
         try self.stream.synchronize();
         if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-samples: {d} points, {d} sample lanes\n", .{ ckts.len, N });
@@ -212,6 +225,8 @@ pub const Samples = struct {
         if (comptime backend == null) return;
         self.stream.synchronize() catch {};
         inline for (buffers) |f| @field(self, f).free();
+        for (self.bsims) |*o| if (o.*) |*b| b.free();
+        self.gpa.free(self.bsims);
         for (self.batches) |*b| b.deinit(self.gpa);
         self.gpa.free(self.batches);
         self.gpa.free(self.active);
@@ -236,13 +251,14 @@ pub const Samples = struct {
         try self.d_q.fillAsync(0, (self.n + 1) * N * @sizeOf(f64), &self.stream);
         try self.d_g.fillAsync(0, (self.nnz + 1) * N * @sizeOf(f64), &self.stream);
         try self.d_c.fillAsync(0, (self.nnz + 1) * N * @sizeOf(f64), &self.stream);
-        for (self.batches) |*b| {
+        for (self.batches, self.bsims) |*b, *own| {
             if (b.count == 0) continue;
             var nl: u64 = N;
             var count: u64 = b.count;
             var none: u64 = 0;
+            const sims = if (own.*) |*o| o else &self.d_sims;
             try b.eval.launchOn(&self.stream, gompute.Dim3.linear(@intCast(N), block), .{ .x = block }, 0, &.{
-                arg(&nl),              arg(&count),            self.d_sims.argPtr(), self.d_active.argPtr(), self.d_limw.argPtr(),
+                arg(&nl),              arg(&count),            sims.argPtr(),        self.d_active.argPtr(), self.d_limw.argPtr(),
                 self.d_x.argPtr(),     b.d_gath.argPtr(),      b.d_rhs_idx.argPtr(), b.d_slots.argPtr(),     b.d_models.argPtr(),
                 b.d_model_of.argPtr(), b.d_instances.argPtr(), self.d_g.argPtr(),    self.d_c.argPtr(),      self.d_f.argPtr(),
                 self.d_q.argPtr(),     b.d_lim.argPtr(),       b.d_slots.argPtr(),   arg(&none),             arg(&none),
@@ -261,4 +277,49 @@ pub const Samples = struct {
     }
 };
 
+/// Why `c` cannot sample on the card under the lifted rule, or null; read
+/// by `Samples.init` once `held/w10-hb-samples-admit.patch` lands. The
+/// sampled operator (`mhb_newton.sample`) runs `eval` alone at each
+/// instant: no limit pass (`converger.run` clears limiting on exit), no
+/// `update_state`, `state_ctl` or commit. Eval reads Model, Instance and
+/// `SimState`, never `State`, so a lane starting from the packed rows is
+/// each host sample; a state hook, a status latch or stateful charge is
+/// no reason to refuse. Refused are the lanes' census names
+/// (`lanes.staticRefusal`'s device rules, kinduc aside): host callbacks,
+/// a delay, Newton hooks, a load check and host-stepped state (hooks with
+/// no device state kernel).
+pub fn refusal(c: *const Circuit) ?[]const u8 {
+    if (c.vpi != null or c.display != null or c.load_check != null) return "VPI, display tasks or a load check";
+    if (c.minDelay() != null) return "a delay line";
+    for (c.batches) |b| {
+        const h = b.hooks;
+        const p = h.gpu_payload orelse return "no device payload";
+        if (h.commit_state != null or h.predict_first_iterate != null or h.check_convergence != null or h.advance_iteration != null)
+            return "Newton hooks";
+        if (h.mark_load_check_rows != null) return "a load check";
+        if (p(b.ctx).lim_kernel.len == 0 and (h.update_state != null or h.state_ctl != null)) return "host-stepped";
+    }
+    return null;
+}
+
 // ---- private ----
+
+/// One batch's lanes' `SimState` when any lane's host batch holds its
+/// `analog initial` results, uploaded on `k`'s context; else null (the
+/// shared `sims`). `analog_initial` goes false where held, as the host
+/// batch's `setSimState` makes it (`BatchGpu.simFor`); `ps[l]` is lane
+/// l's payload.
+fn laneSims(gpa: std.mem.Allocator, k: *Raw, sims: []const SimState, ps: []const device_ir.GpuPayload) !?Buffer {
+    assert(sims.len == ps.len);
+    const held = for (ps) |p| {
+        if (p.held_initial) |h| if (h.*) break true;
+    } else false;
+    if (!held) return null;
+    const own = try gpa.dupe(SimState, sims);
+    defer gpa.free(own);
+    for (own, ps) |*s, p| if (p.held_initial) |h| {
+        s.analog_initial = s.analog_initial and !h.*;
+    };
+    assert(own.len == sims.len);
+    return try lanes_batch.upload(k, std.mem.sliceAsBytes(own));
+}

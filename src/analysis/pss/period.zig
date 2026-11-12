@@ -12,6 +12,7 @@
 //! - `pub fn integrateOnePeriod(ckt: *root.Circuit, ws: *converger.Workspace, sc: *Companion, x: []f64, probes: []const u32, wave: []f64, options: Options) error{ QueryCancelled, OutOfMemory }!bool`
 //! - `pub fn periodStart(ckt: *root.Circuit, sc: *Companion, x: []const f64, probes: []const u32, wave: []f64, options: Options) void`
 //! - `pub fn stepTime(options: Options, k: usize) f64`
+//! - `pub fn stepOptions(options: Options) converger.Options`
 //! - `pub fn periodHook(sc: *Companion, alpha: f64, has_charge: bool) PeriodHook`
 //! - `pub fn periodAccept(ckt: *root.Circuit, hook: *const PeriodHook, x: []const f64, probes: []const u32, wave: []f64, k: usize, t: f64, converged: bool) bool`
 
@@ -38,10 +39,10 @@ pub const Companion = struct {
 /// alpha*(q(x) - q_prev) - i_prev with alpha = 2/dt, matrix G + alpha*C.
 pub const PeriodHook = integrator.Hook(.trapezoidal);
 
-/// Integrates x in place over [0, T] in n_samples trapezoid steps. A
-/// non-empty `wave` receives n_samples+1 point-major rows
-/// [t, v(probes)...] of stride 1 + probes.len. Returns false on the first
-/// step whose Newton fails.
+/// Integrates x in place over [0, T] in n_samples trapezoid steps, the
+/// sources at `t_origin` plus t. A non-empty `wave` receives n_samples+1
+/// point-major rows [t, v(probes)...] of stride 1 + probes.len, t from the
+/// period's start. Returns false on the first step whose Newton fails.
 pub fn integrateOnePeriod(
     ckt: *root.Circuit,
     ws: *converger.Workspace,
@@ -56,12 +57,10 @@ pub fn integrateOnePeriod(
     periodStart(ckt, sc, x, probes, wave, options);
     for (0..steps) |k| {
         const t = stepTime(options, k);
+        const t_sim = options.t_origin + t;
         const hook = periodHook(sc, 2.0 / dt, ckt.has_charge);
-        ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
-        const nr = converger.run(ckt, ws, x, t, .{
-            .max_iter = options.max_newton_iter,
-            .abstol = options.newton_tol,
-        }, hook) catch |err| switch (err) {
+        ckt.setSimState(.{ .t = t_sim, .dt = dt, .kind = .tran });
+        const nr = converger.run(ckt, ws, x, t_sim, stepOptions(options), hook) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => |e| return e,
             else => null, // else: a numerical failure fails the period
         };
@@ -70,16 +69,16 @@ pub fn integrateOnePeriod(
     return true;
 }
 
-/// `integrateOnePeriod`'s start: the transient-phase sim state, the
-/// trapezoid seam state at x, and the t = 0 wave row.
+/// `integrateOnePeriod`'s start: the transient-phase sim state at
+/// `t_origin`, the trapezoid seam state at x, and the t = 0 wave row.
 pub fn periodStart(ckt: *root.Circuit, sc: *Companion, x: []const f64, probes: []const u32, wave: []f64, options: Options) void {
     const n: usize = ckt.n;
     const dt = options.period / @as(f64, @floatFromInt(options.n_samples));
     // Sources follow their waveform only under `analysis("tran")` (§4.6.1),
     // so every evaluated point declares the transient phase.
-    ckt.setSimState(.{ .t = 0, .dt = dt, .kind = .tran });
+    ckt.setSimState(.{ .t = options.t_origin, .dt = dt, .kind = .tran });
     if (ckt.has_charge) {
-        ckt.eval(x, 0);
+        ckt.eval(x, options.t_origin);
         num.copySimd(sc.q_prev[0..n], ckt.q_vec[0..n]);
         // Carry the trapezoid state across the period seam: a converged step
         // leaves i_prev = -f(x), so at x0 it is -rhs. A zero seed loses
@@ -98,9 +97,17 @@ pub fn periodStart(ckt: *root.Circuit, sc: *Companion, x: []const f64, probes: [
     }
 }
 
-/// The end time of step k of a period.
+/// The end time of step k of a period, from the period's start: the
+/// sources see `t_origin` plus it.
 pub fn stepTime(options: Options, k: usize) f64 {
     return options.period * @as(f64, @floatFromInt(k + 1)) / @as(f64, @floatFromInt(options.n_samples));
+}
+
+/// One step's Newton options: the shooting budget and tolerance, and
+/// `.options dv`, which HSPICE applies to every transient step. Every
+/// other field is `converger.Options`' default.
+pub fn stepOptions(options: Options) converger.Options {
+    return .{ .max_iter = options.max_newton_iter, .abstol = options.newton_tol, .dv = options.tol.dv orelse std.math.inf(f64) };
 }
 
 /// The companion hook of one step at `alpha` = 2/dt.

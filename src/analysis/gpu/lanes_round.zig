@@ -24,6 +24,7 @@ const device_ir = @import("device").abi;
 const root = @import("../types.zig");
 const lanes = @import("lanes.zig");
 const lanes_batch = @import("lanes_batch.zig");
+const lanes_lte = @import("lanes_lte.zig");
 const Circuit = root.Circuit;
 const StateCtlOp = device_ir.StateCtlOp;
 const GpuLanes = lanes.GpuLanes;
@@ -52,6 +53,7 @@ pub fn probe(self: *GpuLanes) !void {
         // 3. The LTE bounds.
         try lteKernel(self);
         try self.get(self.lte_out, self.buf(.lte_out));
+        if (self.gear.len != 0) try self.get(self.lte_gear, self.buf(.lte_gear));
     }
     // 4. The probe rows.
     if (self.n_probes > 0) {
@@ -166,6 +168,8 @@ pub fn chargeKernels(self: *GpuLanes, mask: *Buffer, x: *Buffer) !void {
             hubs.d_entries.argPtr(), self.buf(.q).argPtr(), self.buf(.q).argPtr(),
         });
     }
+    // A K card: slot 0 as `host_ops.lteSnap` makes it (`lanes_lte`).
+    if (self.n_fix > 0) try lanes_lte.run(self, mask);
 }
 
 /// `arp_lane_accept`: each accepted lane's `prev <- cur <- x` and its
@@ -178,9 +182,10 @@ pub fn acceptKernel(self: *GpuLanes) !void {
     var nh: u64 = self.n_hist;
     var charge: u64 = @intFromBool(self.has_charge);
     try self.launch(&self.k.accept, (self.n + self.n_qt) * N, &.{
-        arg(&nl),               arg(&n),                    arg(&n_qt),             arg(&nh),                    arg(&charge),
-        self.buf(.sc).argPtr(), self.buf(.accept).argPtr(), self.buf(.x).argPtr(),  self.buf(.cur).argPtr(),     self.buf(.prev).argPtr(),
-        self.buf(.q).argPtr(),  self.buf(.ring).argPtr(),   self.buf(.ip).argPtr(), self.buf(.ring_qt).argPtr(), self.buf(.ip_qt).argPtr(),
+        arg(&nl),                   arg(&n),                     arg(&n_qt),               arg(&nh),                    arg(&charge),
+        self.buf(.sc).argPtr(),     self.buf(.accept).argPtr(),  self.buf(.x).argPtr(),    self.buf(.cur).argPtr(),     self.buf(.prev).argPtr(),
+        self.buf(.q).argPtr(),      self.buf(.ring).argPtr(),    self.buf(.ip).argPtr(),   self.buf(.ring_qt).argPtr(), self.buf(.ip_qt).argPtr(),
+        self.buf(.perm_q).argPtr(), self.buf(.perm_qt).argPtr(), self.buf(.gear).argPtr(),
     });
 }
 
@@ -206,7 +211,8 @@ pub fn lteKernel(self: *GpuLanes) !void {
     var nh: u64 = self.n_hist;
     var n_qt: u64 = self.n_qt;
     try self.launch(&self.k.lte, N, &.{
-        arg(&nl), self.buf(.sc).argPtr(), self.buf(.ring_qt).argPtr(), self.buf(.perm_qt).argPtr(), self.buf(.ip_qt).argPtr(), arg(&nh), arg(&n_qt), self.buf(.lte_in).argPtr(), self.buf(.lte_out).argPtr(),
+        arg(&nl),                 self.buf(.sc).argPtr(),       self.buf(.ring_qt).argPtr(), self.buf(.perm_qt).argPtr(), self.buf(.ip_qt).argPtr(), arg(&nh), arg(&n_qt), self.buf(.lte_in).argPtr(), self.buf(.lte_out).argPtr(),
+        self.buf(.gear).argPtr(), self.buf(.lte_gear).argPtr(),
     });
 }
 

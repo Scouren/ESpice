@@ -27,6 +27,7 @@ module mes(d, g, s);
     parameter integer ztype = 1 from [-1:1] exclude 0;
 
     parameter real vto    = -2.0;                   // threshold [V]
+    aliasparam vt0 = vto;                    // ngspice mes.c:46-47 IOPR spelling
     parameter real beta   = 2.5e-3  from [0:inf);   // transconductance [A/V^2]
     parameter real b      = 0.3     from [0:inf);   // doping-tail factor [1/V]
     parameter real alpha  = 2.0     from (0:inf);   // knee / saturation [1/V]
@@ -47,7 +48,7 @@ module mes(d, g, s);
     parameter real m      = 1.0     from (0:inf);   // instance parallel multiplier
     parameter real gmin   = $simparam("gmin") from [0:inf);   // shunt across each junction
 
-    real vt0, scale, fourkt;
+    real vtc, scale, fourkt;
     real vgs, vgd, vds, mode, vx, vdx, arg, igs, igd;
     real vgst, denom, betap, afac, knee, ids, gm;
     real veroot, veff1, veff2, vnroot, vnew, ext, qroot, par1, cfact;
@@ -57,7 +58,7 @@ module mes(d, g, s);
         // ---- bias-independent prep -------------------------------------------
         // mesload.c uses the fixed CONSTvt0 = k*300.15/q for both gate diodes:
         // `mes` has no tnom/temp card parameter and no temperature maps.
-        vt0    = 1.38064852e-23 * 300.15 / 1.6021766208e-19;
+        vtc    = 1.38064852e-23 * 300.15 / 1.6021766208e-19;
         scale  = area * m;                          // mesload.c: czxx*area, then m*
         fourkt = 4.0 * 1.38064852e-23 * $temperature;
 
@@ -68,19 +69,19 @@ module mes(d, g, s);
 
         // ---- gate junctions, both sides (mesload.c) ---------------------------
         // Reverse arm keeps the cubic term that jfetload.c drops:
-        // arg = 3*vt0/(v*e), I = -Is*(1+arg^3) + gmin*v below -3*vt0.
+        // arg = 3*vtc/(v*e), I = -Is*(1+arg^3) + gmin*v below -3*vtc.
         // The exp-argument clamp at 80 keeps unlimited evaluations finite.
-        if (vgs <= -3.0 * vt0) begin
-            arg = 3.0 * vt0 / (vgs * 2.718281828459045);
+        if (vgs <= -3.0 * vtc) begin
+            arg = 3.0 * vtc / (vgs * 2.718281828459045);
             igs = -is * (1.0 + arg * arg * arg) + gmin * vgs;
         end else begin
-            igs = is * (exp(min(vgs / vt0, 80.0)) - 1.0) + gmin * vgs;
+            igs = is * (exp(min(vgs / vtc, 80.0)) - 1.0) + gmin * vgs;
         end
-        if (vgd <= -3.0 * vt0) begin
-            arg = 3.0 * vt0 / (vgd * 2.718281828459045);
+        if (vgd <= -3.0 * vtc) begin
+            arg = 3.0 * vtc / (vgd * 2.718281828459045);
             igd = -is * (1.0 + arg * arg * arg) + gmin * vgd;
         end else begin
-            igd = is * (exp(min(vgd / vt0, 80.0)) - 1.0) + gmin * vgd;
+            igd = is * (exp(min(vgd / vtc, 80.0)) - 1.0) + gmin * vgd;
         end
 
         // ---- mode select: sign(vds), swap vgs <-> vgd ------------------------

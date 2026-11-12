@@ -20,6 +20,8 @@ const Knobs = @import("../Circuit.zig").Knobs;
 const devices = @import("devices.zig");
 const lu_bench = @import("lu_bench.zig");
 const nowNs = @import("context.zig").nowNs;
+const lu_admit = @import("lu_admit.zig");
+const Hold = lu_admit.Hold;
 
 const K = solver.lu_kernels;
 const direct = solver.direct;
@@ -104,8 +106,14 @@ pub const GpuLu = struct {
     /// `d_a`: `slv.vcopy` is stale while `slv.gen` still equals `gen`
     /// (`flushVcopy`).
     stale: ?struct { slv: *direct.Solver, gen: u32 } = null,
-    /// `load_ns`: host time building and uploading epoch tables.
-    st: struct { calls: u64 = 0, resident: u64 = 0, refactors: u64 = 0, peels: u64 = 0, epochs: u64 = 0, mismatches: u64 = 0, load_ns: u64 = 0 } = .{},
+    /// G3 (`knobs.perf.g3`): the current pivot epoch's host refactors.
+    hold: Hold = .{},
+    /// P1 (`knobs.perf.p1`): the current epoch's host rent; its `machine`
+    /// (set by the executor after `init`) prices the move.
+    rent: lu_admit.Rent = .{},
+    /// `load_ns`: host time building and uploading epoch tables; `up_ns`:
+    /// the part of it `bringUp` took.
+    st: struct { calls: u64 = 0, resident: u64 = 0, refactors: u64 = 0, peels: u64 = 0, epochs: u64 = 0, mismatches: u64 = 0, load_ns: u64 = 0, up_ns: u64 = 0 } = .{},
 
     const Res = struct { combine: Raw, scatter: Raw, pin_ov: []f64, d_ov: Buffer };
 
@@ -275,6 +283,13 @@ pub const GpuLu = struct {
         if (!slv.factored or !lu.factored) return null;
         // Tape-sized factors refactor in microseconds on the host.
         if (lu.tv.items.len != 0) return null;
+        // G3: a young pivot epoch declines before its tables are built.
+        if (self.knobs.perf.g3 and !self.hold.ready(lu.pattern_epoch)) {
+            self.hold.count(lu.pattern_epoch, self.vcopyStale(slv) or !slv.unchanged(vals));
+            return null;
+        }
+        // P1: an epoch whose rent has not paid for its tables declines.
+        if (self.knobs.perf.p1 and !self.forced and !self.bought(slv, vals)) return null;
         try self.ensureEpoch(slv);
         if (self.declined) return null;
         // A stale `vcopy` (`stale`) says nothing about `vals`.
@@ -360,6 +375,7 @@ pub const GpuLu = struct {
     pub fn residentReady(self: *const Self, slv: *direct.Solver) bool {
         if (self.poisoned or self.declined or self.benchOf() != null) return false;
         const lu = slv.sparse() orelse return false;
+        if (self.knobs.perf.g3 and !self.hold.ready(lu.pattern_epoch)) return false;
         return slv.factored and lu.factored and lu.tv.items.len == 0 and lu.void_slots.items.len == 0 and self.epoch == lu.pattern_epoch;
     }
 
@@ -384,6 +400,12 @@ pub const GpuLu = struct {
         if (comptime backend == null) return error.NoGpuArtifacts;
         const lu = slv.sparse() orelse return self.fill(vals, r);
         if (!slv.factored or !lu.factored or lu.tv.items.len != 0) return self.fill(vals, r);
+        // G3, as `trySolve`; a resident call always refactors.
+        if (self.knobs.perf.g3 and !self.hold.ready(lu.pattern_epoch)) {
+            self.hold.count(lu.pattern_epoch, true);
+            return self.fill(vals, r);
+        }
+        if (self.knobs.perf.p1 and !self.forced and !self.bought(slv, null)) return self.fill(vals, r);
         try self.ensureEpoch(slv);
         if (self.declined or lu.void_slots.items.len != 0) return self.fill(vals, r);
 
@@ -484,6 +506,20 @@ pub const GpuLu = struct {
         try self.downloadA(st.slv.vcopy);
     }
 
+    /// P1: whether `slv`'s pivot epoch has moved to the device: loaded
+    /// already, or its host rent now pays for its tables (`Rent.paid`).
+    /// While not, a call that refactors (`vals` changed, or null: a
+    /// resident call, which always refactors) adds to the epoch's age. The
+    /// driver is up once this context brought it up or the query's device
+    /// eval placed it (`place` false).
+    fn bought(self: *Self, slv: *direct.Solver, vals: ?[]const f64) bool {
+        const lu = slv.sparse().?;
+        if (self.epoch == lu.pattern_epoch) return true;
+        if (self.rent.paid(lu, slv.admitted_lanes, self.up or !self.place)) return true;
+        self.rent.add(if (vals) |v| self.vcopyStale(slv) or !slv.unchanged(v) else true);
+        return false;
+    }
+
     /// `load`s `slv`'s pivot epoch unless the tables already hold it,
     /// timed into `st.load_ns`.
     fn ensureEpoch(self: *Self, slv: *direct.Solver) !void {
@@ -507,14 +543,19 @@ pub const GpuLu = struct {
         for (lu.ui.items) |i| flops += lu.lp[i + 1] - lu.lp[i];
         self.flops = flops;
         // The buffers and every copy are sized by `self.n`.
-        if (lu.n != self.n or !admits(flops, lu.n, self.forced)) return;
+        // P1 admitted the epoch already (`bought`); the bars are today's.
+        if (lu.n != self.n or !(if (self.knobs.perf.p1) lu.n != 0 else admits(flops, lu.n, self.forced))) return;
         // The first admitted epoch starts the driver; one that will not
         // start leaves the host LU the rest of the query.
-        if (!self.up) self.bringUp() catch |e| {
-            if (self.forced) std.debug.print("warning: device LU unavailable ({s})\n", .{@errorName(e)});
-            self.poisoned = true;
-            return;
-        };
+        if (!self.up) {
+            const t_up = nowNs();
+            defer self.st.up_ns += nowNs() - t_up;
+            self.bringUp() catch |e| {
+                if (self.forced) std.debug.print("warning: device LU unavailable ({s})\n", .{@errorName(e)});
+                self.poisoned = true;
+                return;
+            };
+        }
         self.upload(slv) catch |e| switch (e) {
             // The device LU is an accelerator: the host LU keeps the epoch.
             error.OutOfMemory, error.AllocFailed => return,
@@ -532,6 +573,9 @@ pub const GpuLu = struct {
         // order.
         var opt: K.Options = .{ .gather = !self.knobs.gpu_lu_nogather };
         if (self.knobs.gpu_lu_tail) |m| opt.tail = lu.n - @min(lu.n, m);
+        opt.g2 = self.knobs.perf.g2;
+        opt.g7 = self.knobs.perf.g7;
+        opt.runs = self.knobs.perf.g2;
         var tb = try K.build(self.gpa, lu, slv.col_ptr, slv.params.refactor_growth_limit, opt);
         defer tb.deinit(self.gpa);
         self.tab = tb.tab;

@@ -12,7 +12,7 @@ and differential oracles come first; coverage and fuzzing alone cannot see it.
 
 | Domain | Components | What "correct" means |
 |---|---|---|
-| Compiler front end | `src/frontend/` (ngspice, HSPICE, Spectre dialects, `.meas`, expressions, `.vec`, Touchstone) | every deck parses to the netlist the dialect's reference defines, or is refused with a declared error |
+| Compiler front end | `src/frontend/` (the ngspice dialect, `.meas`, expressions, `.vec`, Touchstone); `src/spicerack.zig` (every other dialect, as SpiceRack's translation) | every deck parses to the netlist ngspice's reference defines, or is refused with a declared error; a deck in another dialect runs as its translation or fails, and is never read as ngspice |
 | Device models | `models/*.va` through VerA, `src/device/` | currents, charges and their Jacobians match the model's equations |
 | Numerical solver | `src/solver/` (sparse LU, lanes, GMRES), `src/analysis/` (Newton, integrators, AC, noise, PSS, HB, PZ) | each solve satisfies its equations to the stated tolerance |
 | Stateful and parallel | lane batches, `--jobs` scheduler, `Problem` sessions, the C ABI | results equal the serial, one-at-a-time run |
@@ -32,7 +32,8 @@ and differential oracles come first; coverage and fuzzing alone cannot see it.
 | Wrong device derivative | central finite difference at random voltages | property | `src/device/tests/jacobian_fd.zig` |
 | Wrong integrator order | observed order `log2(e_h / e_{h/2})` on RC and RLC | convergence order | `src/analysis/tests/transient.zig` |
 | Engine depends on node names, element order, impedance scale | rename, reorder, split, scale by k, 0 A source | metamorphic | `tests/metamorphic.zig` (in `test`) |
-| Parser panic, leak, undeclared error | no panic, no leak, error from the declared set; same digest on reparse and after no-op rewrites | fuzz (`std.testing.fuzz`, structured and raw) | `src/frontend/tests/{fuzz,expr,measure,source,spectre,sparam,vec}.zig`; corpus replay in `test`, `--fuzz` nightly |
+| Parser panic, leak, undeclared error | no panic, no leak, error from the declared set; same digest on reparse and after no-op rewrites | fuzz (`std.testing.fuzz`, structured and raw) | `src/frontend/tests/{fuzz,expr,measure,source,sparam,vec}.zig`; corpus replay in `test`, `--fuzz` nightly |
+| A deck in another dialect read natively, a failed translation read as ngspice, SpiceRack's time folded into ESPice's, or a kit include read from the working directory | the ngspice twin of what a fake `spice2rack` writes, run natively, bit for bit; the contract's coded error and exit 1 with no raw file; the fake's 0.2 s sleep as a floor under both stderr timing lines; a hand-worked divider whose kit include shares its name with a decoy in the working directory; the corpus decks' `tokenizer` fields for `detect` | contract, differential | `tests/test_correctness.zig` `spicerack/*` checks over `tests/spicerack/` (in `test`); `src/spicerack.zig` tests |
 | A device card scanned on a thread (#230) reads differently from its whole read | the same deck with every card read whole (`ParseOptions.threads = 0`), its raw tables, ids and row order (`exactDigest`); 1 and 8 threads | differential, determinism | `src/frontend/tests/fuzz.zig` (every fuzzed and seeded deck, and a 5700-card deck) |
 | Expression folding wrong | recursive reference evaluator | differential fuzz | `src/frontend/tests/expr.zig` |
 | Swallowed out-of-memory | `checkAllAllocationFailures`: each allocation fails once | fault injection | 38 files under `src/` |

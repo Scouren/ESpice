@@ -1,6 +1,6 @@
 //! The frontend module root: source to netlist to frozen circuit and
-//! queries, the entry points the Problem facade calls. In: a deck (file or
-//! bytes) and its dialect. Out: the parsed netlist (`prepare`), its HDL
+//! queries, the entry points the Problem facade calls. In: an ngspice deck
+//! (file or bytes). Out: the parsed netlist (`prepare`), its HDL
 //! models loaded (`loadModels`), the frozen circuit with its deck and
 //! variant runs (`build`), and queries appended later (`resolveQueries`).
 //! Leaves never import this file.
@@ -11,14 +11,12 @@
 //! - `pub const Tuner = variants.Tuner`
 //! - `pub const Sss = variants.Sss`
 //! - `pub const WorstCase = variants.WorstCase`
-//! - `pub const Dialect = netlist.Dialect`
 //! - `pub const ParseOptions = netlist.ParseOptions`
-//! - `pub const parseDialect, detectDialect` (dialect.zig)
 //! - `pub const Prepared = struct`
 //! - `pub fn deinit(self: *Prepared) void`
 //! - `pub const Source = union(enum)`
 //! - `pub const Bytes = struct`
-//! - `pub fn prepare(io: std.Io, session: Allocator, input: Source, dialect: Dialect, live: []const []const u8, parse: ParseOptions) !netlist.Netlist`
+//! - `pub fn prepare(io: std.Io, session: Allocator, input: Source, live: []const []const u8, parse: ParseOptions) !netlist.Netlist`
 //! - `pub fn loadModels(io: std.Io, lib: *device.Library, session: Allocator, nl: netlist.Netlist, origin: []const u8, apps: []const []const u8) !void`
 //! - `pub fn build(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: netlist.Netlist) !Prepared`
 //! - `pub fn resolveQueries(arena: Allocator, prepared: *const Prepared, directive_text: []const u8) ![]const Job`
@@ -35,10 +33,10 @@ const builder = @import("builder");
 const analyses = @import("analyses.zig");
 const variants = @import("variants.zig");
 const mosra = @import("mosra.zig");
-const dialect_mod = @import("dialect.zig");
 const prepared_deck = @import("prepared_deck.zig");
 const prepared_opvars = @import("prepared_opvars.zig");
 const prepared_soa = @import("prepared_soa.zig");
+const prepared_temper = @import("prepared_temper.zig");
 const Builder = builder.Builder;
 const Job = requests.Query;
 const NO_NODE = analyses.NO_NODE;
@@ -51,15 +49,8 @@ pub const Tuner = variants.Tuner;
 pub const Sss = variants.Sss;
 /// `.wcd`: FORM's points to variant rows (#240, variants.zig).
 pub const WorstCase = variants.WorstCase;
-/// The netlist syntax a deck is read in: ngspice, HSPICE or Spectre.
-pub const Dialect = netlist.Dialect;
 /// How `prepare` reads device cards (#230).
 pub const ParseOptions = netlist.ParseOptions;
-
-/// The dialect a CLI name or short alias selects (dialect.zig).
-pub const parseDialect = dialect_mod.parseDialect;
-/// The dialect a deck's own text is in (dialect.zig).
-pub const detectDialect = dialect_mod.detectDialect;
 
 /// Construction result: the frozen topology and what the deck says about it.
 /// The session arena owns every deck slice; `deinit` releases the circuits.
@@ -139,15 +130,13 @@ const NodeIndex = struct {
 /// names in `live` stay live, so the built circuit takes new values for
 /// them without a re-parse (`Prepared.tuning`). The netlist borrows
 /// `session`; release it once `build` has returned, or with the Prepared
-/// when `live` is not empty. Spectre input expands its `include`s
-/// (`source.expandSpectre`) and nothing else: it splits no `.alter` runs
-/// and reads no data files. Fails with `UnknownParameter` for a `live`
+/// when `live` is not empty. Fails with `UnknownParameter` for a `live`
 /// name no global `.param` defines, with the file error of an
 /// unreadable deck, include, data or `soalimits` file, and with
 /// `InvalidSoaLimits` for a `soalimits` file `prepared_soa.ratings`
 /// refuses. `parse` says how the device cards are read; every choice gives
 /// the same netlist.
-pub fn prepare(io: std.Io, session: Allocator, input: Source, dialect: Dialect, live: []const []const u8, parse: ParseOptions) !netlist.Netlist {
+pub fn prepare(io: std.Io, session: Allocator, input: Source, live: []const []const u8, parse: ParseOptions) !netlist.Netlist {
     const origin = switch (input) {
         .file => |path| path,
         .bytes => |bytes| bytes.origin,
@@ -156,11 +145,8 @@ pub fn prepare(io: std.Io, session: Allocator, input: Source, dialect: Dialect, 
         .file => |path| try std.Io.Dir.cwd().readFileAlloc(io, path, session, .unlimited),
         .bytes => |bytes| try session.dupe(u8, bytes.data),
     };
-    if (dialect == .spectre) {
-        return netlist.parseLive(session, try netlist.source.expandSpectre(io, session, origin, raw), dialect, live, parse);
-    }
     const runs = try netlist.source.splitAlters(session, raw);
-    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), dialect, live, parse);
+    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), live, parse);
     const alters = try session.alloc([]const u8, runs.len - 1);
     for (alters, runs[1..]) |*text, run| text.* = try netlist.source.expand(io, std.heap.page_allocator, session, origin, run);
     nl.deck.alters = alters;
@@ -287,7 +273,7 @@ fn buildRun(lib: *const device.Library, sim_arena: Allocator, parse_arena: Alloc
 /// than a u32 job index can fan out.
 fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: *netlist.Netlist, run: variants.Run) !struct { prepared: Prepared, rebuilds: []const variants.Rebuild } {
     if (nl.deck.analyses.len > (std.math.maxInt(u32) - 1) / 3) return error.CircuitTooLarge;
-    const deck_opts = try analyses.deckOptions(nl.deck.config, nl.deck.dialect);
+    const deck_opts = try analyses.deckOptions(nl.deck.config);
     var b = try Builder.init(sim_arena, lib);
     var compiled_ok = false;
     errdefer if (!compiled_ok) b.deinit();
@@ -298,6 +284,11 @@ fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Alloc
     b.tol = deck_opts.tol;
 
     if (nl.deck.draw_seed and run.point == null and !variants.any(nl.deck)) try variants.drawOnce(parse_arena, nl);
+    // The values that read `temper` at the deck's temperature, over this
+    // run's draws and live values; each analysis moves them from there.
+    const temp_c = deck_opts.temp_c orelse netlist.temper_slots.default_temp_c;
+    var stack: std.ArrayList(netlist.expr.Val) = .empty;
+    try netlist.temper_slots.setTemp(nl, parse_arena, &stack, temp_c);
     var nb = try builder.NetBuilder.init(parse_arena, &b, nl.*);
     try nb.build();
 
@@ -312,6 +303,7 @@ fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Alloc
     errdefer circuit.deinit();
     try prepared_deck.frozenIndices(parse_arena, cards, &circuit);
     const card_names = try requests.CardNames.init(sim_arena, cards);
+    const temper = try prepared_temper.table(lib, sim_arena, parse_arena, nl, &circuit, card_names);
 
     var out = try nb.publish(sim_arena, &circuit, perm);
     if (nl.deck.saves.len > 0) try prepared_deck.keepSaved(parse_arena, &out.probes, &out.probe_labels, nl.deck.saves);
@@ -368,7 +360,7 @@ fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Alloc
     const wcd = if (nl.deck.wcd != null and run.point == null and run.prefix.len == 0) try variants.WorstCase.init(try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "")) else null;
     const tuning = if (nl.tunable.len != 0 and run.point == null and run.prefix.len == 0) try variants.Tuning.init(core.gpa, lib, sim_arena, parse_arena, nl, &circuit, cards) else null;
     errdefer if (tuning) |t| t.deinit();
-    if (plan.variants.refs.len != 0 or tuning != null or wcd != null) try circuit.countParams();
+    if (plan.variants.refs.len != 0 or tuning != null or wcd != null or temper != null) try circuit.countParams();
     card_opts.sample = nl.deck.sample;
     card_opts.card_names = card_names;
     const queries = try analyses.queries(sim_arena, cards_rows, circuit.n, false, out.bindings, cards, card_opts, plan.fanout);
@@ -401,6 +393,8 @@ fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Alloc
         .cards = cards,
         .card_names = card_names,
         .ac_overrides = try prepared_deck.acOverrides(sim_arena, cards, nb.ac_res.items(.name), nb.ac_res.items(.value)),
+        .noise_gaps = try prepared_deck.noiseGaps(sim_arena, nb.noise_gaps.items),
+        .temper = temper,
         .measures = try prepared_deck.measures(sim_arena, nl.deck.measures),
         .save_op = if (nl.deck.save_op) |s| blk: {
             var own = s;
@@ -433,10 +427,10 @@ test namesNoOutput {
 }
 
 test {
-    _ = dialect_mod;
     _ = prepared_deck;
     _ = prepared_opvars;
     _ = prepared_soa;
+    _ = prepared_temper;
     _ = @import("tests/builder.zig");
     _ = @import("tests/prepared.zig");
     _ = @import("tests/models.zig");

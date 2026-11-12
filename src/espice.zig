@@ -6,6 +6,7 @@
 //!
 //! Contents:
 //! - `pub const Problem = @import("espice/Problem.zig")`
+//! - `pub const calibrate = @import("espice/calibrate.zig")`
 //! - `pub const Options = config.Options`
 //! - `pub const MeasureWriters = config.MeasureWriters`
 //! - `pub const HdlToolchain = config.HdlToolchain`
@@ -14,9 +15,6 @@
 //! - `pub const QueryId = requests.QueryId`
 //! - `pub const Query = requests.Query`
 //! - `pub const Source = frontend.Source`
-//! - `pub const Dialect = frontend.Dialect`
-//! - `pub const parseDialect = frontend.parseDialect`
-//! - `pub const detectDialect = frontend.detectDialect`
 //! - `pub const Request = analysis.ExecutionConfig.Backend`
 //! - `pub const gpu_available = analysis.gpu_available`
 //! - `pub const Status = analysis.session.Status`
@@ -44,6 +42,8 @@ const publish = @import("espice/publish.zig");
 
 /// A prepared circuit, its query DAG and the output its results go to.
 pub const Problem = @import("espice/Problem.zig");
+/// `espice calibrate`: measures this machine and writes the calibration file.
+pub const calibrate = @import("espice/calibrate.zig");
 /// Everything `Problem.init` needs. Its slices are copied during init.
 pub const Options = config.Options;
 /// `Options.measures`: the `.meas` values and the cards' error lines.
@@ -60,13 +60,6 @@ pub const QueryId = requests.QueryId;
 pub const Query = requests.Query;
 /// A netlist path, or in-memory text with the origin it is named by.
 pub const Source = frontend.Source;
-/// The netlist syntax family, which decides SPICE letter and LEVEL meaning.
-pub const Dialect = frontend.Dialect;
-/// Maps a CLI dialect name (`ngspice`, `hspice`, `spectre`); null if unknown.
-pub const parseDialect = frontend.parseDialect;
-/// The dialect a deck's text is in, from markers only HSPICE or Spectre
-/// decks carry; ngspice otherwise (the CLI's `--tokenizer` default).
-pub const detectDialect = frontend.detectDialect;
 /// Requested compute backend; `Problem.init` rejects one the build lacks; a
 /// query run with an explicit cuda/hip fails when no GPU is usable.
 pub const Request = analysis.ExecutionConfig.Backend;

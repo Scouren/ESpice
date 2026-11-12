@@ -113,7 +113,7 @@ fn readRows(io: Io, a: Allocator, name: []const u8, resolved: []const u8) Error!
         var cells: std.ArrayList([]const u8) = .empty;
         var c = mem.tokenizeAny(u8, row, " \t,\r");
         while (c.next()) |v| {
-            if (lines.hspice.parseNum(v) == null) {
+            if (lines.ngspice.parseNum(v) == null) {
                 if (!@import("builtin").is_test) std.log.err(".data {s}: {s}:{d}: '{s}' is not a number", .{ name, resolved, line_no, v });
                 return error.InvalidData;
             }

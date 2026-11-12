@@ -1454,6 +1454,79 @@ test "GPU inventory: every built-in model evaluates on the GPU" {
     }
 }
 
+test "GPU census: built-in models the lanes or the HB samples turn down, by name" {
+    // Oracle: two name lists read off VerA's generated declarations
+    // (`State`, `state_class`, `limit`, `updateState`, `stateCtl`,
+    // `status_sites`, `delays`, Instance `__held__`/`__analog_op__absdelay__`
+    // fields) by a separate scan of the generated model sources on
+    // 2026-11-11, not by these predicates. The predicates mirror the hooks
+    // `batch.zig` sets and the refusals that read them:
+    // - lanes (`gpu_drive.gpuLaneRefusal`, `lanes.staticRefusal`): host-
+    //   stepped (state hooks, no state kernel), `commit_state`,
+    //   `predict_first_iterate`, Newton history, a load check;
+    // - HB samples (`lanes_samples.Samples.init`, UnsupportedSampleState):
+    //   any state hook, `status`, a delay, or any of the above.
+    // kinduc's lane refusal is by type name, not a trait: not listed here.
+    // kinduc left the samples list when `ddt(-m*V(br2))` made its coupling a plain charge, with no path-latch state (oracle: hb/kinduc_pair.sp).
+    // A model that gains or loses one fails here with its list printed.
+    const t = impl.test_access.traits;
+    const models = @import("models");
+    @setEvalBranchQuota(20_000_000);
+    const got = comptime blk: {
+        var lane: []const u8 = "";
+        var sample: []const u8 = "";
+        for (@typeInfo(models).@"struct".decl_names) |name| {
+            const D = @field(models, name);
+            if (!@hasDecl(D, "eval")) continue;
+            const timer = t.skipsTimerState(D);
+            const delay = t.hasAbsdelayState(D);
+            const update = @hasDecl(D, "updateState") and !delay and !timer;
+            const ctl = @hasDecl(D, "stateCtl") and !timer;
+            const commit = @hasDecl(D, "updateState") and delay;
+            const newton = @hasDecl(D, "advanceIteration") or @hasDecl(D, "checkConvergence");
+            const hooks = commit or newton or t.predictsOverDeltaOld2(D) or t.load_check.get(t.baseName(D)) != null;
+            if (hooks or (!t.hasStateKernel(D) and (update or ctl))) lane = lane ++ " " ++ name;
+            if (hooks or update or ctl or @hasDecl(D, "status_sites") or @hasDecl(D, "delays")) sample = sample ++ " " ++ name;
+        }
+        break :blk .{ lane, sample };
+    };
+    const want_lane =
+        \\coupled_tlines cswitch hfet1 lossy_tline ltra mosvar r3_cmc sparam_1
+        \\sparam_2 sparam_3 sparam_4 tline vccs_delay vccs_laplace vccs_pole
+        \\vcvs_delay vcvs_laplace vcvs_pole vswitch wline_1 wline_2 wline_3
+        \\wline_4
+    ;
+    const want_sample =
+        \\asmesd asmesd_dio asmhemt b3soidd b3soifd bsim1 bsim4va bsimbulk bsimcmg
+        \\bsimimg bsimsoi_va coupled_ltra coupled_ltra3 coupled_ltra4
+        \\coupled_tlines cswitch gummel_poon hfet1 hfet2 hicumL2_va hisim2_va
+        \\hisimhv_va hisimsoi hisimsotb jfet2 l_utsoi lossy_tline ltra mes
+        \\mesa mextram mextram_t mos1 mos2 mos3 mos6 mos9 mosvar mvsg psp104
+        \\psp104_nqs psp104t r3_cmc sparam_1 sparam_2 sparam_3 sparam_4 tline txl
+        \\vbic13_4t vccs_delay vccs_laplace vccs_pole vcvs_delay vcvs_laplace
+        \\vcvs_pole vdmos vswitch wline_1 wline_2 wline_3 wline_4
+    ;
+    const Names = struct {
+        // Name by name: `want` wraps at newlines, `got` is space-separated.
+        fn same(want: []const u8, have: []const u8) bool {
+            var w = std.mem.tokenizeAny(u8, want, " \n");
+            var h = std.mem.tokenizeScalar(u8, have, ' ');
+            while (true) {
+                const a = w.next();
+                const b = h.next();
+                if (a == null or b == null) return a == null and b == null;
+                if (!std.mem.eql(u8, a.?, b.?)) return false;
+            }
+        }
+    };
+    inline for (.{ .{ "lanes", want_lane, got[0] }, .{ "samples", want_sample, got[1] } }) |c| {
+        if (!Names.same(c[1], c[2])) {
+            std.debug.print("gpu census ({s}):{s}\n", .{ c[0], c[2] });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
 test "Dual: sel takes b at a ±0 indicator and a at any other, NaN included" {
     // `sel` computes `c.v != 0.0` on the bits (#25); this pins the bit trick
     // to the float compare. The miscompile it dodges needs a stripped object
@@ -1590,6 +1663,12 @@ test "BSIM4 linked admission and limited planes agree with forced wide across mo
     std.debug.print("bsim4-mode-gate: checked={d} admitted={d}\n", .{ checked, admitted });
 }
 
+// The #256 generator and the C4 lever's review rule.
+test {
+    _ = @import("bypass.zig");
+    _ = @import("census.zig");
+}
+
 test "a bypass replay stamps the plain evaluation's linearization at its recording" {
     try checkBypassReplay(false);
 }
@@ -1635,7 +1714,7 @@ fn checkBypassReplay(tied: bool) !void {
     const collapse = D.collapse(Real, &model, &instance);
     var nodes: [n]u32 = undefined;
     for (&nodes, collapse, 0..) |*node, alias, u| node.* = 1 + if (alias) |root| root else @as(u32, @intCast(u));
-    if (tied) nodes[@intFromEnum(U.g)] = nodes[@intFromEnum(U.s)];
+    if (tied) nodes[@backingInt(U.g)] = nodes[@backingInt(U.s)];
     const proto = try vt.proto_create(a).unwrap();
     defer proto.destroy(proto.ctx, a);
     try vt.proto_add(proto.ctx, a, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();

@@ -117,7 +117,10 @@ pub fn validatePlot(format: Format, plot: Plot) ValidationError!void {
 /// Checks that `format` can hold a result of this shape. Pure, so
 /// construction can reject a bad selection before any I/O.
 pub fn validateSchema(format: Format, schema: Schema) ValidationError!void {
-    if (schema.varnames.len == 0) return error.DataLengthMismatch;
+    // ngspice-44.2 writes an empty circuit's `.op` as a binary raw plot of
+    // no variables (`No. Variables: 0`, tests/regression/misc/empty-1.sp).
+    // ponytail: binary raw only; ASCII raw and the rest refuse that plot.
+    if (schema.varnames.len == 0 and format != .binary) return error.DataLengthMismatch;
     if (schema.npoints) |n| _ = try sampleCount(schema, n);
     switch (format) {
         .touchstone => _ = try portCount(schema),
@@ -297,7 +300,12 @@ test validatePlot {
     var plot: Plot = .{ .title = "t", .result = .{ .plotname = "p", .varnames = &.{ "time", "v(a)" }, .is_complex = true, .npoints = 2, .data = &.{ 0, 0, 1, 2, 3, 0, 4, 5 } } };
     try validatePlot(.binary, plot);
     try t.expectEqualSlices(f64, &.{ 3, 0, 4, 5 }, plot.point(1));
-    try t.expectError(error.DataLengthMismatch, validatePlot(.binary, .{ .title = "t", .result = .{ .plotname = "p", .varnames = &.{}, .is_complex = false, .npoints = 0, .data = &.{} } }));
+    // An empty circuit's `.op`: no variables, one point, as ngspice-44.2's
+    // binary raw file holds it (empty-1.sp); no other format takes it.
+    const empty: Plot = .{ .title = "t", .result = .{ .plotname = "Operating Point", .varnames = &.{}, .is_complex = false, .npoints = 1, .data = &.{} } };
+    try validatePlot(.binary, empty);
+    for ([_]Format{ .ascii, .csv, .print }) |f| try t.expectError(error.DataLengthMismatch, validatePlot(f, empty));
+    try t.expectEqual(@as(usize, 0), empty.point(0).len);
     const long: [std.math.maxInt(u16) + 1]u8 = @splat('x');
     plot.title = &long;
     try validatePlot(.csv, plot);

@@ -30,7 +30,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -49,7 +48,7 @@ const Error = card_rows.Error;
 const Span = card_rows.Span;
 const Value = card_rows.Value;
 const Analysis = card_rows.Analysis;
-const isGround = netlist_view.isGround;
+const isGroundName = netlist_view.isGroundName;
 const cond = card_table.cond;
 
 pub const Entry = union(enum) { num: f64, text: []const u8 };
@@ -72,6 +71,10 @@ pub const Frame = struct {
     sub: ?u16 = null,
     /// Where this instance's rows start in `Reader.instance_models`.
     models_mark: u32 = 0,
+    /// The product of the `m=` of every enclosing X card whose subcircuit
+    /// declares no `m` parameter: the instance is that many parallel
+    /// copies, so `commit` multiplies it into each card here that takes m.
+    mult: f64 = 1,
 };
 
 /// How a parse reads its device cards. Every choice gives the same netlist,
@@ -199,14 +202,18 @@ pub fn resolve(a: *Analysis, lookup: anytype) void {
         a.pos = 0;
         for (a.args[0..a.args.len -| 1], 1..) |v, i| if (v == .name and std.ascii.eqlIgnoreCase(v.name, "localgnd")) {
             const n = nodeText(a.args[i], &buf) orelse continue;
-            a.pos = if (isGround(a.dialect, n)) 0 else lookup.node(n);
+            a.pos = if (isGroundName(n)) 0 else lookup.node(n);
         };
     }
+    // ngspice's `.pss` names its oscillator node bare, third (inp2dot.c:676).
+    if (a.ngspicePss()) if (nodeText(a.args[2], &buf)) |n| {
+        a.pos = if (isGroundName(n)) 0 else lookup.node(n);
+    };
     if (a.kind != .pz) return;
     for (&a.ports, 0..) |*id, i| {
         if (i >= a.args.len) break;
         const port = nodeText(a.args[i], &buf) orelse continue;
-        id.* = if (isGround(a.dialect, port)) 0 else lookup.node(port);
+        id.* = if (isGroundName(port)) 0 else lookup.node(port);
     }
 }
 

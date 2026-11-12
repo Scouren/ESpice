@@ -6,7 +6,7 @@
 //! Contents:
 //! - `pub const session`, `ExecutionConfig`, `Knobs`, `validateBackend`, `batchWidth`
 //! - `pub const ThreadPool`, `Threads`, `WsPool`, `GpuDriver`, `gpu_available`
-//! - `pub const gpu_lanes`, `driver_test_hooks`, `machine`, `Machine`, `schemaOf`, `mosra`
+//! - `pub const gpu_lanes`, `driver_test_hooks`, `machine`, `Machine`, `schemaOf`, `mosra`, `calibrate`
 
 /// The query graph and its scheduler (`Session`).
 pub const session = @import("session.zig");
@@ -41,6 +41,8 @@ pub const driver_test_hooks = @import("gpu/driver.zig").test_hooks;
 pub const machine = @import("machine.zig");
 /// One parsed calibration (`ExecutionConfig.machine`).
 pub const Machine = @import("machine.zig").Machine;
+/// `espice calibrate`'s measurements (`gpu/calibrate.zig`).
+pub const calibrate = @import("gpu/calibrate.zig");
 /// HSPICE MOSRA level 1 aging over a stress transient.
 pub const mosra = @import("post/mosra.zig");
 /// The result shape of a query, without running it.
@@ -54,15 +56,19 @@ test {
     if (!@import("builtin").single_threaded) _ = @import("tests/executor.zig");
     _ = @import("tests/four.zig");
     _ = @import("tests/gpu.zig");
+    _ = @import("tests/ladder_steps.zig");
     _ = @import("gpu/periodic.zig");
     _ = @import("gpu/lane_color.zig");
     _ = @import("gpu/devices.zig");
     _ = @import("gpu/price.zig");
     _ = @import("machine.zig");
     _ = @import("gpu/context_cost.zig");
+    _ = @import("price.zig");
+    _ = @import("gpu/calibrate.zig");
     _ = @import("tests/periodic.zig");
     _ = @import("tests/pz.zig");
     _ = @import("tests/session.zig");
+    _ = @import("tests/dc_segments.zig");
     _ = @import("tests/sweep.zig");
     _ = @import("tests/transient.zig");
     _ = @import("tests/integration.zig");
@@ -77,6 +83,7 @@ test {
     _ = @import("ac/lstb.zig");
     _ = @import("ac/sp.zig");
     _ = @import("ac/acmatch.zig");
+    _ = @import("ac/sens_ac.zig");
     _ = @import("eigen/pz.zig");
     _ = @import("post/disto.zig");
     _ = @import("post/fft.zig");

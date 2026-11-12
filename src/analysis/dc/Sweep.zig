@@ -7,12 +7,15 @@
 //! In: a run context and `.dc` options. Out: the point-major result table
 //! (sweep value, probes...), outer blocks concatenated, then one block per
 //! `tangents` variant row.
+//! A segment of a split sweep (`Options.lane`, dc/segments.zig) runs its
+//! points alone, from a cold start, and keeps its first and last full
+//! solutions for the seam test (`RunCtx.seam`).
 //! Cites ngspice dctrcurv.c (predictor, state rotation at :290 and
 //! :457-462, accumulated steps at :469) and DCTsetup;
 //! dev/analysis/dc-sweep.md and dev/analysis/optimize.md (tangent rows).
 //!
 //! Contents:
-//! - fields (`ctx`, `ckt`, `opts`, `t`, `saved`, `t2`, `saved2`, `sweeps_temp`, `temp_c`, `n_inner`, `n_outer`, `ncols`, `data`, `hist`, `force`, `ws`, `block_index`, `cold`, `v`, `v2`, `currents`)
+//! - fields (`ctx`, `ckt`, `opts`, `t`, `saved`, `t2`, `saved2`, `sweeps_temp`, `temp_c`, `first`, `n_inner`, `n_outer`, `ncols`, `data`, `hist`, `force`, `ws`, `block_index`, `cold`, `v`, `v2`, `currents`)
 //! - `pub fn init(s: *Sweep, ctx: *const RunCtx, opts: Options) !void`
 //! - `pub fn deinit(s: *Sweep) void`
 //! - `pub fn take(s: *Sweep) Allocator.Error!Result`
@@ -43,6 +46,9 @@ t2: ?root.ParamRef = null,
 saved2: f64 = 0,
 sweeps_temp: bool,
 temp_c: f32,
+/// The whole sweep's index of the first inner point this run solves: a
+/// segment's (`Options.segment`), else 0.
+first: usize,
 n_inner: usize,
 n_outer: usize,
 ncols: usize,
@@ -79,6 +85,9 @@ pub fn init(s: *Sweep, ctx: *const root.RunCtx, opts: Options) !void {
     // V and an I card (their per-type indices overlap) and lets the sweep
     // name a resistor.
     const t = try targetRef(ckt, opts.target);
+    const whole = if (opts.points.len > 0) opts.points.len else sweepCount(opts.start, opts.stop, opts.step);
+    const part: Options.Segment = if (opts.lane) |l| unsplit(opts).segment(l) else .{ .first = 0, .len = whole };
+    assert(part.first + part.len <= whole);
     // A temperature sweep at either level writes every Model row's
     // temperature; `deinit` puts the netlist's back.
     s.* = .{
@@ -89,7 +98,8 @@ pub fn init(s: *Sweep, ctx: *const root.RunCtx, opts: Options) !void {
         .saved = if (t) |r| r.get() else 0,
         .sweeps_temp = opts.target == .temp or (opts.hasOuter() and opts.target2.? == .temp),
         .temp_c = ckt.temp_c,
-        .n_inner = if (opts.points.len > 0) opts.points.len else sweepCount(opts.start, opts.stop, opts.step),
+        .first = part.first,
+        .n_inner = part.len,
         .n_outer = if (!opts.hasOuter()) 1 else if (opts.points2.len > 0) opts.points2.len else sweepCount(opts.start2, opts.stop2, opts.step2),
         .ncols = ctx.probes.len + 1,
         .data = &.{},
@@ -125,7 +135,7 @@ pub fn init(s: *Sweep, ctx: *const root.RunCtx, opts: Options) !void {
 /// too unless `take` moved it out.
 pub fn deinit(s: *Sweep) void {
     if (s.t2) |r| r.set(s.saved2);
-    if (s.sweeps_temp) s.ckt.setCircuitTemp(s.temp_c);
+    if (s.sweeps_temp) s.ckt.setCircuitTemp(s.temp_c) catch |e| std.log.warn("dc: restoring the parameters that read temper failed: {s}", .{@errorName(e)});
     if (s.t) |r| r.set(s.saved);
     // The original values were installed by this circuit once, so they cannot re-wire it.
     s.ckt.recompute() catch unreachable;
@@ -167,7 +177,7 @@ pub fn beginBlock(s: *Sweep, po: usize) !void {
     if (s.opts.hasOuter()) {
         if (po != 0) s.v2 += s.opts.step2;
         if (s.opts.points2.len > 0) s.v2 = s.opts.points2[po];
-        if (s.t2) |r| r.set(s.v2) else s.ckt.setCircuitTemp(@floatCast(s.v2));
+        if (s.t2) |r| r.set(s.v2) else try s.ckt.setCircuitTemp(@floatCast(s.v2));
     }
     s.block_index = po;
     // The pattern is frozen, so one workspace (one symbolic factorization)
@@ -175,6 +185,8 @@ pub fn beginBlock(s: *Sweep, po: usize) !void {
     s.ws = try s.ckt.workspace();
     s.cold = true;
     s.v = s.opts.start;
+    // A segment starts where the whole sweep's accumulated steps reach.
+    for (0..s.first) |_| s.v += s.opts.step;
 }
 
 /// Installs point `pt` of the block and writes its predictor into `sol()`;
@@ -187,8 +199,8 @@ pub fn beginPoint(s: *Sweep, pt: usize) !bool {
     if (pt != 0) try ckt.checkpoint(.{ .phase = .dc, .completed = pt, .total = s.n_inner });
     // Accumulated like ngspice (see `init`).
     if (pt != 0) s.v += opts.step;
-    if (opts.points.len > 0) s.v = opts.points[pt];
-    if (s.t) |r| r.set(s.v) else ckt.setCircuitTemp(@floatCast(s.v));
+    if (opts.points.len > 0) s.v = opts.points[s.first + pt];
+    if (s.t) |r| r.set(s.v) else try ckt.setCircuitTemp(@floatCast(s.v));
     // Only `t`'s device type moved, so later points re-derive just that type
     // (a full walk cost 1,811 BJT preamble runs on a one-instance deck).
     // Point 0 takes the full walk: an outer `.dc ... temp` loop may just have
@@ -238,6 +250,7 @@ pub fn endPoint(s: *Sweep, pt: usize, warm_converged: bool) !void {
         op.coldStart(ckt, x);
         converged = (try op.nodesetLadder(ckt, s.ws, x, .{ .tol = opts.tol }, s.force, 0)).converged;
     }
+    if (s.ctx.seam.len != 0) s.keepSeam(pt, converged);
     const at = s.block_index * s.n_inner + pt;
     const row = s.data[at * ncols ..][0..ncols];
     row[0] = s.v;
@@ -266,12 +279,31 @@ fn previous(s: *const Sweep) []f64 {
     return s.hist[s.ckt.n..][0..s.ckt.n];
 }
 
+/// `pt`'s full solution into its half of a segment's `RunCtx.seam` when it
+/// is the segment's first or last point, NaN when it did not converge.
+fn keepSeam(s: *const Sweep, pt: usize, converged: bool) void {
+    const n = s.ckt.n;
+    assert(s.ctx.seam.len == 2 * n);
+    assert(s.opts.lane != null);
+    for ([_]usize{ 0, s.n_inner - 1 }, 0..) |end, half| if (pt == end) {
+        const dst = s.ctx.seam[half * n ..][0..n];
+        if (converged) @memcpy(dst, s.sol()) else @memset(dst, std.math.nan(f64));
+    };
+}
+
+/// `opts` as the whole sweep, which its segment rows split.
+fn unsplit(opts: Options) Options {
+    var whole = opts;
+    whole.lane = null;
+    return whole;
+}
+
 /// Point `pt` of the current block is the deck's operating point: the first
-/// point of the first block, with every swept device value at its netlist
-/// value. Its cold ladder is then the OP prerequisite's own solve, whose
-/// answer is `ctx.x_op` (04 4.10).
+/// point of the whole sweep's first block, with every swept device value at
+/// its netlist value. Its cold ladder is then the OP prerequisite's own
+/// solve, whose answer is `ctx.x_op` (04 4.10).
 fn isOpPoint(s: *const Sweep, pt: usize) bool {
-    if (pt != 0 or s.block_index != 0 or s.t == null or s.v != s.saved) return false;
+    if (pt != 0 or s.first != 0 or s.block_index != 0 or s.t == null or s.v != s.saved) return false;
     if (s.opts.hasOuter() and (s.t2 == null or s.v2 != s.saved2)) return false;
     return s.ctx.x_op.len == s.ckt.n;
 }

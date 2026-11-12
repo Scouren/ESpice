@@ -1662,4 +1662,5 @@ test {
     _ = OrderTests;
     _ = TranTests;
     _ = TranNoiseTests;
+    _ = @import("transient_levers.zig");
 }

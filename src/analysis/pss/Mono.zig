@@ -147,17 +147,18 @@ pub fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void {
     const dt = opts.period / @as(f64, @floatFromInt(steps));
     for (0..steps + 1) |k| {
         const x = m.traj[k * (n + 1) + 1 ..][0..n];
+        // From the period's start; the sources see `t_origin` plus it.
         const t = if (k == 0) 0 else stepTime(opts, k - 1);
         const ft: []f64 = if (m.ft.len != 0 and k != 0) m.ft[(k - 1) * n ..][0..n] else &.{};
         if (ft.len != 0) {
             // f at t(1 + ε): the stretched period's step time.
-            const t_eps = t * (1 + opts.fd_epsilon);
+            const t_eps = opts.t_origin + t * (1 + opts.fd_epsilon);
             ckt.setSimState(.{ .t = t_eps, .dt = dt, .kind = .tran });
             ckt.eval(x, t_eps);
             @memcpy(ft, ckt.rhs[0..n]);
         }
-        ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
-        ckt.eval(x, t);
+        ckt.setSimState(.{ .t = opts.t_origin + t, .dt = dt, .kind = .tran });
+        ckt.eval(x, opts.t_origin + t);
         if (ft.len != 0) for (ft, ckt.rhs[0..n]) |*d, f| {
             d.* = (d.* - f) / opts.fd_epsilon;
         };

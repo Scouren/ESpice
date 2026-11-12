@@ -53,7 +53,7 @@ Set what you need, then call `espice_create`:
 |---|---|
 | `source_kind` | `ESPICE_FILE`: `source` is a path. `ESPICE_BYTES`: `source` is netlist text |
 | `source`, `origin` | the path or text; `origin` names the file relative includes resolve against |
-| `dialect` | `ESPICE_NGSPICE`, `ESPICE_HSPICE`, `ESPICE_SPECTRE` |
+| `dialect` | `ESPICE_NGSPICE` (0) only. Any other value fails with `UnsupportedDialect` (`ESPICE_INVALID_ARGUMENT`): translate an HSPICE, Spectre, LTspice, Xyce or VACASK deck with `spice2rack --dialect <d> --to espice --kit -o DIR DECK` first and pass the path it prints |
 | `backend`, `explicit_gpu` | `ESPICE_CPU`, `ESPICE_AUTO`, `ESPICE_CUDA`, `ESPICE_HIP`; `explicit_gpu = 1` is the CLI's `--gpu` |
 | `output_format`, `output_path` | write results to a file as the CLI's `--format` and `--rawfile` do; an empty path writes nothing |
 | `max_parallel` | queries that may run at once, as `--jobs` |
@@ -159,7 +159,7 @@ query appended afterwards; names you leave out keep their last values,
 and queries appended earlier keep the values they were appended with, so
 their results stay valid. Append the analyses again after each call.
 Their plots are named after the point, `Operating Point (wn=1, wp=2)`.
-Names match case-insensitively, except in the Spectre dialect.
+Names match case-insensitively.
 
 Nothing is parsed again. The point is evaluated from the prepared deck as a
 `.step` point is: usually a handful of parameter writes, sometimes a rebuild

@@ -69,7 +69,7 @@ pub fn concatenates(format: Format) bool {
 /// Asserts what the format's `encode` asserts: a plot that passed
 /// `validatePlot(format, plot)`.
 pub fn encode(w: *Io.Writer, format: Format, plot: Plot) Io.Writer.Error!void {
-    assert(plot.result.varnames.len > 0);
+    assert(plot.result.varnames.len > 0 or format == .binary);
     return switch (format) {
         .binary => @import("rawfile.zig").encode(w, plot),
         .ascii => @import("ascii_raw.zig").encode(w, plot),

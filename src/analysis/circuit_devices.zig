@@ -22,10 +22,12 @@
 //! - `pub fn commitStates(self: *const Circuit, x: []const f64) ?f64`
 //! - `pub fn stateCtl(self: *Circuit, sop: StateCtlOp) bool`
 //! - `pub fn minDelay`, `pub fn boundStep`, `pub fn nextBreakpoint`
-//! - `pub fn setCircuitTemp(self: *Circuit, temp_c: f32) void`
+//! - `pub fn setCircuitTemp(self: *Circuit, temp_c: f32) !void`
 //! - `pub fn setHomotopy(self: *Circuit, gmin: f64, source_scale: f64) void`
 //! - `pub fn paramsMoved(self: *Circuit) void`
 //! - `pub fn setBypass(self: *Circuit, tol: ?BypassTol) void`
+//! - `pub fn setChargeTracking(self: *Circuit, on: bool) void`
+//! - `pub fn settleLaneLoan(self: *Circuit, slv: *const direct.Solver) void`
 //! - `pub fn setSimState(self: *Circuit, st: SimState) void`
 //! - `pub fn recompute(self: *Circuit) error{TopologyChanged}!void`
 //! - `pub fn recomputeType(self: *Circuit, t: DeviceType) error{TopologyChanged}!void`
@@ -38,6 +40,8 @@ const abi = @import("device").abi;
 const Circuit = @import("Circuit.zig").Circuit;
 const Display = @import("Circuit.zig").Display;
 const par_eval = @import("par_eval.zig");
+const direct = @import("solver").direct;
+const Temper = @import("core").Temper;
 
 /// Tells the circuit that the next `applyLimits` or `stateCtl(.query)` is
 /// followed by `eval` (or, with `charge`, `evalQ`) at `x` and `t`, with
@@ -209,11 +213,15 @@ pub fn nextBreakpoint(self: *const Circuit, t: f64) ?f64 {
     return if (best == std.math.inf(f64)) null else best;
 }
 
-/// Installs a circuit temperature in degrees Celsius. Call `recompute`
-/// before solving, which also detects a temperature-driven topology change.
-pub fn setCircuitTemp(self: *Circuit, temp_c: f32) void {
+/// Installs a circuit temperature in degrees Celsius, and the parameters
+/// whose card value reads `temper` at it (`Circuit.temper`, ngspice
+/// inp_evaluate_temper). Call `recompute` before solving, which re-derives
+/// the devices from both and detects a temperature-driven topology change.
+/// Fails only when the parameter writes cannot allocate.
+pub fn setCircuitTemp(self: *Circuit, temp_c: f32) !void {
     self.temp_c = temp_c;
     self.lin.valid = false;
+    if (self.temper) |t| try writeTemper(self, t, temp_c);
     for (self.batches) |b| if (b.hooks.set_temp) |f| f(b.ctx, temp_c);
     markGpuDirty(self);
 }
@@ -246,6 +254,37 @@ pub fn paramsMoved(self: *Circuit) void {
 pub fn setBypass(self: *Circuit, tol: ?abi.BypassTol) void {
     self.bypass_tol = tol;
     for (self.batches) |b| if (b.hooks.set_bypass) |f| f(b.ctx, tol);
+}
+
+/// Turns N3's charge tracking (`Hooks.track_charges`) on or off on every
+/// batch with charge. Off, the default, every pass is today's and
+/// `charges_clean` answers false, so `acceptStates` never stages. The
+/// transient turns it on for its host run (`Sim.init`) and off again
+/// (`Sim.deinit`). An attached ParEval tracks its passes too
+/// (`ParEval.setTracking`), which needs its N3 tables.
+pub fn setChargeTracking(self: *Circuit, on: bool) void {
+    assert(!on or self.knobs.perf.n3);
+    assert(!on or self.gpuContext() == null);
+    for (self.batches) |b| if (b.hooks.track_charges) |f| f(b.ctx, on);
+    if (self.par_eval) |p| p.setTracking(on);
+}
+
+/// C6 step 1 (#253): once the LU has judged a pivot epoch
+/// (`direct.Solver.admitted_lanes`), gives the lanes of `lane_loan` past
+/// that width back to its pool, lowers `lu_threads` to match and drops the
+/// loan; a no-op until then. Bitwise either way: every refactor width is
+/// its one-thread form. Asserts a loan.
+pub fn settleLaneLoan(self: *Circuit, slv: *const direct.Solver) void {
+    const loan = self.lane_loan.?;
+    const admitted = slv.admitted_lanes;
+    if (admitted == 0) return;
+    const held = loan.held.*;
+    const keep = @min(admitted - 1, held);
+    loan.pool.give(held - keep);
+    loan.held.* = keep;
+    self.solver_execution.lu_threads = @intCast(keep + 1);
+    self.lane_loan = null;
+    assert(keep <= held);
 }
 
 /// Publishes the analysis state (`$abstime`, timestep, `analysis()`,
@@ -331,11 +370,13 @@ fn acceptStates(self: *Circuit, x: []const f64) ?f64 {
         return tr;
     };
     if (self.gpuContext() != null or self.par_eval != null) {
+        if (self.knobs.perf.n3) if (parStaged(self, x)) |tr| return tr;
         self.evalQ(x, self.sim.t);
         const tr = if (self.gpuContext()) |g| g.updateStates(x, self.sim) else hostUpdate(self, x);
         self.q_fresh = true;
         return tr;
     }
+    if (self.knobs.perf.n3) if (acceptStaged(self, x)) |tr| return tr;
     self.lin.valid = false;
     self.clearPlanes(.charge);
     const pl = self.ownPlanes();
@@ -354,10 +395,92 @@ fn acceptStates(self: *Circuit, x: []const f64) ?f64 {
     return min_reject;
 }
 
+/// N3 (docs/perf_research/09-after-the-levers.md): the serial accept pass
+/// without its charge evaluation. `x` is the iterate Newton's last assemble
+/// ran at (`converger.finalizeStep` stages `x_old`), so when every charge
+/// batch's last pass is clean (`chargesClean`) the planes and tapes already
+/// hold `evalQ(x)`'s bits; only the state halves run, `update_range` where
+/// the batch fuses them (`accept_q` never calls `update_done`) and
+/// `update_state` elsewhere, in batch order as the loop below. Null takes
+/// today's pass: a dirty batch, `-Dcertify` (its re-assemble restores
+/// the planes, not the tapes) or a JFNK pin (its last eval is a matvec).
+fn acceptStaged(self: *Circuit, x: []const f64) ??f64 {
+    assert(self.gpuContext() == null and self.par_eval == null);
+    assert(self.has_charge);
+    if (!stagingAllowed(self)) return null;
+    for (self.batches) |b| {
+        if (b.has_charge and !chargesClean(b)) return null;
+        if (b.hooks.accept_q != null and b.hooks.update_range == null) return null;
+    }
+    self.lin.valid = false;
+    var min_reject: ?f64 = null;
+    for (self.batches) |b| {
+        const tr = if (b.hooks.accept_q != null)
+            b.hooks.update_range.?(b.ctx, x, 0, b.count)
+        else if (b.hooks.update_state) |f| f(b.ctx, x) else null;
+        if (tr) |r| min_reject = if (min_reject) |cur| @min(cur, r) else r;
+    }
+    self.q_fresh = true;
+    return min_reject;
+}
+
+/// N3 over ParEval's lanes: `acceptStaged`'s rule, with today's threaded
+/// state pass (`hostUpdate`) for the state halves. A charge batch is clean
+/// when its own `charges_clean` holds and every one of its ranges in the
+/// last threaded pass was (`ParEval.chargesClean`, the conjunction lane 0
+/// folds in chunk order after the pass). Null takes today's two passes.
+fn parStaged(self: *Circuit, x: []const f64) ??f64 {
+    if (self.gpuContext() != null) return null;
+    const p = self.par_eval.?;
+    assert(self.has_charge);
+    if (!stagingAllowed(self)) return null;
+    for (self.batches, 0..) |b, bi| {
+        if (b.has_charge and !(chargesClean(b) and p.chargesClean(bi))) return null;
+    }
+    self.lin.valid = false;
+    const tr = hostUpdate(self, x);
+    self.q_fresh = true;
+    return tr;
+}
+
+/// Whether the last Newton eval can stand for the accept pass's charges:
+/// not under `-Dcertify` (its re-assemble restores the planes, not the
+/// tapes) nor a JFNK pin (its last eval is a matvec).
+fn stagingAllowed(self: *const Circuit) bool {
+    if (comptime Circuit.certify) return false;
+    return switch (self.knobs.newton.pin) {
+        .auto, .direct => true,
+        else => false,
+    };
+}
+
+/// Whether batch `b`'s last host pass left `eval_q`'s charges in the planes
+/// and its tape: false while tracking is off (`setChargeTracking`).
+fn chargesClean(b: abi.Batch) bool {
+    const f = b.hooks.charges_clean orelse return false;
+    return f(b.ctx);
+}
+
 /// Copies `sim` into every batch (`Batch.publishSim`): a store each, a
 /// call for a bypassable type.
 fn publishSim(self: *const Circuit) void {
     for (self.batches) |b| b.publishSim(self.sim);
+}
+
+/// Writes each of `t`'s expressions, evaluated at `temp_c`, to its
+/// parameters, through `setParams` so instances keep sharing the Model rows
+/// every reader receives alike. Re-derives nothing: `setCircuitTemp`'s
+/// caller recomputes.
+fn writeTemper(self: *Circuit, t: Temper, temp_c: f32) !void {
+    assert(t.starts[0] == 0);
+    const values = try self.gpa.alloc(f64, t.refs.len);
+    defer self.gpa.free(values);
+    for (0..t.count()) |k| {
+        assert(t.starts[k] <= t.starts[k + 1]);
+        @memset(values[t.starts[k]..t.starts[k + 1]], try t.eval(t.ctx, @intCast(k), temp_c));
+    }
+    try self.setParams(t.refs, values, false);
+    paramsMoved(self);
 }
 
 fn markGpuDirty(self: *Circuit) void {

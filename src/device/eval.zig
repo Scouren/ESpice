@@ -114,6 +114,13 @@ pub const test_access = if (builtin.is_test) .{
     .spicePwlBreak = breakpoints.spicePwlBreak,
     .ParamRef = abi.ParamRef,
     .PatternView = abi.PatternView,
+    .bypass_models = traits.bypass_models,
+    .bypass_models_c4 = traits.bypass_models_c4,
+    .baseName = traits.baseName,
+    .charge_only = traits.charge_only,
+    .chargeOnlyFields = traits.chargeOnlyFields,
+    .Census = @import("batch_census.zig").Census,
+    .traits = traits,
 } else {};
 
 // As the build root, export every model in `models`: its GPU kernels (or a

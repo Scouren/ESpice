@@ -5,9 +5,9 @@
 //!
 //! Contents:
 //! - `pub fn sourceDc(dev: Device) ?f64`
-//! - `pub fn isPortCard(dev: Device) bool`
 //! - `pub fn sourcePort(dev: Device) !?struct { num: u16, z0: f64, band: requests.Port.Band }`
-//! - `pub fn sourceAc(dev: Device) ?struct { re: f64, im: f64 }`
+//! - `pub const SourceAc = struct`
+//! - `pub fn sourceAc(dev: Device) ?SourceAc`
 //! - `pub fn sourceDisto(dev: Device, key: []const u8) [2]f64`
 //! - `pub fn finiteLineCoefficients(value: anytype) bool`
 //! - `pub fn cplVector(kv: []const Kv, key: []const u8, out: []f64) !usize`
@@ -16,6 +16,11 @@
 //! - `pub fn numericParameter(kv: []const Kv, key: []const u8) !?f64`
 //! - `pub fn applyKv(target: anytype, kv: []const Kv) !void`
 //! - `pub fn bindKv(bind: *const fn ([*]u8, []const batch.Param) batch.BindStatus, blob: [*]u8, kv: []const Kv) !void`
+//! - `pub fn ignoredKeys(arena: std.mem.Allocator, comptime T: type, kv: []const Kv) ![]const []const u8`
+//! - `pub const NgspiceKey`
+//! - `pub const ngspice_model_keys: []const u8`
+//! - `pub fn checkModelKeys(arena: std.mem.Allocator, comptime T: type, model: ?[]const u8, card: []const u8, kv: []const Kv) ![]const []const u8`
+//! - `pub fn ngspiceKey(model: []const u8, key: []const u8) ?NgspiceKey`
 //! - `pub fn copyNames(arena: std.mem.Allocator, names: []const []const u8) ![]const []const u8`
 //! - `pub fn kvNumber(kv: []const Kv, key: []const u8) ?f64`
 //! - `pub fn resistanceFloor(r: f64) f64`
@@ -47,53 +52,91 @@ const Proto = batch.Proto;
 
 const net_devices = @import("net_devices.zig");
 
-/// A source card's DC value: `dc=`, `DC v`, `DC(v)` or the first bare
-/// number not owed to AC/DISTOF. Null when the card gives none.
+/// A source's AC excitation (`sourceAc`): re + j·im, and `unit`, its
+/// derivative in the magnitude.
+pub const SourceAc = struct { re: f64, im: f64, unit: [2]f64 };
+
+/// What ngspice does with one `.model` key of one device: a row of
+/// ngspice_model_keys.tsv.
+pub const NgspiceKey = struct {
+    /// The values at which ngspice computes what it computes with the key
+    /// absent: none known, one (`at`), or `any`: a key nothing reads, only a
+    /// SOA warning reads, only self-heating behind a thermal node or flag
+    /// the builder refuses reads, or the builder applies itself.
+    inert: union(enum) { none, at: f64, any },
+    /// True when only ngspice's noise analysis reads the key.
+    noise_only: bool,
+    /// ngspice's description of the key: the physics it sets.
+    what: []const u8,
+};
+
+/// Per ESPice catalog model, one row per key an ngspice `.model` card of
+/// that device sets (its model and instance IFparm tables,
+/// inpgmod.c:131-160): model, key, inert value (`-` none, `*` any),
+/// `noise` or `-`, and ngspice's description. Generated from ngspice-45 by
+/// tools/ngspice_model_keys.py, whose doc says how each column is read off
+/// the source. ngspice 44.2 takes every key but ngspice-45's additions:
+/// diode isw nz perim tbv1 vjsw, bsimsoi ddmod noimod, hisim2 lpgd3 pgd3
+/// ppgd3 wpgd3, mes ic.
+pub const ngspice_model_keys: []const u8 = @embedFile("ngspice_model_keys.tsv");
+
+/// Model card keys the frontend reads itself rather than binding: LEVEL and
+/// SWNQS pick the device (`resolveDeviceId`), LMIN..WMAX and WNFLAG pick the
+/// bin (card_table.zig, reader_models.zig), the rest are prepared_soa.zig's
+/// SOA limits. M, like LEVEL, ngspice skips on a model card with no word
+/// (inpgmod.c:139-143).
+const read_by_builder = std.StaticStringMap(void).initComptime(.{
+    .{"level"},   .{"m"},       .{"swnqs"},   .{"lmin"},    .{"lmax"},    .{"wmin"},
+    .{"wmax"},    .{"wnflag"},  .{"vgs_max"}, .{"vgd_max"}, .{"vgb_max"}, .{"vds_max"},
+    .{"vbs_max"}, .{"vbd_max"}, .{"vbe_max"}, .{"vbc_max"}, .{"vce_max"}, .{"bv_max"},
+});
+
+/// Model card keys net_passive.addPassive reads itself for an R, C or L
+/// card (res.c, cap.c and ind.c spellings no .va declares), per type so a
+/// MOS card's stray `l=` still warns.
+const read_by_passive = .{
+    .{ devices.resistor, &[_][]const u8{ "rsh", "narrow", "dw", "short", "dlr", "defw", "w", "l", "res" } },
+    .{ devices.capacitor, &[_][]const u8{ "cap", "cj", "cox", "cjsw", "capsw", "defw", "w", "defl", "l", "narrow", "short", "del", "di", "thick" } },
+    .{ devices.inductor, &[_][]const u8{ "ind", "csect", "dia", "length", "nt", "mu" } },
+};
+
+/// A source card's DC value as ngspice-44.2 sets it (inp2v.c, inp2i.c):
+/// a bare number straight after the nodes, over every keyword; else the
+/// last `DC v`, `DC(v)`, `dc=v` or, on an I card, `c=v` (isrc.c's second
+/// name for `dc`). Null when the card gives none. Measured into 1k: `v1 a
+/// 0 1 dc=3` is 1 V, `dc 2 dc 3` is 3 V, `i1 0 a dc=3m c=2m` is 2 V, and
+/// no other bare number is DC: `v1 a 0 3 ac 1` is 3 V, while `pulse(...)
+/// 3`, `ac 1 3`, `pwl(...) r 0` and `td 1n` hold 0, and `portnum 1 z0 50
+/// 3` stops the deck. The parser keeps no order between `DC v` and
+/// `dc=v`; `net_waves.refuseUnknownKey` refuses a card with both.
 pub fn sourceDc(dev: Device) ?f64 {
-    if (kvNumber(dev.kv, "dc")) |dc| return dc;
-    // Numbers still owed to a preceding AC/DISTOF keyword (mag [phase]).
-    var skip: usize = 0;
+    if (dev.positional.len > 0 and dev.positional[0] == .num) return dev.positional[0].num;
+    var dc: ?f64 = null;
     for (dev.positional, 0..) |pos, idx| switch (pos) {
-        .num => |n| {
-            if (skip > 0) {
-                skip -= 1;
-                continue;
-            }
-            return n;
-        },
         .group => |group| {
             if (std.mem.eql(u8, group.name(), "dc") and group.args().len > 0)
-                return group.args()[0].number() orelse 0;
+                dc = group.args()[0].number() orelse 0;
         },
-        .name => |name| {
-            if (std.mem.eql(u8, name, "dc")) {
-                if (Value.numberAt(dev.positional, idx + 1)) |dc| return dc;
-            } else if (std.mem.eql(u8, name, "ac") or
-                std.mem.eql(u8, name, "distof1") or std.mem.eql(u8, name, "distof2"))
-            {
-                skip = 2;
-            }
+        .name => |name| if (std.mem.eql(u8, name, "dc")) {
+            dc = Value.numberAt(dev.positional, idx + 1) orelse dc;
         },
         else => {},
     };
-    return null;
+    for (dev.kv) |item| if (std.mem.eql(u8, item.key, "dc") or std.mem.eql(u8, item.key, "c")) {
+        dc = item.value.number() orelse dc;
+    };
+    return dc;
 }
 
-/// An HSPICE P card, which the reader turns into a V card (netlist.zig
-/// readDevice): kind `v` under a leaf name that starts with `p`.
-pub fn isPortCard(dev: Device) bool {
-    const leaf = dev.name[if (std.mem.lastIndexOfScalar(u8, dev.name, '.')) |i| i + 1 else 0..];
-    return dev.kind == 'v' and leaf.len > 0 and std.ascii.toLower(leaf[0]) == 'p';
-}
-
-/// The RF port of a V card (`VP1 in 0 DC 0 AC 1 portnum 1 z0 50`, or an
-/// HSPICE P card's `port=1`), null when `portnum` is not given (ngspice
-/// vsrctemp.c:74-82). `z0` defaults to 50 ohm.
-/// Both `portnum 1` and `portnum=1` are accepted. A given `portnum` outside
-/// 1..1024 or a non-positive `z0` is an error, not a plain source.
+/// The RF port of a V card (`VP1 in 0 DC 0 AC 1 portnum 1 z0 50`), null
+/// when `portnum` is not given (ngspice vsrctemp.c:74-82). `z0` defaults
+/// to 50 ohm. Both `portnum 1` and `portnum=1` are accepted. A given
+/// `portnum` outside 1..1024 or a non-positive `z0` is an error, not a
+/// plain source. `hblin_h=` and `hblin_s=` (ESPice's) name the port's
+/// `.hblin` sideband.
 pub fn sourcePort(dev: Device) !?struct { num: u16, z0: f64, band: requests.Port.Band } {
     const num_f = blk: {
-        if (kvNumber(dev.kv, "portnum") orelse kvNumber(dev.kv, "port")) |v| break :blk v;
+        if (kvNumber(dev.kv, "portnum")) |v| break :blk v;
         for (dev.positional, 0..) |pos, idx| {
             if (pos != .name or !std.mem.eql(u8, pos.name, "portnum")) continue;
             break :blk Value.numberAt(dev.positional, idx + 1) orelse return null;
@@ -116,15 +159,26 @@ pub fn sourcePort(dev: Device) !?struct { num: u16, z0: f64, band: requests.Port
 }
 
 /// The `AC` spec of a source card as its complex excitation
-/// mag * e^(j*phase*pi/180); null when the card names no `AC`, so an .ac run
-/// does not drive it (ngspice vsrcacld.c:171, isrcacld.c:36). Bare `AC` is
-/// mag 1 phase 0 and `AC mag` is phase 0 (vsrcpar.c:59-72, vsrctemp.c:38-43).
-/// Phase is in degrees.
-pub fn sourceAc(dev: Device) ?struct { re: f64, im: f64 } {
+/// mag * e^(j*phase*pi/180) and its derivative in mag, `unit`; null when the
+/// card names no `AC`, so an .ac run does not drive it (ngspice
+/// vsrcacld.c:171, isrcacld.c:36). Bare `AC` is mag 1 phase 0 and `AC mag`
+/// is phase 0 (vsrcpar.c:59-72, vsrctemp.c:38-43); the keyword forms
+/// `ac=mag`, `acmag=` and `acphase=` are vsrc.c's and isrc.c's "ac",
+/// "acmag" and "acphase" parameters (sens-ac-1.sp's `ac=42mA`). Phase is
+/// in degrees.
+pub fn sourceAc(dev: Device) ?SourceAc {
     var mag: f64 = 1;
     var phase: f64 = 0;
     var given = false;
-    for (dev.positional, 0..) |pos, idx| {
+    if (kvNumber(dev.kv, "ac") orelse kvNumber(dev.kv, "acmag")) |m| {
+        mag = m;
+        given = true;
+    }
+    if (kvNumber(dev.kv, "acphase")) |p| {
+        phase = p;
+        given = true;
+    }
+    if (!given) for (dev.positional, 0..) |pos, idx| {
         switch (pos) {
             // `AC 1 SIN 0 1 1k`: numberAt returns null on the next
             // keyword, so the trailing waveform never reads as a phase.
@@ -144,10 +198,11 @@ pub fn sourceAc(dev: Device) ?struct { re: f64, im: f64 } {
         }
         given = true;
         break;
-    }
+    };
     if (!given) return null;
     const rad = phase * (std.math.pi / 180.0);
-    return .{ .re = mag * @cos(rad), .im = mag * @sin(rad) };
+    const unit = [2]f64{ @cos(rad), @sin(rad) };
+    return .{ .re = mag * unit[0], .im = mag * unit[1], .unit = unit };
 }
 
 /// `DISTOF1 [mag [phase]]` or `DISTOF2 ...` (`key`) on a source card
@@ -203,7 +258,7 @@ pub fn cplVector(kv: []const Kv, key: []const u8, out: []f64) !usize {
     return 0;
 }
 
-/// Logs why HSPICE element `dev` (`letter` W or S) is refused.
+/// Logs why element `dev` (card letter `letter`) is refused.
 pub fn refuse(dev: Device, letter: u8, why: []const u8) error{UnsupportedCard} {
     if (!@import("builtin").is_test) std.log.err("{c} element '{s}': {s}", .{ letter, dev.name, why });
     return error.UnsupportedCard;
@@ -248,6 +303,99 @@ pub fn bindKv(bind: *const fn ([*]u8, []const batch.Param) batch.BindStatus, blo
     try bind(blob, params).unwrap();
 }
 
+/// The keys of model card pairs `kv` that model type `T` does not bind and
+/// the builder does not read, in card order: what ngspice prints as
+/// "unrecognized parameter (key) - ignored" (inpgmod.c:189). The slice
+/// lives in `arena`.
+pub fn ignoredKeys(arena: std.mem.Allocator, comptime T: type, kv: []const Kv) ![]const []const u8 {
+    const params = try arena.alloc(batch.Param, kv.len);
+    for (kv, params) |item, *p| p.* = .{ .key = item.key, .value = null };
+    const known = try arena.alloc(bool, kv.len);
+    @memset(known, false);
+    batch.bind.markKnown(T, params, known);
+    const own: []const []const u8 = comptime blk: {
+        for (read_by_passive) |row| {
+            if (@hasDecl(row[0], "Model")) if (row[0].Model == T) break :blk row[1];
+        }
+        break :blk &.{};
+    };
+    var ignored: std.ArrayList([]const u8) = .empty;
+    for (kv, known) |item, hit| {
+        const passive = for (own) |key| {
+            if (std.mem.eql(u8, key, item.key)) break true;
+        } else false;
+        if (hit or passive or item.key.len == 0 or read_by_builder.has(item.key)) continue;
+        try ignored.append(arena, item.key);
+    }
+    return ignored.items;
+}
+
+/// Checks model card `card`'s pairs `kv` against model type `T`, by
+/// ngspice's tables for catalog model `model`, for each key `T` leaves
+/// unbound and the builder does not read:
+/// - a key ngspice also lacks logs ngspice's "unrecognized parameter (key)
+///   - ignored" (inpgmod.c:189) and runs;
+/// - a key at its inert value (`NgspiceKey.inert`: one value or any, or a
+///   bsim3 VERSION that picks bsim3.va's code) runs with no word:
+///   ngspice's answer is the same;
+/// - a noise-only key at any other value is returned, for the caller to
+///   record as a gap only a noise analysis refuses;
+/// - any other key logs what it sets, and the card fails with
+///   `UnmodelledParameter`: ESPice would give a wrong number with no error.
+/// `model` is null for an HDL module card, whose keys only warn. The
+/// returned keys live in `arena`.
+pub fn checkModelKeys(arena: std.mem.Allocator, comptime T: type, model: ?[]const u8, card: []const u8, kv: []const Kv) ![]const []const u8 {
+    const quiet = @import("builtin").is_test;
+    const m = model orelse "";
+    var refused = false;
+    var noise: std.ArrayList([]const u8) = .empty;
+    for (try ignoredKeys(arena, T, kv)) |key| {
+        const k = ngspiceKey(m, key) orelse {
+            if (!quiet) std.log.warn("model {s}: unrecognized parameter ({s}) - ignored", .{ card, key });
+            continue;
+        };
+        const value = kvNumber(kv, key);
+        const at_inert = switch (k.inert) {
+            .none => false,
+            .at => |i| if (value) |v| v == i else false,
+            .any => true,
+        };
+        if (at_inert or versionPicksModel(m, key, value)) continue;
+        if (k.noise_only) {
+            try noise.append(arena, key);
+            continue;
+        }
+        refused = true;
+        if (quiet) continue;
+        if (k.inert == .at)
+            std.log.err("model {s}: '{s}' ({s}) changes ngspice's answer and ESPice's {s} does not model it; only {s}={d} runs", .{ card, key, k.what, m, key, k.inert.at })
+        else
+            std.log.err("model {s}: '{s}' ({s}) changes ngspice's answer and ESPice's {s} does not model it", .{ card, key, k.what, m });
+    }
+    if (refused) return error.UnmodelledParameter;
+    return noise.items;
+}
+
+/// The ngspice_model_keys.tsv row of key `key` (lowercase) of ESPice catalog
+/// model `model`; null when ngspice's tables for it lack the key, and for a
+/// model ngspice has no built-in table for.
+pub fn ngspiceKey(model: []const u8, key: []const u8) ?NgspiceKey {
+    const table = ngspice_model_keys;
+    var buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\n{s}\t{s}\t", .{ model, key }) catch return null;
+    const at = std.mem.indexOf(u8, table, needle) orelse return null;
+    const end = std.mem.indexOfScalarPos(u8, table, at + 1, '\n') orelse table.len;
+    var cols = std.mem.splitScalar(u8, table[at + needle.len .. end], '\t');
+    const inert = cols.next().?;
+    const noise = cols.next().?;
+    return .{
+        // The generator writes `-`, `*` or a Python float repr.
+        .inert = if (std.mem.eql(u8, inert, "-")) .none else if (std.mem.eql(u8, inert, "*")) .any else .{ .at = std.fmt.parseFloat(f64, inert) catch unreachable },
+        .noise_only = std.mem.eql(u8, noise, "noise"),
+        .what = cols.rest(),
+    };
+}
+
 pub fn copyNames(arena: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
     const copied = try arena.alloc([]const u8, names.len);
     for (names, copied) |name, *copy| copy.* = try arena.dupe(u8, name);
@@ -267,3 +415,12 @@ pub fn resistanceFloor(r: f64) f64 {
 }
 
 // ---- private ----
+
+/// True when `key` is a bsim3 card's VERSION that picks the code bsim3.va
+/// is: ngspice runs BSIM3 3.3.0 for 3.3 and BSIM3v0/v1/v32 for 3.0-3.2
+/// (inpdomod.c:271-288). VERSION is a string field there, so the generated
+/// table has no inert value for it.
+fn versionPicksModel(model: []const u8, key: []const u8, value: ?f64) bool {
+    const v = value orelse return false;
+    return std.mem.eql(u8, model, "bsim3") and std.mem.eql(u8, key, "version") and v >= 3.3 and v < 3.4;
+}

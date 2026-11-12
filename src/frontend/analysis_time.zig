@@ -1,7 +1,8 @@
 //! Time-domain and DC cards to queries. In: one `.op`, `.tran`,
-//! `.trannoise`, `.matex`, `.dc`, `.four`, `.envelope`, `.mc` or `.temp`
+//! `.trannoise`, `.matex`, `.dc`, `.four`, `.envelope` or `.mc`
 //! card. Out: its query.
-//! Cites: ngspice dctran.c, traninit.c, dcop.c; HSPICE [CR] .OP, .TRAN, .DC.
+//! Cites: ngspice dctran.c, traninit.c, dcop.c; HSPICE [CR] .OP, .DC,
+//! .TRANNOISE.
 //!
 //! Contents:
 //! - `pub fn dcTarget(args: []const Value, i: usize, cards: []const requests.CardRef) !requests.Dc.SweepTarget`
@@ -15,7 +16,6 @@
 //! - `pub fn fourJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job`
 //! - `pub fn envelopeJob(a: netlist.Analysis) !Job`
 //! - `pub fn mcJob(a: netlist.Analysis) !Job`
-//! - `pub fn tempJob(a: netlist.Analysis) !?Job`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -34,9 +34,9 @@ const Library = @import("device").Library;
 const analysis_args = @import("analysis_args.zig");
 
 /// One `.dc` axis, read from `args[i.*..]` and `i` advanced past it:
-/// `start stop incr`, HSPICE `START= STOP= STEP=`, `LIN|DEC|OCT np start
-/// stop` or `POI np v1 ... vn` [CR .DC]. The typed grids become explicit
-/// `points`, allocated in `arena`.
+/// `start stop incr`, or ESPice's `LIN|DEC|OCT np start stop` or `POI np
+/// v1 ... vn` grids (no ngspice spelling) [CR .DC]. The typed grids become
+/// explicit `points`, allocated in `arena`.
 const Axis = struct { start: f64 = 0, stop: f64 = 0, step: f64 = 1, points: []const f64 = &.{} };
 
 /// The swept quantity of `.dc <card|TEMP> start stop step`, as the
@@ -183,7 +183,6 @@ pub fn tranJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job {
     const id = a.kind;
     const node_id = a.pos;
     const node_neg = a.neg;
-    if (id == .tran and a.dialect == .hspice) return .{ .tran = try hspiceTran(args) };
     if (id == .tran_noise and args.len > 0 and args[0] != .num) return .{ .tran_noise = try hspiceTranNoise(ctx, args, node_id, node_neg) };
     try analysis_args.arity(args, 2, if (id == .tran) 5 else 2);
     const step = try analysis_args.positive(args, 0);
@@ -191,7 +190,7 @@ pub fn tranJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job {
     if (id == .matex) return .{ .matex = .{ .t_stop = stop, .h_output_cap = step } };
     if (id == .tran_noise) return .{ .tran_noise = .{ .t_stop = stop, .dt_init = step, .dt_max = step } };
     var numeric_end = args.len;
-    const uic = analysis_args.hasUic(args);
+    const uic = Value.hasUic(args);
     if (uic) numeric_end -= 1;
     if (numeric_end > 4) return error.InvalidAnalysisArguments;
     // ngspice tstart: suppresses OUTPUT before it, never the solve.
@@ -206,6 +205,7 @@ pub fn dcJob(a: netlist.Analysis, cards: []const requests.CardRef, ctx: analysis
     var opts: requests.Dc = .{ .target = try dcTarget(args, 0, cards) };
     var i: usize = 1;
     const inner = try dcAxis(ctx.arena, args, &i);
+    if (!aboveAbsoluteZero(opts.target, inner)) return error.InvalidAnalysisArguments;
     opts.start = inner.start;
     opts.stop = inner.stop;
     opts.step = inner.step;
@@ -214,6 +214,7 @@ pub fn dcJob(a: netlist.Analysis, cards: []const requests.CardRef, ctx: analysis
         opts.target2 = try dcTarget(args, i, cards);
         i += 1;
         const outer = try dcAxis(ctx.arena, args, &i);
+        if (!aboveAbsoluteZero(opts.target2.?, outer)) return error.InvalidAnalysisArguments;
         opts.start2 = outer.start;
         opts.stop2 = outer.stop;
         opts.step2 = outer.step;
@@ -256,30 +257,11 @@ pub fn mcJob(a: netlist.Analysis) !Job {
     return .{ .mc = opts };
 }
 
-/// The `temp` card.
-pub fn tempJob(a: netlist.Analysis) !?Job {
-    const args = a.args;
-    // A single-temperature card is deck configuration.
-    if (args.len == 1) {
-        if (try analysis_args.number(args, 0) <= -273.15) return error.InvalidAnalysisArguments;
-        return null;
-    }
-    try analysis_args.arity(args, 3, 3);
-    const opts: requests.Temp = .{ .t_start = try analysis_args.number(args, 0), .t_stop = try analysis_args.number(args, 1), .t_step = try analysis_args.number(args, 2) };
-    try analysis_args.checkStep(opts.t_start, opts.t_stop, opts.t_step);
-    if (opts.t_step <= 0 or (opts.t_stop - opts.t_start) / opts.t_step >= std.math.maxInt(u32) or
-        @min(opts.t_start, opts.t_stop) <= -273.15) return error.InvalidAnalysisArguments;
-    return .{ .temp = opts };
-}
-
 // ---- private ----
 
 fn dcAxis(arena: std.mem.Allocator, args: []const Value, i: *usize) !Axis {
-    const Word = enum { lin, dec, oct, poi, start, stop, step };
-    const words = std.StaticStringMap(Word).initComptime(.{
-        .{ "lin", .lin },     .{ "dec", .dec },   .{ "oct", .oct },   .{ "poi", .poi },
-        .{ "start", .start }, .{ "stop", .stop }, .{ "step", .step },
-    });
+    const Word = enum { lin, dec, oct, poi };
+    const words = std.StaticStringMap(Word).initComptime(.{ .{ "lin", .lin }, .{ "dec", .dec }, .{ "oct", .oct }, .{ "poi", .poi } });
     const wordAt = struct {
         fn f(a: []const Value, at: usize) ?Word {
             var lower: [8]u8 = undefined;
@@ -295,21 +277,6 @@ fn dcAxis(arena: std.mem.Allocator, args: []const Value, i: *usize) !Axis {
         i.* += 3;
         return axis;
     }) {
-        .start, .stop, .step => {
-            var seen: u3 = 0;
-            while (wordAt(args, i.*)) |key| : (i.* += 2) {
-                const v = try analysis_args.number(args, i.* + 1);
-                switch (key) {
-                    .start => axis.start = v,
-                    .stop => axis.stop = v,
-                    .step => axis.step = v,
-                    else => return error.InvalidAnalysisArguments,
-                }
-                seen |= @as(u3, 1) << @intCast(@backingInt(key) - @backingInt(Word.start));
-            }
-            if (seen != 0b111) return error.InvalidAnalysisArguments;
-            try analysis_args.checkStep(axis.start, axis.stop, axis.step);
-        },
         .poi => {
             const n = try analysis_args.count(u32, args, i.* + 1, 0);
             if (n == 0 or args.len < i.* + 2 + n) return error.InvalidAnalysisArguments;
@@ -342,57 +309,6 @@ fn dcAxis(arena: std.mem.Allocator, args: []const Value, i: *usize) !Axis {
         axis.stop = axis.points[axis.points.len - 1];
     }
     return axis;
-}
-
-/// HSPICE `.tran tstep1 tstop1 [tstep2 tstop2 ...] [START=t] [UIC]` [CR
-/// .TRAN]: one run to the last tstop. A double-point card whose tstep2 and
-/// tstop2 are both below tstop1, with no START=, is the SPICE form
-/// `tstep tstop tstart delmax`, as is a three-number card.
-fn hspiceTran(args: []const Value) !requests.Tran {
-    var nums: [32]f64 = undefined;
-    var n: usize = 0;
-    var start: ?f64 = null;
-    var uic = false;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        var lower: [8]u8 = undefined;
-        switch (args[i]) {
-            .num => |v| {
-                if (n == nums.len or !std.math.isFinite(v)) return error.InvalidAnalysisArguments;
-                nums[n] = v;
-                n += 1;
-            },
-            .name => {
-                const word = try analysis_args.keyword(args, i, &lower);
-                if (std.mem.eql(u8, word, "uic")) {
-                    uic = true;
-                } else if (std.mem.eql(u8, word, "start")) {
-                    i += 1;
-                    start = try analysis_args.number(args, i);
-                } else return error.InvalidAnalysisArguments;
-            },
-            else => return error.InvalidAnalysisArguments,
-        }
-    }
-    if (n < 2 or !(nums[0] > 0) or !(nums[1] > 0)) return error.InvalidAnalysisArguments;
-    var t: requests.Tran = .{ .t_stop = nums[1], .dt_init = nums[0], .uic = uic, .dt_max = null };
-    if (n == 3 or (n == 4 and start == null and nums[2] < nums[1] and nums[3] < nums[1])) {
-        t.t_start = nums[2];
-        if (n == 4) t.dt_max = if (nums[3] > 0) nums[3] else return error.InvalidAnalysisArguments;
-    } else {
-        if (n % 2 != 0) return error.InvalidAnalysisArguments;
-        // ponytail: the finest tstep caps the whole run; a per-segment cap
-        // would save steps in the coarse segments.
-        var k: usize = 2;
-        while (k < n) : (k += 2) {
-            if (!(nums[k] > 0) or !(nums[k + 1] > nums[k - 1])) return error.InvalidAnalysisArguments;
-            t.dt_init = @min(t.dt_init, nums[k]);
-            t.t_stop = nums[k + 1];
-        }
-    }
-    t.t_start = start orelse t.t_start;
-    if (!(t.t_start >= 0) or t.t_start >= t.t_stop) return error.InvalidAnalysisArguments;
-    return t;
 }
 
 /// HSPICE `.trannoise out [METHOD=MC|SDE] [SEED=] [SAMPLES=] [TIME=all|t]
@@ -439,6 +355,16 @@ fn hspiceTranNoise(ctx: analysis_args.CardContext, args: []const Value, pos: u32
     return o;
 }
 
+/// False when `axis` sweeps the temperature to or below 0 K. ngspice 44.2
+/// runs such a sweep (measured on `.dc temp -300 20 10`); ESPice refuses it.
+/// Start and stop bound a stepped axis, and a grid lists every point.
+fn aboveAbsoluteZero(target: requests.Dc.SweepTarget, axis: Axis) bool {
+    if (target != .temp) return true;
+    if (!(axis.start > -273.15 and axis.stop > -273.15)) return false;
+    for (axis.points) |p| if (!(p > -273.15)) return false;
+    return true;
+}
+
 /// A comptime argument list: strings become names, numbers numbers.
 fn argv(comptime xs: anytype) []const Value {
     const final = comptime blk: {
@@ -457,11 +383,6 @@ test dcAxis {
     const plain = try dcAxis(a, argv(.{ 0, 1, 0.5, "v2" }), &i);
     try testing.expectEqual(@as(usize, 3), i);
     try testing.expectEqual(@as(f64, 0.5), plain.step);
-    i = 1;
-    const keyed = try dcAxis(a, argv(.{ "v1", "STEP", 0.25, "start", 1, "stop", 2 }), &i);
-    try testing.expectEqual(@as(usize, 7), i);
-    try testing.expectEqual(@as(f64, 1), keyed.start);
-    try testing.expectEqual(@as(f64, 0.25), keyed.step);
     i = 0;
     const poi = try dcAxis(a, argv(.{ "poi", 3, 5, -1, 2 }), &i);
     try testing.expectEqual(@as(usize, 5), i);
@@ -474,7 +395,7 @@ test dcAxis {
     const dec = try dcAxis(a, argv(.{ "dec", 1, 1, 100 }), &i);
     try testing.expectEqual(@as(usize, 3), dec.points.len);
     for ([_][]const Value{
-        argv(.{ "start", 0, "stop", 1 }), // no STEP
+        argv(.{ "start", 0, "stop", 1, "step", 0.5 }), // HSPICE's keyed form: SpiceRack writes `0 1 0.5`
         argv(.{ "poi", 4e9, 1 }), // more points than given
         argv(.{ "lin", 0, 0, 1 }),
         argv(.{ "dec", 1, 0, 100 }),
@@ -485,33 +406,6 @@ test dcAxis {
         i = 0;
         try testing.expectError(error.InvalidAnalysisArguments, dcAxis(a, args, &i));
     }
-}
-
-test hspiceTran {
-    const two = try hspiceTran(argv(.{ 1e-9, 1e-6 }));
-    try testing.expectEqual(@as(f64, 1e-6), two.t_stop);
-    try testing.expectEqual(@as(?f64, null), two.dt_max);
-    // Three numbers, and four whose second pair sits below tstop1, are
-    // the SPICE `tstep tstop tstart [delmax]`.
-    try testing.expectEqual(@as(f64, 2e-7), (try hspiceTran(argv(.{ 1e-9, 1e-6, 2e-7 }))).t_start);
-    const spice = try hspiceTran(argv(.{ 1e-9, 1e-6, 2e-7, 5e-9 }));
-    try testing.expectEqual(@as(f64, 2e-7), spice.t_start);
-    try testing.expectEqual(@as(?f64, 5e-9), spice.dt_max);
-    // Segments: the finest tstep for the whole run, to the last tstop.
-    const segs = try hspiceTran(argv(.{ 1e-9, 1e-6, 1e-10, 2e-6, "START", 1e-7, "uic" }));
-    try testing.expectEqual(@as(f64, 1e-10), segs.dt_init);
-    try testing.expectEqual(@as(f64, 2e-6), segs.t_stop);
-    try testing.expectEqual(@as(f64, 1e-7), segs.t_start);
-    try testing.expect(segs.uic);
-    for ([_][]const Value{
-        argv(.{1e-9}),
-        argv(.{ 0, 1e-6 }),
-        argv(.{ 1e-9, 1e-6, 1e-9, 2e-6, 1e-9 }), // odd segment count
-        argv(.{ 1e-9, 1e-6, 1e-9, 5e-7, "start", 0 }), // tstop2 before tstop1
-        argv(.{ 1e-9, 1e-6, "start", 1e-6 }), // start at the stop
-        argv(.{ 1e-9, 1e-6, "start" }),
-        argv(.{ 1e-9, 1e-6, "bogus" }),
-    }) |args| try testing.expectError(error.InvalidAnalysisArguments, hspiceTran(args));
 }
 
 test tranNoiseSamples {

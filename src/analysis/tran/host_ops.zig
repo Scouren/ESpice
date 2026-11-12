@@ -15,8 +15,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
+const abi = @import("device").abi;
 const converger = @import("solver").converger;
 const root = @import("../types.zig");
+const bound_lanes = @import("bound_lanes.zig");
 const integrator = @import("integrator.zig");
 const Sim = @import("Sim.zig");
 const Attempt = Sim.Attempt;
@@ -86,10 +88,14 @@ pub const HostOps = struct {
     /// `stepBound` (order <= 2) of `method` after a step at `a.method`.
     pub inline fn bound(_: HostOps, s: *Sim, a: *const Attempt, method: Method, lte: integrator.LteIn) f64 {
         const h = s.lteHist();
+        if (s.bound_mins.len > 1) if (s.ckt.par_eval) |pe|
+            return bound_lanes.boundLanes(pe, s.bound_mins, s.bound_chunk, method, a.method, .{ h[0], h[1], h[2], h[3] }, s.lteIp(), a.c, lte);
         return integrator.stepBound(W, method, a.method, .{ h[0], h[1], h[2], h[3] }, s.lteIp(), a.c, lte);
     }
-    /// `stepBoundGear` of `method` after a step at `a.method`.
+    /// `stepBoundGear` of `method` after a step at `a.method`; its lane
+    /// min under N7, the same bits.
     pub inline fn boundGear(_: HostOps, s: *Sim, a: *const Attempt, method: Method, lte: integrator.LteIn) f64 {
+        if (s.ckt.knobs.perf.n7) return integrator.stepBoundGearLanes(method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
         return integrator.stepBoundGear(method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
     }
     /// advanceCurrent on both index spaces, then the ring rotation.
@@ -107,13 +113,17 @@ pub const HostOps = struct {
         _ = s.ckt.commitStates(s.cur);
         _ = s.ckt.stateCtl(.commit);
     }
-    /// The stateful-charge re-read at `cur` (`has_state_q`).
+    /// The stateful-charge re-read at `cur` (`has_state_q`); under N3
+    /// over `Sim.rebase_batches` only (`rebaseNarrow`), the same bits.
     pub inline fn rebase(_: HostOps, s: *Sim, a: *const Attempt) void {
         const ckt = s.ckt;
         const q_hist = s.qHist();
         const qt_hist = s.qtHist();
         if (!(s.has_charge and ckt.has_state_q)) return;
-        ckt.evalQ(s.cur, s.t);
+        if (s.rebase_batches.len > 0 and ckt.gpuContext() == null and ckt.par_eval == null)
+            rebaseNarrow(s)
+        else
+            ckt.evalQ(s.cur, s.t);
         integrator.rebaseCurrent(s.i_prev, ckt.q_vec[0..s.n], q_hist[1], a.c.ag0);
         num.copySimd(q_hist[1], ckt.q_vec[0..s.n]);
         if (s.n_qt > 0) {
@@ -184,6 +194,28 @@ pub fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrato
 }
 
 // ---- private ----
+
+/// `evalQ(cur, t)`'s `q_vec` and tapes, re-reading only `rebase_batches`
+/// into `q_scratch`. Every other charge batch has no accepted-step state,
+/// so its tape and its terms still hold the accept pass's bits at the same
+/// x, time and state, and only re-read batches stamp `rebase_rows`: each
+/// copied row sums the same terms from +0.0 in the same batch order.
+fn rebaseNarrow(s: *Sim) void {
+    const ckt = s.ckt;
+    const scratch = s.q_scratch;
+    assert(scratch.len == @as(usize, ckt.n) + 1);
+    assert(s.rebase_rows.len <= ckt.n);
+    num.zeroSimd(scratch);
+    const pl: abi.Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = scratch };
+    for (s.rebase_batches) |bi| {
+        const b = ckt.batches[bi];
+        b.hooks.eval_q.?(b.ctx, &pl, 0, b.count, s.cur, s.t);
+    }
+    for (s.rebase_rows) |r| ckt.q_vec[r] = scratch[r];
+    // What `evalQ` leaves besides the planes.
+    ckt.lin.valid = false;
+    ckt.q_fresh = false;
+}
 
 /// Moves every history slot one older, [cur, prev, ...] -> [stale, cur,
 /// prev, ...]: the oldest slot comes round as the scratch slot 0. The

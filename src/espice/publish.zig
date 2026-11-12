@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
 const analysis = @import("analysis");
 const core = @import("core");
 const output = @import("output");
@@ -211,23 +210,13 @@ fn deliverOne(self: *Problem, session: *const Session, id: QueryId) DeliveryErro
         // An `.sp` carries its ports' z0, which a Touchstone output records (#60).
         var z0: std.ArrayList(f64) = .empty;
         defer z0.deinit(self.gpa);
-        if (job == .sp) try modeZ0(self.gpa, job.sp.ports, &z0);
+        if (job == .sp) for (job.sp.ports) |p| try z0.append(self.gpa, p.z0);
         const plot: output.Plot = .{ .title = session.deck.title, .result = res, .z0 = z0.items };
         try self.delivery.publish(self.io, plot);
         if (job == .sp) if (job.sp.lin) |lin| if (lin.touchstone) try writeTouchstone(self, lin.file, plot);
     }
     if (main) assert(self.streaming != id);
     return true;
-}
-
-/// Appends the reference impedance of each of `ports`' modes to `z0`, in
-/// sp.zig's `Basis` order: each port's first mode (a balanced one's
-/// differential, 2·z0), then the common modes (z0/2).
-fn modeZ0(gpa: Allocator, ports: []const requests.Port, z0: *std.ArrayList(f64)) Allocator.Error!void {
-    const before = z0.items.len;
-    for (ports) |p| try z0.append(gpa, if (p.balanced != null) 2 * p.z0 else p.z0);
-    for (ports) |p| if (p.balanced != null) try z0.append(gpa, p.z0 / 2);
-    assert(z0.items.len - before >= ports.len);
 }
 
 /// Writes a `.lin format=touchstone` result as `<file>.s<N>p` beside the

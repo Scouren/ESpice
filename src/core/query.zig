@@ -180,13 +180,15 @@ pub const Query = union(Kind) {
     hblin: Hblin,
 
     /// The run starts from the `.ic` values with no operating point: a
-    /// `.tran ... uic`, or a `.four` over one. An `.fft` carries its own
-    /// transient but always runs it from an operating point.
+    /// `.tran ... uic`, a `.four` over one, or ngspice's `.pss ... uic`. An
+    /// `.fft` carries its own transient but always runs it from an
+    /// operating point.
     pub fn uic(job: Query) bool {
         return switch (job) {
             .tran => |o| o.uic,
             .four => |o| if (o.tran_opts) |t| t.uic else false,
-            .ac, .dc, .dcmatch, .disto, .envelope, .hb, .matex, .mc, .noise, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => false,
+            .pss => |o| o.uic,
+            .ac, .dc, .dcmatch, .disto, .envelope, .hb, .matex, .mc, .noise, .op, .pac, .pnoise, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => false,
         };
     }
 };
@@ -197,7 +199,7 @@ test "every transient-family query runs off the transient operating point" {
     try std.testing.expect(!Kind.dc.transient());
 }
 
-test "only a uic transient, or a .four over one, skips its operating point" {
+test "only a uic transient, a .four over one, or a uic .pss skips its operating point" {
     // Oracle: Query.uic's contract, read off the `.tran ... uic` card form.
     const t = std.testing;
     try t.expect((Query{ .tran = .{ .t_stop = 1, .uic = true } }).uic());
@@ -207,4 +209,6 @@ test "only a uic transient, or a .four over one, skips its operating point" {
     const fft: Fft = .{ .tran = .{ .t_stop = 1, .uic = true }, .out_pos = 1, .start = 0, .stop = 1, .label = "v(1)" };
     try t.expect(!(Query{ .fft = fft }).uic());
     try t.expect(!(Query{ .op = .{} }).uic());
+    try t.expect((Query{ .pss = .{ .period = 1, .uic = true } }).uic());
+    try t.expect(!(Query{ .pss = .{ .period = 1 } }).uic());
 }

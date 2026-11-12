@@ -2,12 +2,11 @@
 //! netlist.zig `subst`. Out: the compiled tape (expr_compile.zig) and its
 //! value, folded on a value stack (`fold`, `eval`). No tree is built: a
 //! consumer walks subtrees backwards from their last op (`subtreeStart`).
-//! Cites: dev/research/ngspice-syntax.md §2.2, ngspice xpressn.c; HSPICE
-//! [Star-Hspice Table 10-1] for `**` (#39, #77).
+//! Cites: dev/research/ngspice-syntax.md §2.2, ngspice xpressn.c (#39, #77).
 //!
 //! Contents:
-//! - `pub const Error, CompileError, none, Code, Fn, Op, Scratch` (expr_ops.zig)
-//! - `pub const isDistribution, isDistributionName` (expr_ops.zig)
+//! - `pub const Error, none, Code, Fn, Op, Scratch` (expr_ops.zig)
+//! - `pub const isDistribution, isDistributionName, bsourceFn` (expr_ops.zig)
 //! - `pub const max_depth, compile, compileAll, numberLen, isOperator` (expr_compile.zig)
 //! - `pub const Val = struct`
 //! - `pub fn fold(gpa: Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, geometry: bool, live: []const f64) Error!Val`
@@ -26,9 +25,6 @@ const lines = @import("lines.zig");
 /// with `OutOfMemory`. A failed `compile` leaves what it appended in the
 /// `Scratch`; roll it back with `Scratch.mark` and `Scratch.reset`.
 pub const Error = expr_ops.Error;
-/// `compile`'s errors: `UnsupportedCard` for `%` or `\` used as an
-/// operator, or a unary `!`, in a dialect without it (#203).
-pub const CompileError = expr_ops.CompileError;
 /// Absent operand.
 pub const none = expr_ops.none;
 /// Postfix opcode.
@@ -43,6 +39,8 @@ pub const Scratch = expr_ops.Scratch;
 pub const isDistributionName = expr_ops.isDistributionName;
 /// True for the functions a Monte Carlo trial draws.
 pub const isDistribution = expr_ops.isDistribution;
+/// The B parser's meaning of a numparam built-in; null where it has none.
+pub const bsourceFn = expr_ops.bsourceFn;
 /// Recursion bound of `compile`, in parser calls.
 pub const max_depth = expr_compile.max_depth;
 /// Compiles the expression at `text[pos]`; returns where it ends.
@@ -184,7 +182,7 @@ fn step(stack: *std.ArrayList(Val), op: Op, consts: []const f64, geometry: bool,
                 .div => x / y,
                 .mod => x - y * @trunc(x / y),
                 .idiv => @trunc(@abs(x / y)),
-                .pow => if (op.b == 1) hspicePower(x, y) else std.math.pow(f64, @abs(x), y),
+                .pow => std.math.pow(f64, @abs(x), y),
                 .lt => bool01(x < y),
                 .gt => bool01(x > y),
                 .le => bool01(x <= y),
@@ -208,13 +206,18 @@ fn call(f: Fn, args: []const Val) Val {
         all_known = all_known and a.known;
     }
     const want: usize = switch (f) {
-        .table, .other => return .unknown(false),
+        // `ddt` reads the circuit's history, even of a constant.
+        .table, .ddt => return .unknown(false),
         // Folding keeps the nominal; a Monte Carlo trial draws through
         // `eval`'s `draw` instead.
         .agauss, .gauss, .unif, .aunif => return if (args.len >= 2 and args.len <= 4 and args[0].known) args[0] else .unknown(args.len >= 2 and all_nominal),
         .limit => return if (args.len == 2 and args[0].known) args[0] else .unknown(false),
         .ternary => 3,
-        .pow, .pwr, .min, .max, .hpow => 2,
+        // numparam seeds a call's second operand `v = 1.0` (xpressn.c:921)
+        // and keeps it when the call has one argument, so max(x) is
+        // MAX(x, 1) and min(x) MIN(x, 1) (xpressn.c:142-146).
+        .min, .max => if (args.len == 1) 1 else 2,
+        .pow, .pwr, .bpwr => 2,
         else => 1,
     };
     if (args.len != want or !args[0].known) return .unknown(all_nominal);
@@ -224,25 +227,28 @@ fn call(f: Fn, args: []const Val) Val {
         return if (picked.known) picked else .unknown(all_nominal);
     }
     if (want == 2 and !args[1].known) return .unknown(all_nominal);
-    const b = if (want == 2) args[1].num else 0;
+    // A one-argument min or max reads numparam's seeded 1; no other
+    // one-argument function reads `b`.
+    const b = if (want == 2) args[1].num else 1;
     return .of(switch (f) {
         .sqrt => @sqrt(a),
         .abs => @abs(a),
         .min => @min(a, b),
         .max => @max(a, b),
-        // numparam's pwr is |a|^b (xpressn.c XFU_PWR), so pwr(-0, 0) is 1.
-        .pow, .pwr => std.math.pow(f64, @abs(a), b),
-        .hsqrt => std.math.copysign(@sqrt(@abs(a)), a),
-        .hlog => if (a < 0) -@log(-a) else @log(a),
-        .hlog10 => if (a < 0) -@log10(-a) else @log10(a),
-        .hpow => std.math.pow(f64, a, @trunc(b)),
+        // numparam's pow is C's (xpressn.c XFU_POW): pow(-2, 3) is -8 and
+        // pow(-2, 2.5) NaN, where ngspice-44.2 fails the deck. Its pwr is
+        // |a|^b (XFU_PWR), so pwr(-0, 0) is 1, and so is the B parser's
+        // pow; the B parser's pwr is PTpwr's sign(a)·|a|^b (`bsourceFn`).
+        .pow => std.math.pow(f64, a, b),
+        .pwr => std.math.pow(f64, @abs(a), b),
+        .bpwr => if (a < 0) -std.math.pow(f64, -a, b) else std.math.pow(f64, a, b),
         .exp => @exp(a),
         .ln, .log => @log(a),
         .log10 => @log10(a),
         .sin => @sin(a),
         .cos => @cos(a),
         .tan => @tan(a),
-        .atan => std.math.atan(a),
+        .atan, .arctan => std.math.atan(a),
         .floor => @floor(a),
         .ceil => @ceil(a),
         .tanh => std.math.tanh(a),
@@ -257,17 +263,8 @@ fn call(f: Fn, args: []const Val) Val {
         .asinh => std.math.asinh(a),
         .acosh => std.math.acosh(a),
         .atanh => std.math.atanh(a),
-        .ternary, .agauss, .gauss, .unif, .aunif, .limit, .table, .other => unreachable,
+        .ternary, .agauss, .gauss, .unif, .aunif, .limit, .table, .ddt => unreachable,
     });
-}
-
-/// HSPICE's `x**y` (ngspice's hs compatibility, xpressn.c): a negative x
-/// takes the rounded exponent, and 0 to any power is 0. ngspice's own `^`
-/// is |x|^y, so (-8)**(1/3) is 2 and (-1.75)^3 is +5.359 (#39, #77).
-fn hspicePower(x: f64, y: f64) f64 {
-    if (x < 0) return std.math.pow(f64, x, @round(y));
-    if (x == 0) return 0;
-    return std.math.pow(f64, x, y);
 }
 
 /// numparam's `nint` (§2.2): to the nearest integer, a half to the even one.
@@ -291,41 +288,51 @@ test "compile and fold: precedence, associativity and calls" {
     const a = arena.allocator();
     const Case = struct { []const u8, f64 };
     for ([_]Case{
-        .{ "1+2*3", 1 + 2 * 3 },      .{ "(1+2)*3", (1 + 2) * 3 },                .{ "7-2-1", 7 - 2 - 1 },
-        .{ "10/4", 10.0 / 4.0 },      .{ "2^3^2", 64 },                           .{ "2**3", 8 },
-        .{ "-2^2", -4 },              .{ "2^-1", 0.5 },                           .{ "+3", 3 },
-        .{ "1<2", 1 },                .{ "2<=1", 0 },                             .{ "1>=1", 1 },
-        .{ "3>2", 1 },                .{ "1==1", 1 },                             .{ "1!=1", 0 },
-        .{ "1&&0", 0 },               .{ "1||0", 1 },                             .{ "!0", 1 },
-        .{ "!3", 0 },                 .{ "1?2:3", 2 },                            .{ "0?2:3", 3 },
-        .{ "1+1?4:5", 4 },            .{ "'1+2'*2", 6 },                          .{ "\"2\"", 2 },
-        .{ "sqrt(16)", 4 },           .{ "max(1,min(5,3))", 3 },                  .{ "pow(2,10)", 1024 },
-        .{ "abs(-3)", 3 },            .{ "floor(2.5)+ceil(2.5)", 5 },             .{ "1k*2", 2000 },
-        .{ "agauss(1,0.1,3)", 1 },    .{ "limit(2,1)", 2 },                       .{ "1e-3*2", 2e-3 },
-        .{ "pwr(-4,0.5)", 2 },        .{ "pwr(9,0.5)", 3 },
+        .{ "1+2*3", 1 + 2 * 3 },        .{ "(1+2)*3", (1 + 2) * 3 },         .{ "7-2-1", 7 - 2 - 1 },
+        .{ "10/4", 10.0 / 4.0 },        .{ "2^3^2", 64 },                    .{ "2**3", 8 },
+        .{ "-2^2", -4 },                .{ "2^-1", 0.5 },                    .{ "+3", 3 },
+        .{ "1<2", 1 },                  .{ "2<=1", 0 },                      .{ "1>=1", 1 },
+        .{ "3>2", 1 },                  .{ "1==1", 1 },                      .{ "1!=1", 0 },
+        .{ "1&&0", 0 },                 .{ "1||0", 1 },                      .{ "!0", 1 },
+        .{ "!3", 0 },                   .{ "1?2:3", 2 },                     .{ "0?2:3", 3 },
+        .{ "1+1?4:5", 4 },              .{ "'1+2'*2", 6 },                   .{ "\"2\"", 2 },
+        .{ "sqrt(16)", 4 },             .{ "max(1,min(5,3))", 3 },           .{ "pow(2,10)", 1024 },
+        .{ "abs(-3)", 3 },              .{ "floor(2.5)+ceil(2.5)", 5 },      .{ "1k*2", 2000 },
+        .{ "agauss(1,0.1,3)", 1 },      .{ "limit(2,1)", 2 },                .{ "1e-3*2", 2e-3 },
+        .{ "pwr(-4,0.5)", 2 },          .{ "pwr(9,0.5)", 3 },
         // numparam's operators and built-ins (#121).
-                              .{ "7%3", 1 },
-        .{ "-7%3", -1 },              .{ "7\\2", 3 },                             .{ "1<>2", 1 },
-        .{ "2<>2", 0 },               .{ "tanh(0)", 0 },                          .{ "sqr(3)", 9 },
-        .{ "int(-2.7)", -2 },         .{ "nint(2.5)", 2 },                        .{ "nint(3.5)", 4 },
-        .{ "nint(-2.5)", -2 },        .{ "sgn(-3)", -1 },                         .{ "sinh(0)+cosh(0)", 1 },
-        .{ "arctan(0)+asin(0)", 0 },  .{ "acos(1)+asinh(0)+atanh(0)", 0 },        .{ "acosh(1)", 0 },
+                       .{ "7%3", 1 },
+        .{ "-7%3", -1 },                .{ "7\\2", 3 },                      .{ "1<>2", 1 },
+        .{ "2<>2", 0 },                 .{ "tanh(0)", 0 },                   .{ "sqr(3)", 9 },
+        .{ "int(-2.7)", -2 },           .{ "nint(2.5)", 2 },                 .{ "nint(3.5)", 4 },
+        .{ "nint(-2.5)", -2 },          .{ "sgn(-3)", -1 },                  .{ "sinh(0)+cosh(0)", 1 },
+        .{ "arctan(0)+asin(0)", 0 },    .{ "acos(1)+asinh(0)+atanh(0)", 0 }, .{ "acosh(1)", 0 },
         .{ "ternary_fcn(0,2,3)", 3 },
-        // ngspice's powers of a negative base (#39).
-        .{ "pwr(-0,0)", 1 },                        .{ "(-2)^3", 8 },
-        .{ "(-2)^0.5", @sqrt(2.0) },  .{ "(-2)^2.5", std.math.pow(f64, 2, 2.5) }, .{ "pow(-2,0.5)", @sqrt(2.0) },
+        // ngspice's powers of a negative base (#39): numparam's pow is C's,
+        // its pwr, `^` and `**` |x|^y (ngspice-44.2: -8, 8, 8).
+          .{ "pwr(-0,0)", 1 },                 .{ "(-2)^3", 8 },
+        .{ "pow(-2,3)", -8 },           .{ "(-2)^0.5", @sqrt(2.0) },         .{ "(-2)^2.5", std.math.pow(f64, 2, 2.5) },
+        .{ "pwr(-2,0.5)", @sqrt(2.0) }, .{ "pow(0,0)", 1 },                  .{ "pwr(-2,3)", 8 },
+        // numparam's one-argument max and min read a seeded 1 (xpressn.c:921).
+        .{ "max(0.5)", 1 },             .{ "max(3)", 3 },                    .{ "min(3)", 1 },
     }) |case| {
         const v = try testFold(a, case[0]);
         try std.testing.expect(v.known);
         try std.testing.expectEqual(case[1], v.num);
     }
+    // C's pow of a negative base to a fractional power is NaN; ngspice-44.2
+    // fails a deck that reads {pow(-2,2.5)}.
+    try std.testing.expect(std.math.isNan((try testFold(a, "pow(-2,2.5)")).num));
     // nint(-0.5) is -0: ngspice-45 reads {1/nint(-0.5)} as -inf. Found by the
     // reference fuzz as ln(+(ln(0)&&3)/nint(-0.5))^1e-300.
     try std.testing.expectEqual(-std.math.inf(f64), (try testFold(a, "1/nint(-0.5)")).num);
     // Names, probes, unknown functions and wrong arities stay symbolic.
-    for ([_][]const u8{ "x+1", "v(a)", "i(v1)*2", "foo(1)", "sqrt()", "min(1)", "agauss(1)" }) |text|
+    for ([_][]const u8{ "x+1", "v(a)", "i(v1)*2", "foo(1)", "sqrt()", "pow(1)", "agauss(1)" }) |text|
         try std.testing.expect(!(try testFold(a, text)).known);
-    for ([_][]const u8{ "", "1+", "(1", "1)", "a=b", "a|b", "a&b", "1 2", "1?2", "f(1,", "#", "'1" }) |text| {
+    // PSPICE's single `|`, `&` and unary `~` too: plain ngspice-44.2 stops
+    // on each, "Syntax error: letter [|]"; and a `{` inside the text, which
+    // ngspice does not read as a group (src/tests/expressions.zig).
+    for ([_][]const u8{ "", "1+", "(1", "1)", "a=b", "1 2", "1?2", "f(1,", "#", "'1", "{1", "(1}", "~", "1|0", "1&0", "~0", "1&&&0", "{1+2}*3", "2*{1}" }) |text| {
         var s: Scratch = .{};
         try std.testing.expectError(error.ParseError, compileAll(lines.ngspice, a, &s, text));
     }
@@ -334,24 +341,32 @@ test "compile and fold: precedence, associativity and calls" {
     try std.testing.expectEqual(6, try compile(lines.ngspice, a, &s, "x 1+2 y", 2));
 }
 
-test "HSPICE sqrt, log, log10 and pow follow Star-Hspice Table 10-1 (#39)" {
+test "the B parser's pwr, which `bsourceFn` maps pwr to, is sign(x)·|x|^y; its pow is |x|^y" {
+    // ptfuncs.c PTpwr and PTpower; ngspice-44.2 reads b1 o 0 v=pwr(-2,3)
+    // as -8, pwr(-2,2.5) as -5.6568542494923806 and pow(-2,3) as 8.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stack: std.ArrayList(Val) = .empty;
+    const Case = struct { Fn, f64, f64, f64 };
+    for ([_]Case{
+        .{ .pwr, -2, 3, -8 }, .{ .pwr, -2, 2.5, -std.math.pow(f64, 2, 2.5) }, .{ .pwr, 2, 3, 8 },
+        .{ .pwr, 0, 0, 1 },   .{ .pow, -2, 3, 8 },                            .{ .pow, -2, 2.5, std.math.pow(f64, 2, 2.5) },
+    }) |c| {
+        const f = bsourceFn(c[0]).?;
+        const ops = [_]Op{ .{ .code = .num, .a = 0 }, .{ .code = .num, .a = 1 }, .{ .code = .call, .a = @backingInt(f), .b = 2 } };
+        const v = try fold(arena.allocator(), &stack, &ops, &.{ c[1], c[2] }, false, &.{});
+        try std.testing.expect(v.known);
+        try std.testing.expectEqual(c[3], v.num);
+    }
+}
+
+test "`**` and `^` are |x|^y, as ngspice's PTpower (#39, #77)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_]struct { []const u8, f64 }{
-        .{ "sqrt(-4)", -2 },  .{ "log(-100)", -@log(100.0) }, .{ "log10(-100)", -2 },
-        .{ "pow(2,2.5)", 4 }, .{ "pow(-2,3.7)", -8 },         .{ "sqrt(4)", 2 },
-        .{ "(-2)**3", -8 },   .{ "(-2)**2.6", -8 },           .{ "0**2", 0 },
-    }) |case| {
-        var s: Scratch = .{};
-        try compileAll(lines.hspice, a, &s, case[0]);
-        var stack: std.ArrayList(Val) = .empty;
-        const v = try fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
-        try std.testing.expect(v.known);
-        try std.testing.expectEqual(case[1], v.num);
-    }
-    // (-8)**(1/3) is |-8|^(1/3) in every ngspice mode.
+    // Hand-computed: 8^(1/3) = 2 and 1.75^3 = 5.359375, both signs dropped.
     try std.testing.expectApproxEqRel(2, (try testFold(a, "(-8)**(1/3)")).num, 1e-15);
+    try std.testing.expectApproxEqRel(5.359375, (try testFold(a, "(-1.75)^3")).num, 1e-15);
 }
 
 test "compile bounds its recursion" {
@@ -455,34 +470,21 @@ test numberLen {
     for ("|&<>=!+-*/%\\^?") |c| try std.testing.expect(isOperator(c));
 }
 
-test "% and \\ are operators in ngspice and Spectre (%) and refused in HSPICE (#203)" {
+test "% and \\ are numparam operators (#203)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     // Hand-computed: 10 % 3 = 1, trunc(10 / 3) = 3.
     try std.testing.expectEqual(1, (try testFold(a, "10 % 3")).num);
     try std.testing.expectEqual(3, (try testFold(a, "10 \\ 3")).num);
-    var s: Scratch = .{};
-    try compileAll(lines.spectre, a, &s, "10 % 3");
-    for ([_][]const u8{ "10 % 3", "10\\3", "2*(7 % 4)" }) |text|
-        try std.testing.expectError(error.UnsupportedCard, compileAll(lines.hspice, a, &s, text));
-    try std.testing.expectError(error.UnsupportedCard, compileAll(lines.spectre, a, &s, "10 \\ 3"));
-    // `*` and `/` are every dialect's.
-    try compileAll(lines.hspice, a, &s, "6 * 2 / 3");
 }
 
-test "unary ! is refused in HSPICE, read elsewhere (#203)" {
+test "unary ! is numparam's logical not (#203)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     // Hand-computed: !0 + 1 = 2.
     try std.testing.expectEqual(2, (try testFold(a, "!0+1")).num);
-    var s: Scratch = .{};
-    try compileAll(lines.spectre, a, &s, "!0+1");
-    try std.testing.expectError(error.UnsupportedCard, compileAll(lines.hspice, a, &s, "!0+1"));
-    try std.testing.expectError(error.UnsupportedCard, compileAll(lines.hspice, a, &s, "(a<b) && !(a==b)"));
-    // `!=` is HSPICE's.
-    try compileAll(lines.hspice, a, &s, "(a<b) && (a!=b)");
 }
 
 test {

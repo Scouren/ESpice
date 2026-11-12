@@ -400,7 +400,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) !*Problem {
     errdefer self.library.deinit();
     self.library.toolchain = try config.toolchainFromEnv(arena, options.hdl_toolchain);
     self.library.vpi = options.vpi;
-    const ast = try frontend.prepare(io, scratch, options.source, options.dialect, options.live_params, config.parseFromEnv());
+    const ast = try frontend.prepare(io, scratch, options.source, options.live_params, config.parseFromEnv());
     try frontend.loadModels(io, &self.library, scratch, ast, self.origin, options.vpi_apps);
     timingLap(io, &lap, "frontend (source, parsing, HDL)");
     self.prepared = try frontend.build(&self.library, arena, scratch, ast);

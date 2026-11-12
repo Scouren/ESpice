@@ -120,7 +120,7 @@ const Sample = struct {
                 break :blk c.get(s.i);
             },
             .measure, .soa_count => nan,
-            .neg, .add, .sub, .mul, .div, .pow => unreachable,
+            .neg, .not, .add, .sub, .mul, .div, .pow, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or", .ternary => unreachable,
         };
     }
 };
@@ -137,8 +137,9 @@ pub fn columnIndex(names: []const []const u8, name: []const u8) ?usize {
 }
 
 /// Folds measure postfix; `leaves.leaf(op, v)` values each `num`, `measure`,
-/// `soa_count` and `vector` op, `v` counting the vector ops before it. Returns NaN on a
-/// stack overflow or underflow, or a malformed tail.
+/// `soa_count` and `vector` op, `v` counting the vector ops before it. An
+/// operator with a NaN operand gives NaN (`core.MeasureOp`). Returns NaN on
+/// a stack overflow or underflow, or a malformed tail.
 // comptime interface: the leaves vary (a PARAM card's earlier results, a
 // `par()` sample's columns); two cases, and a runtime pointer per op would
 // cost a call per sample.
@@ -153,23 +154,39 @@ pub fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
             vectors += @intFromBool(op == .vector);
             n += 1;
         },
-        .neg => {
+        .neg, .not => {
             if (n == 0) return nan;
-            stack[n - 1] = -stack[n - 1];
+            const x = &stack[n - 1];
+            if (!std.math.isNan(x.*)) x.* = if (op == .neg) -x.* else truth(x.* == 0);
         },
-        .add, .sub, .mul, .div, .pow => {
+        .add, .sub, .mul, .div, .pow, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or" => {
             if (n < 2) return nan;
             n -= 1;
             const b = stack[n];
             const x = &stack[n - 1];
-            x.* = switch (op) {
+            x.* = if (std.math.isNan(x.*) or std.math.isNan(b)) nan else switch (op) {
                 .add => x.* + b,
                 .sub => x.* - b,
                 .mul => x.* * b,
                 .div => x.* / b,
                 .pow => std.math.pow(f64, x.*, b),
-                .num, .measure, .vector, .soa_count, .neg => unreachable,
+                .lt => truth(x.* < b),
+                .gt => truth(x.* > b),
+                .le => truth(x.* <= b),
+                .ge => truth(x.* >= b),
+                .eq => truth(x.* == b),
+                .ne => truth(x.* != b),
+                .@"and" => truth(x.* != 0 and b != 0),
+                .@"or" => truth(x.* != 0 or b != 0),
+                .num, .measure, .vector, .soa_count, .neg, .not, .ternary => unreachable,
             };
+        },
+        .ternary => {
+            if (n < 3) return nan;
+            n -= 2;
+            const c = stack[n - 1];
+            const picked = if (c != 0) stack[n] else stack[n + 1];
+            stack[n - 1] = if (std.math.isNan(c) or std.math.isNan(stack[n]) or std.math.isNan(stack[n + 1])) nan else picked;
         },
     };
     assert(n <= stack.len);
@@ -178,6 +195,11 @@ pub fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
 }
 
 // ---- private ----
+
+/// A comparison's or logic op's value, as numparam gives it: 1 or 0.
+fn truth(b: bool) f64 {
+    return @floatFromInt(@intFromBool(b));
+}
 
 test "a complex column reads the part its vectype names" {
     // Oracle: 3 + 4j has magnitude 5, 20·log10(5) dB, atan2(4, 3) rad.

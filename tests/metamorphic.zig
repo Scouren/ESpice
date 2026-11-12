@@ -214,16 +214,25 @@ pub fn rewrite(a: Allocator, src: []const u8, kind: Kind) Allocator.Error!?Varia
             for (cs) |c| if (c.element and std.mem.indexOfScalar(u8, "rclvRCLV", c.tokens[0][0]) == null) return null;
             v.current_factor = k;
             for (cs) |c| {
-                const factor: f64 = if (!c.element) 1 else switch (std.ascii.toLower(c.tokens[0][0])) {
-                    'r', 'l' => k,
-                    'c' => 1 / k,
-                    else => 1,
-                };
-                if (factor == 1) {
-                    try out.print(a, "{s}\n", .{c.line});
-                    continue;
-                }
-                try out.print(a, "{s} {s} {s} {e}\n", .{ c.tokens[0], c.tokens[1], c.tokens[2], number(c.tokens[3]).? * factor });
+                const letter = if (c.element) std.ascii.toLower(c.tokens[0][0]) else ' ';
+                if (letter == 'r' or letter == 'l' or letter == 'c') {
+                    const factor = if (letter == 'c') 1 / k else k;
+                    try out.print(a, "{s} {s} {s} {e}\n", .{ c.tokens[0], c.tokens[1], c.tokens[2], number(c.tokens[3]).? * factor });
+                } else if (letter == 'v' and for (c.tokens[3..]) |t| {
+                    if (std.ascii.startsWithIgnoreCase(t, "z0")) break true;
+                } else false) {
+                    // A port's z0 is the source's series resistance
+                    // (vsrcload.c), so it scales with R. Past the nodes only.
+                    try out.appendSlice(a, c.tokens[0]);
+                    for (c.tokens[1..], 1..) |t, i| {
+                        if (i > 3 and std.ascii.eqlIgnoreCase(c.tokens[i - 1], "z0")) {
+                            try out.print(a, " {e}", .{(number(t) orelse return null) * k});
+                        } else if (i > 2 and std.ascii.startsWithIgnoreCase(t, "z0=")) {
+                            try out.print(a, " z0={e}", .{(number(t[3..]) orelse return null) * k});
+                        } else try out.print(a, " {s}", .{t});
+                    }
+                    try out.append(a, '\n');
+                } else try out.print(a, "{s}\n", .{c.line});
             }
         },
         .zero_source => {
@@ -268,6 +277,9 @@ test "each rewrite keeps the relation it states" {
     const s = (try rewrite(a, deck, .scale)).?;
     try testing.expectEqualStrings("t\nVin in 0 10\nR1 in out 1e4\nC1 out 0 1e-13\n.op\n.end\n", s.text);
     try testing.expectEqual(k, s.current_factor);
+    // A port's z0 scales with R; a node named z0 does not.
+    const port = "t\nv1 a 0 dc 1 portnum 1 z0 50\nv2 z0 0 1 portnum 2 z0=1k\nr1 a z0 50\n.op\n";
+    try testing.expectEqualStrings("t\nv1 a 0 dc 1 portnum 1 z0 5e2\nv2 z0 0 1 portnum 2 z0=1e4\nr1 a z0 5e2\n.op\n", (try rewrite(a, port, .scale)).?.text);
     try testing.expectEqualStrings("t\nimm_zero in 0 0\nVin in 0 10\nR1 in out 1k\nC1 out 0 1p\n.op\n.end\n", (try rewrite(a, deck, .zero_source)).?.text);
     const dd = (try rewrite(a, "t\nv1 a 0 1\nd1 a k dm\ne1 o 0 k 0 2\n.model dm d\n", .rename)).?;
     try testing.expectEqualStrings("t\nv1 m3 0 1\nd1 m3 m2 dm\ne1 m1 0 m2 0 2\n.model dm d\n", dd.text);

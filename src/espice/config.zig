@@ -10,7 +10,7 @@
 //! - `pub const MeasureWriters = struct { out: *std.Io.Writer, err: *std.Io.Writer }`
 //! - `pub const HdlToolchain = frontend.Library.Toolchain`
 //! - `pub const Shared = struct`
-//! - `pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: Shared) error{EmirNeedsCpu}!analysis.ExecutionConfig`
+//! - `pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: Shared) error{ EmirNeedsCpu, UnknownLever }!analysis.ExecutionConfig`
 //! - `pub fn pointOptions(options: Options, prepared: *const frontend.Prepared, save_path: ?[]const u8) requests.PointOptions`
 //! - `pub fn deckJobs(scratch: Allocator, deck: *const core.Deck, point: requests.PointOptions) Allocator.Error![]requests.Query`
 //! - `pub fn withPoint(scratch: Allocator, queries: []const requests.Query, point: requests.PointOptions) Allocator.Error![]requests.Query`
@@ -35,7 +35,6 @@ const requests = core.query;
 pub const Options = struct {
     /// A netlist path, or in-memory text with the origin it is named by.
     source: frontend.Source,
-    dialect: frontend.Dialect = .ngspice,
     /// Where results go. `.save` and `.stim` files land in its path's directory.
     output: output.Selection = .{},
     /// Device backend and thread counts. `final_plan` lets a lone leading
@@ -122,8 +121,9 @@ const likely_gpu_bytes = 1 << 20;
 /// policy. Under `auto` the lane policy reads the card's FP64 rate from
 /// `shared.machine`, never the driver.
 /// A deck asking for `--emir` runs on the CPU; `error.EmirNeedsCpu` when the
-/// caller asked for a GPU explicitly.
-pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: Shared) error{EmirNeedsCpu}!analysis.ExecutionConfig {
+/// caller asked for a GPU explicitly. `error.UnknownLever` when `ESPICE_PERF`
+/// names a lever `core.perf.Levers` does not have.
+pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: Shared) error{ EmirNeedsCpu, UnknownLever }!analysis.ExecutionConfig {
     var config = options.backend;
     // `--emir` reads the host device batches, as the CLI's does (#237).
     if (prepared.deck.emir_file != null) {
@@ -131,7 +131,7 @@ pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: S
         config.backend = .cpu;
     }
     config.timing_in_depth = options.timing_in_depth;
-    config.knobs = knobsFromEnv();
+    config.knobs = try knobsFromEnv();
     // A test whose oracle is the plain scalar run turns the bypass off.
     config.knobs.bypass = options.backend.knobs.bypass;
     config.gpu_driver = shared.gpu_driver;
@@ -275,7 +275,11 @@ pub fn loadMachine(arena: Allocator) ?analysis.Machine {
     const m = analysis.machine;
     const v = m.vendor orelse return null;
     const live = m.identity("", v);
-    return m.load(arena, .{ .xdg_cache_home = env("XDG_CACHE_HOME"), .home = env("HOME") }, &live) orelse {
+    const knobs: analysis.Knobs = .{ .xdg_cache_home = env("XDG_CACHE_HOME"), .home = env("HOME") };
+    // Lever p1: the identity keys decide, named on refusal
+    // (08-placement.md step 1). A bad lever list fails in `execution`.
+    if (if (core.perf.Levers.parse(env("ESPICE_PERF"))) |l| l.p1 else |_| false) return m.loadKeyed(arena, knobs, &live, v);
+    return m.load(arena, knobs, &live) orelse {
         m.noteUncalibrated(&live);
         return null;
     };
@@ -350,8 +354,11 @@ fn isSweep(deck: *const core.Deck) bool {
 
 /// The developer switches (`analysis.Knobs`); the field docs name each
 /// variable.
-fn knobsFromEnv() analysis.Knobs {
+fn knobsFromEnv() error{UnknownLever}!analysis.Knobs {
     var k: analysis.Knobs = .{};
+    k.perf = try core.perf.Levers.parse(env("ESPICE_PERF"));
+    k.newton.perf = k.perf;
+    k.lu.perf = k.perf;
     if (env("ESPICE_SOLVER")) |s| k.newton.pin = @TypeOf(k.newton.pin).names.get(s) orelse .auto;
     k.newton.opdbg = isSet("ZP_OPDBG");
     k.newton.newton_debug = isSet("ZP_NEWTON_DEBUG");

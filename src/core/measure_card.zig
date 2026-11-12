@@ -58,10 +58,13 @@ pub const Check = struct {
 
 /// One postfix op of a `PARAM=` measure or a `par('expr')` waveform: a
 /// constant, the result of the `measure`-th card, a result vector by label
-/// (`v(out)`, `i(v1)`; waveforms only), `soa_count()` (the SOA excursions
-/// of the result a PARAM card reads, `Result.soa_count`, #238), or an
-/// arithmetic operator.
-pub const MeasureOp = union(enum) { num: f64, measure: u32, vector: []const u8, soa_count, neg, add, sub, mul, div, pow };
+/// (`v(out)`, `i(v1)`, `time`; waveforms only), `soa_count()` (the SOA
+/// excursions of the result a PARAM card reads, `Result.soa_count`, #238),
+/// an arithmetic, comparison or logic operator (`not`, `and`, `or`; 1 or
+/// 0), or `ternary`, `c ? a : b` over c, a, b. An operator with a NaN
+/// operand gives NaN: ngspice fails a PARAM card that reads a failed one,
+/// whose name it never defined (measure.c:366-372, 459-466).
+pub const MeasureOp = union(enum) { num: f64, measure: u32, vector: []const u8, soa_count, neg, not, add, sub, mul, div, pow, lt, gt, le, ge, eq, ne, @"and", @"or", ternary };
 
 /// A clause value HSPICE lets name earlier `.meas` results (`FROM=t10`,
 /// `TD='tr+1n'`): `expr` is evaluated over them before the clause runs and

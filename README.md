@@ -5,7 +5,7 @@ A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compi
 through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
-espice deck.sp                                   # ngspice, HSPICE or Spectre deck, detected
+espice deck.sp                                   # ngspice deck; HSPICE or Spectre detected, translated by spice2rack
 espice -r out.raw deck.sp                        # also write waveforms
 espice --format=touchstone -r out.s2p deck.sp
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes

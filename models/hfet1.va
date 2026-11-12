@@ -39,9 +39,13 @@ module hfet1(d, g, s);
                                                   // *instance* `m`; the model-level
                                                   // `m` below is the knee shape)
     parameter real dtemp = 0.0;                   // instance temp offset [K]
-    parameter real temp  = -1.0;                  // explicit instance temp [K];
-                                                  // <=0 means $temperature+dtemp
-    parameter real tnom  = $simparam("tnom") + 273.15 from (0:inf);   // .options tnom (CKTnomTemp) [K]
+    parameter real temp  = 27.0;                  // explicit instance temp [degC]
+                                                  // (hfetparam.c:61-63); wins over
+                                                  // dtemp (hfettemp.c:62-68)
+    // No model TNOM: ngspice refers every tempco to .options tnom
+    // (CKTnomTemp, hfettemp.c:71-73) and 44.2 prints "unrecognized parameter
+    // (tnom) - ignored" for one on the card, which a degC card value read
+    // here as kelvin would not.
 
     // --- polarity / gate model selection ---
     parameter integer type    = 1 from [-1:1] exclude 0;  // +1 NHFET, -1 PHFET
@@ -50,6 +54,7 @@ module hfet1(d, g, s);
 
     // --- channel ---
     parameter real vto     = 0.15;                // threshold [V] (PHFET: -0.15)
+    aliasparam vt0 = vto;                    // ngspice hfet.c:46-47 IOPR spelling
     parameter real lambda  = 0.15;                // channel-length modulation [1/V]
     parameter real mu      = 0.4    from (0:inf); // low-field mobility [m^2/Vs]
     parameter real vs      = 1.5e5  from (0:inf); // saturation velocity [m/s]
@@ -198,7 +203,7 @@ module hfet1(d, g, s);
     endfunction
 
     // bias-independent prep (hfettemp.c)
-    real tempk, dtn, vth, etavth, mu_t, vto_t, lambda_t, vt1_i, vt2_i;
+    real tempk, tnom, dtn, vth, etavth, mu_t, vto_t, lambda_t, vt1_i, vt2_i;
     real n0, n02, gchi0, imax, vl, cf, area_half, rt, wl, iso, ggrwl;
     real is1s_a, is2s_a, is1d_a, is2d_a, deltasqr, csat_th;
     real iseff_s, ln1_s, lne_s, iseff_d, ln1_d, lne_d;
@@ -213,8 +218,9 @@ module hfet1(d, g, s);
     analog begin
         // ==== §1.5 temperature map — hfettemp.c:62-90 =====================
         // Instance temperature tracks .options temp / .temp unless given.
-        if (temp > 0.0) tempk = temp;
-        else            tempk = $temperature + dtemp;
+        if ($param_given(temp)) tempk = temp + 273.15;
+        else                    tempk = $temperature + dtemp;
+        tnom = $simparam("tnom") + 273.15;        // .options tnom [K]
         dtn = tempk - tnom;                       // reference is tnom, NOT tf
         vth = 1.38064852e-23 / 1.6021766208e-19 * tempk;
 

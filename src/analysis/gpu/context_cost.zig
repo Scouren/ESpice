@@ -1,7 +1,8 @@
 //! The `auto` backend's price of a GPU query. In: the circuit's batches, a
 //! host probe of their eval time, the caller's eval estimate, the machine's
 //! calibrated constants (`machine.zig`) and the measurements earlier runs
-//! left in the cache directory. Out: an admit or a
+//! left in the cache directory; under lever `p1`, the census and the
+//! file's model rows alone (`../price.zig`). Out: an admit or a
 //! decline before the first driver call, the audit that holds an admitted
 //! query to its price, and the JIT warmth of the heavy kernel images.
 //! Cites #126 and #139 (the measurements behind the constants).
@@ -15,6 +16,8 @@
 //! - `pub fn quote(gpa: std.mem.Allocator, host: Host, threads: u32, c: *const Constants) !price.Cost`
 //! - `pub fn recommend(host: Host, m: ?*const Machine) bool`
 //! - `pub fn imageOf(kernel: []const u8) ?[:0]const u8`
+//! - `pub fn imageKey(kernel: []const u8) u64`
+//! - `pub fn unpriced(m: *const Machine, b: device_ir.Batch) bool`
 //! - `pub fn imageWarm(image: []const u8, knobs: Knobs) bool`
 //! - `pub fn markWarm(image: []const u8, knobs: Knobs) void`
 
@@ -29,6 +32,7 @@ const devices = @import("devices.zig");
 const context = @import("context.zig");
 const ctx_scatter = @import("context_scatter.zig");
 const price = @import("price.zig");
+const placement = @import("../price.zig");
 const machine = @import("../machine.zig");
 const Machine = machine.Machine;
 const Constants = machine.Constants;
@@ -147,6 +151,9 @@ const StubBatch = struct {
     count: u32 = 1,
     /// `GpuPayload.instances`: `count` instances' bytes.
     held: []const u8 = &.{},
+    /// `GpuPayload.kernel`: no image in a test build, so its name keys
+    /// the model row (`imageKey`).
+    kernel: []const u8 = "",
     evals: u32 = 0,
 
     fn eval(ctx: *anyopaque, _: *const Planes, _: u32, _: u32, _: []const f64, _: f64) void {
@@ -159,7 +166,7 @@ const StubBatch = struct {
     fn payload(ctx: *anyopaque) device_ir.GpuPayload {
         const self: *StubBatch = @ptrCast(@alignCast(ctx));
         return .{
-            .kernel = "",
+            .kernel = self.kernel,
             .count = self.count,
             .n_u = 2,
             .models = &.{},
@@ -186,7 +193,10 @@ const StubBatch = struct {
 /// `NotEnoughGpuWork`, from the machine's calibrated constants (`m.c`):
 /// the GPU must beat the CPU by `min_ratio` per eval and by `margin` over
 /// the whole query, the driver's `start_ms` included unless `driver_up`.
+/// Under lever `p1` it prices from `m`'s model rows and the census alone
+/// (`placement.place`): no probe, no record, `driver_up` unread.
 pub fn admit(gpa: std.mem.Allocator, host: Host, threads: u32, evals: f64, driver_up: bool, m: *const Machine) !Price {
+    if (host.knobs.perf.p1) return admitPriced(gpa, host, threads, evals, m);
     const c = &m.c;
     const stats = host.knobs.gpu_stats != .off;
     const init_us: f64 = if (driver_up) 0 else c.start_ms * 1e3;
@@ -313,6 +323,21 @@ pub fn imageOf(kernel: []const u8) ?[:0]const u8 {
     return images[e.blob];
 }
 
+/// The key of `kernel`'s `machine.Model` row: the Wyhash of its embedded
+/// image, or of the kernel's name when this build has none (a runtime
+/// `.hdl` image, which calibrate never measures, so it has no row).
+pub fn imageKey(kernel: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, imageOf(kernel) orelse kernel);
+}
+
+/// Under lever `p1`, whether eligible batch `b` stays on the host: `m`
+/// holds no model row for its image (08-placement.md sec. 2). False for a
+/// batch without a GPU payload, which never leaves the host anyway.
+pub fn unpriced(m: *const Machine, b: device_ir.Batch) bool {
+    const get = b.hooks.gpu_payload orelse return false;
+    return placement.rowOf(m, imageKey(get(b.ctx).kernel)) == null;
+}
+
 pub fn imageWarm(image: []const u8, knobs: Knobs) bool {
     return sassFits() or markedWarm(image, knobs);
 }
@@ -328,6 +353,47 @@ pub fn markWarm(image: []const u8, knobs: Knobs) void {
 }
 
 // ---- private ----
+
+/// `admit` under lever `p1`: the census of `host`'s eligible batches
+/// (image keys and widths, the bytes `quote` prices) at `threads` lanes
+/// and `evals` evals, placed by `placement.place`. Evaluates nothing.
+fn admitPriced(gpa: std.mem.Allocator, host: Host, threads: u32, evals: f64, m: *const Machine) !Price {
+    const stats = host.knobs.gpu_stats != .off;
+    var slots: u64 = 0;
+    var n_rows: usize = 0;
+    for (host.batches) |b| {
+        const get = b.hooks.gpu_payload orelse continue;
+        if (!b.has_const_jacobian) slots += get(b.ctx).slots.len;
+        n_rows += 1;
+    }
+    const rows = try gpa.alloc(placement.Batch, n_rows);
+    defer gpa.free(rows);
+    var i: usize = 0;
+    for (host.batches) |b| {
+        const get = b.hooks.gpu_payload orelse continue;
+        const p = get(b.ctx);
+        rows[i] = .{ .image = imageKey(p.kernel), .count = @max(p.count, 1) };
+        i += 1;
+    }
+    assert(i == n_rows);
+    const n_planes: usize = if (host.has_charge) 4 else 2;
+    const ng = host.planes.g_vals.len;
+    const nr = host.planes.rhs.len;
+    const census: placement.Census = .{
+        .batches = rows,
+        .evals = evals,
+        .bus_bytes = @floatFromInt((n_planes * (ng + nr) / 2 + 2 * host.n) * @sizeOf(f64)),
+        .stage_bytes = @floatFromInt(slots * n_planes / 2 * @sizeOf(f64)),
+        .lanes = @max(threads, 1),
+    };
+    const v = placement.place(m, &census);
+    if (!v.device) return decline(stats, v.cpu_us, v.gpu_us, "priced from the calibration's rows");
+    if (stats) std.debug.print(
+        "gpu-stats: cost per eval cpu={d:.0} us gpu={d:.0} us ({d} of {d} batches priced), {d:.0} evals: GPU\n",
+        .{ v.cpu_us, v.gpu_us, v.priced, n_rows, evals },
+    );
+    return .{ .cpu_us = v.cpu_us, .key = CostCache.key(host, threads, evals) };
+}
 
 /// `gpuWins` for prices `Audit` measured: no per-eval safety ratio
 /// (the audit demotes at 1), the query margin and the setup kept.
@@ -488,6 +554,48 @@ test "Cost.admit prices a measured host eval and leaves the planes alone" {
         try std.testing.expectEqual(@as(u32, 0), other.evals);
         try std.testing.expectEqualSlices(f64, &@as([8]f64, @splat(7)), &vals);
     }
+}
+
+test "Cost.admit under p1: the file's model rows decide, nothing is probed, driver_up is unread" {
+    // Oracle: hand arithmetic on rows written here (flat across sizes, so
+    // `interp` returns them): `fast` saves 1e6 * (1000 - 3.3 * ~50) us,
+    // past the 350 ms start; `slow` loses per eval; `none` has no row. The
+    // stub counts its host evals: a probe would make them nonzero.
+    const gpa = std.testing.allocator;
+    var gpu_hooks: device_ir.Hooks = undefined;
+    gpu_hooks.gpu_payload = StubBatch.payload;
+    var host_hooks: device_ir.Hooks = undefined;
+    host_hooks.gpu_payload = null;
+    var vals: [8]f64 = @splat(7);
+    const planes: Planes = .{ .g_vals = vals[0..2], .c_vals = vals[2..4], .rhs = vals[4..6], .q_vec = vals[6..8] };
+    const models = [_]machine.Model{
+        .{ .image = imageKey("fast"), .dev_us = @splat(50), .host_p_us = @splat(1000), .host_e_us = @splat(1000), .jit_ms = 0, .lane_gain = 1 },
+        .{ .image = imageKey("slow"), .dev_us = @splat(5000), .host_p_us = @splat(100), .host_e_us = @splat(100), .jit_ms = 0, .lane_gain = 1 },
+    };
+    const m: Machine = .{ .id = .{ .threads = 1 }, .c = try fixture(), .models = &models };
+    const Case = struct { kernel: []const u8, evals: f64, admitted: bool };
+    for ([_]Case{
+        .{ .kernel = "fast", .evals = 1e6, .admitted = true },
+        // 300 evals save ~250 ms: under the start, whether or not the
+        // driver is up.
+        .{ .kernel = "fast", .evals = 300, .admitted = false },
+        .{ .kernel = "slow", .evals = 1e6, .admitted = false },
+        .{ .kernel = "none", .evals = 1e6, .admitted = false },
+    }) |c| for ([_]bool{ false, true }) |driver_up| {
+        var dev: StubBatch = .{ .spin_ns = 0, .kernel = c.kernel };
+        const batches = [_]device_ir.Batch{dev.batch(&gpu_hooks)};
+        const host: Host = .{ .batches = &batches, .planes = planes, .n = 2, .trash_slot = 2, .has_charge = false, .knobs = .{ .perf = .{ .p1 = true } } };
+        const got = admit(gpa, host, 1, c.evals, driver_up, &m);
+        if (c.admitted) {
+            try std.testing.expectApproxEqRel(@as(f64, 1000), (try got).cpu_us, 1e-12);
+        } else try std.testing.expectError(Error.NotEnoughGpuWork, got);
+        try std.testing.expectEqual(@as(u32, 0), dev.evals);
+        try std.testing.expectEqualSlices(f64, &@as([8]f64, @splat(7)), &vals);
+        try std.testing.expectEqual(std.mem.eql(u8, c.kernel, "none"), unpriced(&m, batches[0]));
+    };
+    // A batch without a GPU payload is never `unpriced`: it is the host's.
+    var cpu_only: StubBatch = .{ .spin_ns = 0 };
+    try std.testing.expect(!unpriced(&m, cpu_only.batch(&host_hooks)));
 }
 
 test "Cost.recommend speaks for one history line, not for a thousand" {

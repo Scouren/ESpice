@@ -71,10 +71,13 @@ pub fn instantiateMove(template: *const Prepared, gpa: Allocator) !Circuit {
 /// `template`. Free it with `deinit`.
 pub fn fromSnapshot(template: *const Prepared, source: *const Circuit, gpa: Allocator) !Circuit {
     if (source.n != template.n or source.col_ptr.ptr != template.col_ptr.ptr) return error.IncompatibleDependency;
+    const kept = try keptOrder(source, gpa);
+    errdefer gpa.free(kept);
     const batches = try copyBatches(gpa, source.batches, "snapshot");
     errdefer freeBatches(gpa, batches);
 
     var ckt = try allocate(template.*, gpa, batches, .borrowed);
+    ckt.c8_order = kept;
     ckt.sim = source.sim;
     ckt.temp_c = source.temp_c;
     return ckt;
@@ -88,7 +91,10 @@ pub fn fromSnapshotMove(template: *const Prepared, source: *Circuit, gpa: Alloca
     if (source.n != template.n or source.col_ptr.ptr != template.col_ptr.ptr) return error.IncompatibleDependency;
     if (source.owns_batches and (source.gpa.ptr != gpa.ptr or source.gpa.vtable != gpa.vtable))
         return fromSnapshot(template, source, gpa);
+    const kept = try keptOrder(source, gpa);
+    errdefer gpa.free(kept);
     var ckt = try allocate(template.*, gpa, source.batches, .borrowed);
+    ckt.c8_order = kept;
     ckt.owns_batches = source.owns_batches;
     ckt.sim = source.sim;
     ckt.temp_c = source.temp_c;
@@ -136,6 +142,8 @@ pub fn release(self: *Circuit) void {
         if (self.pooled()) |p| p.give(@intFromPtr(self.col_ptr.ptr), self.knobs.newton, self.knobs.lu, w.*) else w.deinit(gpa);
     }
     self.ws = null;
+    gpa.free(self.c8_order);
+    self.c8_order = &.{};
     if (self.load_check) |*lc| lc.deinit(gpa);
     self.load_check = null;
     if (self.param_refs) |refs| gpa.free(refs);
@@ -240,6 +248,7 @@ fn allocate(data: Prepared, gpa: Allocator, batches: []Batch, topology: Topology
         .current_row = data.current_row,
         .has_charge = data.has_charge,
         .has_state_q = data.has_state_q,
+        .linear = data.linear,
         .has_baseline = false,
         .g_base = &.{},
         .c_base = &.{},
@@ -275,4 +284,13 @@ fn copyBatches(gpa: Allocator, sources: []const Batch, comptime hook: []const u8
 fn freeBatches(gpa: Allocator, batches: []const Batch) void {
     for (batches) |b| b.hooks.deinit(b.ctx, gpa);
     gpa.free(batches);
+}
+
+/// A copy of the column order `source`'s solver kept under lever C8
+/// (`direct.Solver.keptOrder`); empty when there is none or no workspace.
+fn keptOrder(source: *const Circuit, gpa: Allocator) Allocator.Error![]u32 {
+    const ws = if (source.ws) |*w| w else return &.{};
+    const order = ws.slv.keptOrder() orelse return &.{};
+    assert(order.len == source.n);
+    return gpa.dupe(u32, order);
 }

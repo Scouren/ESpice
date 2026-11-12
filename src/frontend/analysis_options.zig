@@ -6,7 +6,7 @@
 //!
 //! Contents:
 //! - `pub const DeckOptions`
-//! - `pub fn deckOptions(config: []const netlist.Config, dialect: netlist.Dialect) !DeckOptions`
+//! - `pub fn deckOptions(config: []const netlist.Config) !DeckOptions`
 //! - `pub fn applyDeckOptions(job: *Job, o: DeckOptions) void`
 
 const std = @import("std");
@@ -25,17 +25,19 @@ const GROUND = core.GROUND;
 const Library = @import("device").Library;
 const analysis_args = @import("analysis_args.zig");
 
-/// Parsed `.options` overrides, in deck order: a later card wins.
+/// Parsed `.options` overrides, in deck order: a later card wins, except
+/// that a `.temp` card beats every `.options temp`.
 pub const DeckOptions = struct {
     /// The `.options` tolerances and iteration limits, copied into every
     /// query by `applyDeckOptions`.
     tol: numerics.Tolerances = .{},
-    /// `.options method`; null keeps each query's default.
+    /// `.options method` (`gear`, `trap` or `trapezoidal`; another name
+    /// warns and changes nothing); null keeps each query's default.
     method: ?requests.Method = null,
-    /// `.temp` or `.options temp` in degrees Celsius; null when not given.
+    /// The last `.temp` card (27 when it holds other than one value), else
+    /// the last `.options temp`, in degrees Celsius; null when neither is
+    /// given.
     temp_c: ?f64 = null,
-    /// An HSPICE `.temp t1 t2 ...` list: every query runs at each.
-    temp_list: []const Value = &.{},
     /// `.options delmax`: the transient step cap when the `.tran` card sets
     /// none.
     delmax: ?f64 = null,
@@ -77,16 +79,17 @@ const runlvl_trtol = [6]f64{ 28, 14, 7, 3.5, 1.75, 0.875 };
 /// Option names outside this list (and the ones `foldOptions` passes on to
 /// other readers) are not simulated, and each draws a warning in every
 /// dialect. `gshunt`, `cshunt` and `rshunt` are read by the netlist.
-const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt, maxwarns };
+const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt, maxwarns, dv };
 
 /// Folds the deck's `.options` and `.temp` cards; `InvalidAnalysisArguments`
 /// on a value out of range, logged with its card. The last `.temp` card
-/// wins, whether it is one value or a list. The HSPICE dialect defaults TNOM to 25 degC and
-/// runs the circuit at TNOM [SA Ch.20]; ngspice defaults both to 27 degC.
-pub fn deckOptions(config: []const netlist.Config, dialect: netlist.Dialect) !DeckOptions {
+/// sets the temperature over every `.options temp`, as in ngspice 44.2;
+/// without one, the last `.options temp` does. TNOM and the run
+/// temperature default to 27 degC, as in ngspice.
+pub fn deckOptions(config: []const netlist.Config) !DeckOptions {
     // The card being folded, named by any error it raises.
     var line: []const u8 = "";
-    return foldOptions(config, dialect, &line) catch |err| {
+    return foldOptions(config, &line) catch |err| {
         // The test runner fails any test that logs an error.
         if (!@import("builtin").is_test) std.log.err("options: {s}: {s}", .{ line, @errorName(err) });
         return err;
@@ -120,40 +123,31 @@ pub fn applyDeckOptions(job: *Job, o: DeckOptions) void {
 
 // ---- private ----
 
-fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *[]const u8) !DeckOptions {
-    // HSPICE spellings: ABSV/RELV/ABSI are VNTOL/RELTOL/ABSTOL, GMINDC the DC
-    // gmin (ESPice has one gmin), METHOD=BDF its Gear.
+fn foldOptions(config: []const netlist.Config, line: *[]const u8) !DeckOptions {
+    // HSPICE's ABSV, RELV, ABSI, GMINDC and METHOD=BDF are SpiceRack's to
+    // write as VNTOL, RELTOL, ABSTOL, GMIN and GEAR: ngspice 44.2 ignores
+    // the names and warns on the method (measured), and so does ESPice.
     const names = std.StaticStringMap(Option).initComptime(.{
-        .{ "method", .method }, .{ "reltol", .reltol },             .{ "abstol", .abstol },
-        .{ "vntol", .vntol },   .{ "gmin", .gmin },                 .{ "trtol", .trtol },
-        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },                 .{ "itl2", .itl2 },
-        .{ "itl4", .itl4 },     .{ "maxord", .maxord },             .{ "temp", .temp },
-        .{ "tnom", .tnom },     .{ "absv", .vntol },                .{ "relv", .reltol },
-        .{ "absi", .abstol },   .{ "gmindc", .gmin },               .{ "delmax", .delmax },
-        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt },             .{ "xmu", .xmu },
-        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling }, .{ "maxwarns", .maxwarns },
+        .{ "method", .method },             .{ "reltol", .reltol },     .{ "abstol", .abstol },
+        .{ "vntol", .vntol },               .{ "gmin", .gmin },         .{ "trtol", .trtol },
+        .{ "chgtol", .chgtol },             .{ "itl1", .itl1 },         .{ "itl2", .itl2 },
+        .{ "itl4", .itl4 },                 .{ "maxord", .maxord },     .{ "temp", .temp },
+        .{ "tnom", .tnom },                 .{ "delmax", .delmax },     .{ "gshunt", .gshunt },
+        .{ "cshunt", .cshunt },             .{ "xmu", .xmu },           .{ "rshunt", .rshunt },
+        .{ "tran_ceiling", .tran_ceiling }, .{ "maxwarns", .maxwarns }, .{ "dv", .dv },
     });
-    const methods = std.StaticStringMap(requests.Method).initComptime(.{
-        .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal }, .{ "bdf", .gear_2 },
-    });
-    var o: DeckOptions = .{ .tnom_c = if (dialect == .hspice) 25 else 27 };
+    const methods = std.StaticStringMap(requests.Method).initComptime(.{ .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal } });
+    var o: DeckOptions = .{};
     var maxord: ?f64 = null;
     var runlvl: ?f64 = null;
     var accurate = false;
     var fast = false;
+    var last_temp: ?netlist.Config = null;
     for (config) |card| {
         line.* = card.line;
         const args = card.args;
         if (card.temp) {
-            // The last `.temp` card wins, list or single value.
-            if (args.len > 1) {
-                o.temp_list = args;
-                o.temp_c = null;
-                continue;
-            }
-            o.temp_c = try analysis_args.number(args, 0);
-            o.temp_list = &.{};
-            if (o.temp_c.? <= -273.15) return error.InvalidAnalysisArguments;
+            last_temp = card;
             continue;
         }
         var lower: [16]u8 = undefined;
@@ -206,8 +200,10 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
             }
             if (option == .method) {
                 const method = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-                if (method.len > lower.len) return error.InvalidAnalysisArguments;
-                o.method = methods.get(std.ascii.lowerString(lower[0..method.len], method)) orelse return error.InvalidAnalysisArguments;
+                const known_method = if (method.len <= lower.len) methods.get(std.ascii.lowerString(lower[0..method.len], method)) else null;
+                // ngspice 44.2: "unsupported integration method", and the
+                // run keeps the method it had (measured on `method=bdf`).
+                if (known_method) |m| o.method = m else std.log.warn("options: unsupported integration method '{s}'; the method is unchanged", .{method});
                 continue;
             }
             const raw = try analysis_args.number(args, i);
@@ -256,12 +252,27 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                     if (!(value > 0)) return error.InvalidAnalysisArguments;
                     if (option == .reltol) o.tol.reltol = value else o.tol.trtol = value;
                 },
+                .dv => {
+                    if (!(value > 0)) return error.InvalidAnalysisArguments;
+                    o.tol.dv = value;
+                },
                 inline else => |field| {
                     if (value < 0) return error.InvalidAnalysisArguments;
                     @field(o.tol, @tagName(field)) = value;
                 },
             }
         }
+    }
+    // ngspice 44.2 (measured): only the last `.temp` card counts, and it
+    // beats every `.options temp` before or after it. One value is the
+    // temperature; any other count warns and runs at the default 27 degC.
+    if (last_temp) |card| {
+        line.* = card.line;
+        o.temp_c = if (card.args.len == 1) try analysis_args.number(card.args, 0) else blk: {
+            std.log.warn("options: {s}: could not set the temperature; the circuit runs at 27 degC, as in ngspice (.dc temp sweeps it)", .{card.line});
+            break :blk 27;
+        };
+        if (o.temp_c.? <= -273.15) return error.InvalidAnalysisArguments;
     }
     // ngspice raises the order only from 1 to 2 and only when maxord > 1
     // (dctran.c:900), so maxord=1 is backward Euler under trap as under gear,
@@ -272,6 +283,5 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
     var level = runlvl orelse if (fast and !accurate) @as(f64, 1) else 0;
     if (accurate and runlvl != 0) level = @max(level, 5);
     if (level != 0) o.trtol = runlvl_trtol[@as(usize, @intFromFloat(level)) - 1];
-    if (dialect == .hspice and o.temp_c == null and o.temp_list.len == 0) o.temp_c = o.tnom_c;
     return o;
 }

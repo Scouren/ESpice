@@ -7,6 +7,7 @@
 //! Contents:
 //! - `pub fn addTxl(self: *NetBuilder, dev: Device) !void`
 //! - `pub fn addLossyLine(self: *NetBuilder, dev: Device) !void`
+//! - `pub fn addTline(self: *NetBuilder, dev: Device) !void`
 //! - `pub fn addUrc(self: *NetBuilder, dev: Device) !void`
 //! - `pub fn addCpl(self: *NetBuilder, dev: Device) !void`
 //! - `pub fn addWline(self: *NetBuilder, dev: Device) !void`
@@ -46,7 +47,8 @@ const NetBuilder = net_builder.NetBuilder;
 
 /// TXL (Y card) on txl.va's Pade/history line. The RC case inp2y
 /// expands into 3-pi sections (r/l > 1.6e10) is refused, not approximated;
-/// a failed fit refuses the run (txl.va $fatal).
+/// a failed fit refuses the run (txl.va $fatal). r=0 is ReadTxL's lossless
+/// line (txlsetup.c: R/L < 5e5 and G < 1e-2), txl.va's `lsl` branch.
 pub fn addTxl(self: *NetBuilder, dev: Device) !void {
     if (dev.pins.len != 4) return error.InvalidTransmissionLinePorts;
     var r: f64 = 0;
@@ -55,16 +57,23 @@ pub fn addTxl(self: *NetBuilder, dev: Device) !void {
     var c: f64 = 0;
     var len: f64 = 0;
     if (dev.model) |m| {
-        r = try net_cards.numericParameter(m.kv, "r") orelse 0;
+        // txlsetup.c:93-97 refuses a model without r= (E_BADPARM).
+        r = try net_cards.numericParameter(m.kv, "r") orelse return error.UnsupportedTransmissionLineParameters;
         l = try net_cards.numericParameter(m.kv, "l") orelse 0;
         g = try net_cards.numericParameter(m.kv, "g") orelse 0;
         c = try net_cards.numericParameter(m.kv, "c") orelse 0;
         len = try net_cards.numericParameter(m.kv, "length") orelse 0;
     }
-    if ((try net_cards.numericParameter(dev.kv, "length")) orelse (try net_cards.numericParameter(dev.kv, "len"))) |v| len = v;
-    // numericParameter already rejected non-finite values.
-    if (g < 0 or r <= 0 or l <= 0 or c <= 0 or len <= 0 or r / l > 1.6e10 or
-        !std.math.isFinite(r * len) or r * len <= 0)
+    // inp2y.c reads only `len` after the model name; ngspice runs a card
+    // `length=` with the model's length.
+    if (try net_cards.numericParameter(dev.kv, "len")) |v| len = v;
+    for (dev.kv) |item| if (std.mem.eql(u8, item.key, "length") and !@import("builtin").is_test)
+        std.log.warn("Y element '{s}': length= is ignored on a Y card, as ngspice ignores it; use len=", .{dev.name});
+    // numericParameter already rejected non-finite values. r=0 with
+    // g >= 1e-2 misses the lossless branch and reaches main_pade, whose
+    // y_pade divides by R/L: ngspice 44.2 aborts it ("Timestep too small").
+    if (g < 0 or r < 0 or l <= 0 or c <= 0 or len <= 0 or r / l > 1.6e10 or (r == 0 and g >= 1e-2) or
+        !std.math.isFinite(r * len) or (r > 0 and r * len <= 0))
         return error.UnsupportedTransmissionLineParameters;
     var nm: devices.txl.Model = .{ .r = r, .l = l, .g = g, .c = c, .len = len };
     net_devices.deriveModel(devices.txl, &nm, self.b, dev.pins.len);
@@ -84,15 +93,22 @@ pub fn addTxl(self: *NetBuilder, dev: Device) !void {
 /// static RG line to lossy_tline.va's exact two-port. Anything else is refused.
 pub fn addLossyLine(self: *NetBuilder, dev: Device) !void {
     if (dev.pins.len != 4) return error.InvalidTransmissionLinePorts;
+    // ngspice's O card sets only initial conditions (ltra.c LTRApTable); the
+    // length and every line constant are the model's. A card `len=` is
+    // ngspice's "unknown parameter (len)".
+    for (dev.kv) |item| if (!isLineIc(item.key)) {
+        if (!@import("builtin").is_test) std.log.err("O element '{s}': unknown instance parameter '{s}'; the line's length and constants are its model's (len=, r=, l=, g=, c=)", .{ dev.name, item.key });
+        return error.UnknownParameter;
+    };
     var model: devices.lossy_tline.Model = .{};
-    if (dev.model) |m| {
-        try net_cards.applyKv(&model, m.kv);
-        // TXL model cards spell the line length `length=`; the
-        // lossy_tline field is `len`.
-        if (try net_cards.numericParameter(m.kv, "length")) |length| model.len = @floatCast(length);
+    if (dev.model) |m| try net_cards.applyKv(&model, m.kv);
+    // An LTRA model's length is `len=` alone: ngspice 44.2 ignores a
+    // `length=` ("unrecognized parameter") and LTRAsetup then refuses the
+    // line, as it refuses any model without len=.
+    if (model.len == 0) {
+        if (!@import("builtin").is_test) std.log.err("O element '{s}': lossy line length must be given (len= on its LTRA model)", .{dev.name});
+        return error.UnsupportedTransmissionLineParameters;
     }
-    try net_cards.applyKv(&model, dev.kv);
-    if (try net_cards.numericParameter(dev.kv, "length")) |length| model.len = @floatCast(length);
 
     const len: f64 = @as(f64, model.len);
     if (len <= 0 or model.r < 0 or model.l < 0 or model.g < 0 or model.c < 0)
@@ -139,6 +155,11 @@ pub fn addLossyLine(self: *NetBuilder, dev: Device) !void {
         return error.UnsupportedTransmissionLineParameters;
     }
 
+    // ltraload.c:289-300 keeps the ICs under uic, and the convolution reads
+    // them as t <= 0; an RG line (returned above) never reads them
+    // (ltraload.c:228).
+    try refuseIcUnderUic(self, dev, 'o');
+
     var ports: [4]u32 = undefined;
     for (&ports, dev.pins) |*port, pin| port.* = try self.rowOf(pin);
 
@@ -167,6 +188,27 @@ pub fn addLossyLine(self: *NetBuilder, dev: Device) !void {
     if (!net_cards.finiteLineCoefficients(.{ t_model.z0, t_model.td }) or t_model.z0 <= 0 or t_model.td <= 0)
         return error.UnsupportedTransmissionLineParameters;
     try self.b.addDevice(devices.tline, dev.name, &t_model, &.{}, ports);
+}
+
+/// T card (tra.c) on tline.va, bound like any letter card. Its initial
+/// conditions are dropped without uic, where ngspice's operating point
+/// replaces them (traload.c:67-78), and refused under uic, where ngspice
+/// seeds the delay history with them (traload.c:61-66, 79-86).
+pub fn addTline(self: *NetBuilder, dev: Device) !void {
+    try refuseIcUnderUic(self, dev, 't');
+    var kv: std.ArrayList(Kv) = .empty;
+    for (dev.kv) |item| {
+        // tline.va's ic_v1..ic_i2 are declared and read by nothing yet: a
+        // card that set one would be dropped silently. ngspice has no such key.
+        if (std.mem.startsWith(u8, item.key, "ic_")) {
+            if (!@import("builtin").is_test) std.log.err("{s}: unknown instance parameter '{s}'", .{ dev.name, item.key });
+            return error.UnknownParameter;
+        }
+        if (!isLineIc(item.key)) try kv.append(self.arena, item);
+    }
+    var line = dev;
+    line.kv = kv.items;
+    net_devices.addSingleDevice(self, devices.tline, line) catch |err| return net_devices.named(dev, err);
 }
 
 /// URC (U card): `Uxxx n1 n2 ngnd model [l=len] [n=lumps]`. Expanded, as
@@ -279,7 +321,10 @@ pub fn addCpl(self: *NetBuilder, dev: Device) !void {
     const nl = try net_cards.cplVector(card.kv, "l", &ll);
     const nc = try net_cards.cplVector(card.kv, "c", &cc);
     const ng = try net_cards.cplVector(card.kv, "g", &gg);
-    const length = (try net_cards.numericParameter(dev.kv, "length")) orelse (try net_cards.numericParameter(card.kv, "length")) orelse 0;
+    // inp2p.c reads the card's `length` or `len`; cplsetup.c:483-485 puts
+    // it over the model's.
+    const length = (try net_cards.numericParameter(dev.kv, "length")) orelse (try net_cards.numericParameter(dev.kv, "len")) orelse
+        (try net_cards.numericParameter(card.kv, "length")) orelse 0;
     const tri = n_lines * (n_lines + 1) / 2;
     if (nr != tri or nl != tri or nc != tri or (ng != 0 and ng != tri) or !std.math.isFinite(length) or length <= 0)
         return error.UnsupportedTransmissionLineParameters;
@@ -460,3 +505,23 @@ pub fn addSparam(self: *NetBuilder, dev: Device) !void {
 }
 
 // ---- private ----
+
+/// Whether `key` is one of an O or T card's initial conditions (ltra.c
+/// LTRApTable, tra.c:18-22): v1, v2, i1, i2, or the `ic=v1,i1,v2,i2` vector,
+/// whose tail the reader keeps as positional values.
+fn isLineIc(key: []const u8) bool {
+    for ([_][]const u8{ "v1", "v2", "i1", "i2", "ic" }) |k| if (std.mem.eql(u8, key, k)) return true;
+    return false;
+}
+
+/// Refuses `dev` when it carries initial conditions and the deck runs a
+/// uic `.tran` or `.pss`: ngspice starts the line's history from them,
+/// and tline.va and ltra.va start it from the uic start vector (KNOWN GAP
+/// tran/ltra_tran_uic_initial_conditions.sp). Without uic they are inert.
+fn refuseIcUnderUic(self: *const NetBuilder, dev: Device, letter: u8) error{UnsupportedCard}!void {
+    for (dev.kv) |item| if (isLineIc(item.key)) {
+        for (self.nl.deck.analyses) |dir| if ((dir.kind == .tran or dir.kind == .pss) and Value.hasUic(dir.args))
+            return net_cards.refuse(dev, letter, "v1, v2, i1, i2 and ic= under uic are not modelled; ngspice starts the line's history from them");
+        return;
+    };
+}

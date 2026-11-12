@@ -168,7 +168,7 @@ const models = @import("models");
 const GROUND = @import("../types.zig").GROUND;
 
 /// A deck with nothing in it but `probes`, for driving a Session by hand.
-fn bareDeck(probes: []const u32, labels: []const []const u8) Deck {
+pub fn bareDeck(probes: []const u32, labels: []const []const u8) Deck {
     return .{
         .probes = probes,
         .probe_labels = labels,
@@ -197,7 +197,7 @@ fn paramRef(params: []const @import("../types.zig").ParamRef, ty: @import("devic
 
 /// An executor config with lane batching `lanes` and bypass off: lanes
 /// never bypass, so the oracle is the plain scalar run.
-fn laneConfig(lanes: bool) @import("../executor.zig").Config {
+pub fn laneConfig(lanes: bool) @import("../executor.zig").Config {
     var config: @import("../executor.zig").Config = .{};
     config.knobs.lanes = lanes;
     config.knobs.bypass = false;
@@ -1330,5 +1330,50 @@ test "a .four and .fft read a matching .tran's rows bitwise as their own runs, a
     for (fail_ids[1..]) |id| {
         try t.expectEqual(fail_ids[0], failing.rows.items(.reads)[@backingInt(id)]);
         try t.expectEqual(error.TransientFailed, (try failing.info(id)).failure.?);
+    }
+}
+
+test "a .pss spectrum reads its card's period rows, bitwise its own shooting, and shoots alone beside any other .pss" {
+    // Oracle: the spectrum query appended alone, which shoots its own orbit
+    // (`pss.finish`), the path a read period replaces. Red before
+    // `linkReaders` took `.pss`: every spectrum shot its own orbit.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const vin = try b.addNode();
+    const out = try b.addNode();
+    try b.addDevice(models.vsource, "", &.{ .dc = 0, .waveform = 2, .sin_vo = 0, .sin_va = 1, .sin_freq = 1e3 }, &.{}, .{ vin, GROUND });
+    try b.addDevice(models.resistor, "", &.{ .r = 1e3 }, &.{}, .{ vin, out });
+    try b.addDevice(models.capacitor, "", &.{ .c = 1e-7 }, &.{}, .{ out, GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    const deck = bareDeck(&.{ vin, out }, &.{ "v(in)", "v(out)" });
+    const spectrum: requests.Pss = .{ .period = 1e-3, .n_samples = 64, .harms = 5 };
+    var period = spectrum;
+    period.harms = 0;
+    // Another orbit: the spectrum must not read it.
+    var finer = period;
+    finer.n_samples = 128;
+    const own = blk: {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [1]requests.QueryId = undefined;
+        _ = try s.append(&.{.{ .pss = spectrum }}, &ids);
+        try s.runAll(.{ .quantum = .completion });
+        break :blk try t.allocator.dupe(f64, (try s.result(ids[0])).data);
+    };
+    defer t.allocator.free(own);
+    try t.expectEqual(@as(usize, 5 * 3), own.len);
+    for ([_]requests.Pss{ period, finer }, [_]bool{ true, false }) |source, reads| {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [2]requests.QueryId = undefined;
+        _ = try s.append(&.{ .{ .pss = source }, .{ .pss = spectrum } }, &ids);
+        try s.runAll(.{ .max_parallel = 2, .quantum = .completion });
+        try t.expectEqual(null, s.failure());
+        const i = @backingInt(ids[1]);
+        try t.expectEqual(reads, s.rows.items(.reads)[i] == ids[0]);
+        try t.expectEqual(reads, s.rows.items(.executor)[i].?.source != null);
+        try t.expectEqualSlices(u64, @ptrCast(own), @ptrCast((try s.result(ids[1])).data));
     }
 }

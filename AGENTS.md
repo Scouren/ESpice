@@ -31,7 +31,7 @@ Project-specific:
 | Skill | Use it for here |
 |---|---|
 | `spice-engine` | MNA stamps, sparse LU replay, Newton with limiting, timestep control, device derivatives, ngspice/Xyce oracles |
-| `compiler-construction` | `src/frontend`: the SPICE and Spectre netlist readers, expressions, coded diagnostics |
+| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: `src/spicerack.zig`), expressions, coded diagnostics |
 | `gpu-kernel-optimization` | `--backend cuda` and HIP: device evaluation and solves on the GPU, where the data lives |
 | `branchless` | Data-dependent branches in device evaluation (region selects, limiting), before `simd-loops` |
 
@@ -164,7 +164,7 @@ Project-specific:
 | Skill | Use it for here |
 |---|---|
 | `spice-engine` | MNA stamps, sparse LU replay, Newton with limiting, timestep control, device derivatives, ngspice/Xyce oracles |
-| `compiler-construction` | `src/frontend`: the SPICE and Spectre netlist readers, expressions, coded diagnostics |
+| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: `src/spicerack.zig`), expressions, coded diagnostics |
 | `gpu-kernel-optimization` | `--backend cuda` and HIP: device evaluation and solves on the GPU, where the data lives |
 | `branchless` | Data-dependent branches in device evaluation (region selects, limiting), before `simd-loops` |
 
@@ -294,8 +294,10 @@ An **oracle** is the independent thing that says an output is wrong. The main bu
 ## Building
 
 - Run every `zig build` inside `nix develop .#ci -c …` (or `nix develop` for the GPU toolchain). The shell gives each Zig store path its own global cache (`ZIG_GLOBAL_CACHE_DIR=~/.cache/zig-<store path>`). VerA pins a different build of the same Zig version, so with a shared `~/.cache/zig` the two evict each other's build runner and every `zig build`, even `--help`, takes about 2 minutes. The first build in a fresh cache pays a one-time compile of about 70 s.
-- Edit loop: keep `zig build check --watch -fincremental` running. `check` type-checks every test root without emitting or running anything, so an edit is re-checked in under a second. On 0.18.0-dev.349 the compiler segfaults with `-fincremental` on every root that imports the device module; only the core, solver and output roots survive it. A plain `--watch` works everywhere.
+- Edit loop: watch only the roots you are editing. Each test root has a `check-<root>` step that type-checks it without emitting or running anything (`zig build --help | grep check-`; src/core/root.zig is `check-core`, src/device/tests/eval.zig is `check-device-tests-eval`). Keep one watch over your root set: `zig build check-device check-analysis --watch`. Add `-fincremental` only to a watch of a single one of `check-core`, `check-solver` and `check-output`, under its lock (Worktrees): on 0.18.0-dev.349 the compiler segfaults with it on every root that imports the device module.
+- `zig build check` runs every `check-<root>`: the pre-commit build, run plain. A watch keeps one compiler process resident per root it covers, so a watch over all of `check` can run the machine out of memory by itself.
 - `zig build test` is the only test step. Narrow it with `-Dtest-filter=<unit test name>` and `-- --filter <deck path prefix>`. Run the corpus on a GPU with `-- --backend auto --jobs 1` (the release corpus: the placement users get); `-- --backend cuda --jobs 1` puts every eligible device on the GPU. Run it without `-fincremental`.
+- Test runs cache. A second `zig build test` with nothing changed finds every unit-test run cached (`--summary all` lists them). The corpus reruns every time (it takes `--` arguments, which turns its cache off), and so do the C API example and the codegen residue probe. Two rules keep the rest cached. A test run that needs an environment variable sets it with `setTestEnv` (build.zig), which drops what `nix develop` sets anew per call: a Run step hashes its whole environment once one variable is set. A test that reads a file at run time has its directory in `test_data_dirs`, so an edit to that file reruns it.
 - Day-to-day: Debug, passed explicitly (build.zig defaults to ReleaseFast): `-Doptimize=Debug -Dgpu=false -Dcuda-arch=none -Dhip-arch=none`. The gate and the nightly run ReleaseSafe: every assertion on, LLVM codegen. `--fuzz=<N>` needs LLVM, so fuzz in ReleaseSafe. ReleaseFast is for benchmarking only.
 
 Rebuild times per test root (measured 2026-10-19, when each root had its own step; 32 cores under load avg 11–17, `-Dgpu=false`; expect faster on a quiet machine):
@@ -321,5 +323,7 @@ Rebuild times per test root (measured 2026-10-19, when each root had its own ste
 ## Worktrees
 
 - Symlink a new worktree's `.zig-cache` to the main checkout's (`ln -s <main>/.zig-cache <worktree>/.zig-cache`) so they share build results. That needs VerA ≥ v0.20.0. Older VerA hashed absolute paths in its `simSources` WriteFiles, so each worktree regenerated every model and recompiled all device objects (230 s).
-- Shared caches share incremental state: run one `--watch -fincremental` per artifact at a time across all worktrees. Take the lock: `flock -n ~/.cache/espice-incremental.lock nix develop <main>#ci -c zig build check --watch -fincremental -Doptimize=Debug -Dgpu=false -Dcuda-arch=none -Dhip-arch=none`. If it's held, use plain `zig build check` (still cached per root).
+- A worktree at a commit another worktree built hits the shared cache: test roots name the `.hdl` sources relative to the build root (`HdlPaths` in build.zig), so they compile to the same bytes everywhere. What ships keeps absolute paths, so the `espice` exe, `libespice.a` and the binaries linking it (the C API test, the C example) build once per worktree.
+- Shared caches share incremental state, and every worktree's module paths are now the same. A `-fincremental` watch covers one root and holds its lock across all worktrees: `flock -n ~/.cache/espice-incremental-<root>.lock nix develop <main>#ci -c zig build check-<root> --watch -fincremental -Doptimize=Debug -Dgpu=false -Dcuda-arch=none -Dhip-arch=none`. If it's held, run plain `zig build check-<root>` (still cached). A plain `--watch` needs no lock.
+- Collect the shared cache when it passes its budget (`du -sh <main>/.zig-cache`), only while no build runs in any worktree. The budget is the working set of the one or two trees in use plus a margin; `--budget` has no default until that working set is measured. `python3 -I tools/zig_cache_gc.py --budget <size> --dry-run` prints the cache's bytes by last use and what it would remove; read both, then run it without `--dry-run`. A `warning: … used within 24 h` line means the budget reached entries relatime cannot order (atime moves at most once a day, so it marks their first use that day): raise the budget. It refuses while a `zig`, `maker` or `configurer` process works in any worktree. It removes `tmp/`, unfinished manifests and outputs no manifest names, then the least recently used manifest-and-output pairs and `z/` files until the cache fits, then every manifest whose output is gone, so no later build hits a deleted entry. It keeps `h/timestamp`, the corpus runner's `correctness/` and `metamorphic/`, `vera-check/` and `args/`, and touches nothing outside the cache. Collecting replaces deleting `.zig-cache`: the budget keeps the warm entries. When it stops early ("a build holds …"), rerun it once no build runs; its last pass repairs what a racing build left. Its test: `python3 -I -m unittest discover -s tools -p 'test_zig_cache_gc*.py'`.
 - Agents: one zig process each, and no build while `free -g` shows under 8 GB available.

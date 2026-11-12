@@ -5,7 +5,8 @@
 //! Newton solve per parameter. `Adjoint` is shared with `.dcmatch` and
 //! `.dcsens`.
 //! In: the circuit at its operating point and the output node pair. Out:
-//! one real point of dVout/dp per parameter, named as ngspice names it.
+//! one real point of dVout/dp per parameter, named as ngspice names it. The
+//! AC form (`opts.ac`) is `ac/sens_ac.zig`'s.
 //! Cites ngspice cktsens.c (Sens_Delta, names at :224-238) and the
 //! IF_PRINCIPAL tables of res.c, cap.c, ind.c, vsrc.c and isrc.c; #71, #85,
 //! #91, #154.
@@ -14,9 +15,11 @@
 //! - `pub const Options = core.query.Sens`
 //! - `pub const Adjoint = struct` (`init`, `deinit`, `fd`)
 //! - `pub fn run(ctx: *const RunCtx, opts: Options) !Result`
+//! - `pub fn sensParams(ckt: *Circuit, names: CardNames, gpa: Allocator) ![]ParamRef`
 //! - `pub fn solve(ckt, x_op, params, output_node, output_neg, gpa) ![]f64`
 //! - `pub fn fdStep(orig: f64) f64`
 //! - `pub fn isSensParam(type_name: []const u8, name: []const u8) bool`
+//! - `pub fn columnName(a: Allocator, scratch: Allocator, ctx: *const RunCtx, opts: Options, ref: ParamRef) Allocator.Error![]const u8`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -118,14 +121,12 @@ const principal = std.StaticStringMap([]const u8).initComptime(.{
 ///   principal instance parameter     -> `<card>`           (r1)
 ///   any other instance parameter     -> `<card>_<param>`   (r1_scale)
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    if (opts.ac != null) return @import("../ac/sens_ac.zig").run(ctx, opts);
     const a = ctx.allocator;
     const scratch = ctx.scratch_allocator;
-    const all = try ctx.circuit.collectParams();
-    var kept: std.ArrayList(root.ParamRef) = .empty;
-    defer kept.deinit(scratch);
+    const refs = try sensParams(ctx.circuit, opts.card_names, scratch);
+    defer scratch.free(refs);
 
-    for (all) |ref| if (isSensParam(ctx.circuit.typeName(ref.type), ref.param_name)) try kept.append(scratch, ref);
-    const refs = kept.items;
     const sens = try solve(ctx.circuit, ctx.x_op, refs, opts.output_node, opts.output_neg, scratch);
     defer scratch.free(sens);
 
@@ -145,6 +146,24 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .npoints = 1,
         .data = try a.dupe(f64, sens),
     };
+}
+
+/// Returns the parameters `.sens` lists (`isSensParam`), in
+/// `Circuit.collectParams` order, owned by `gpa`. An internal add
+/// (`CardNames.internal`), such as a portnum V's z0 resistor, has none:
+/// ngspice's z0 lives inside its vsrc, and 44.2 aborts `.sens` on a portnum
+/// deck ("node allocation in DEVsetup() during sensitivity analysis",
+/// measured).
+pub fn sensParams(ckt: *root.Circuit, names: root.CardNames, gpa: Allocator) ![]root.ParamRef {
+    const all = try ckt.collectParams();
+    var kept: std.ArrayList(root.ParamRef) = .empty;
+    errdefer kept.deinit(gpa);
+
+    for (all) |ref| {
+        if (names.internal(ref.type, ref.index)) continue;
+        if (isSensParam(ckt.typeName(ref.type), ref.param_name)) try kept.append(gpa, ref);
+    }
+    return kept.toOwnedSlice(gpa);
 }
 
 /// Returns dV(output_node, output_neg)/dp for each of `params` at `x_op`,
@@ -200,15 +219,13 @@ pub fn isSensParam(type_name: []const u8, name: []const u8) bool {
     return !src or std.mem.eql(u8, name, "dc");
 }
 
-// ---- private ----
-
 /// One `.sens` column name in the results arena `a`. The table rather than
 /// `is_instance`: ngspice's IF_PRINCIPAL flag lives on the instance
 /// parameter table, but VerA puts every Verilog-A `parameter` on Model. The
 /// `v(...)` wrapper is ngspice's too: cktsens.c hands the raw writer a
 /// UID_OTHER name, which types as a voltage. The instance's $mfactor is
 /// ngspice's instance parameter `m`.
-fn columnName(a: Allocator, scratch: Allocator, ctx: *const root.RunCtx, opts: Options, ref: root.ParamRef) Allocator.Error![]const u8 {
+pub fn columnName(a: Allocator, scratch: Allocator, ctx: *const root.RunCtx, opts: Options, ref: root.ParamRef) Allocator.Error![]const u8 {
     const type_name = ctx.circuit.typeName(ref.type);
     const card = opts.card_names.get(ref.type, ref.index);
     const dev = card orelse try scratch.print("{s}#{d}", .{ type_name, ref.index });
@@ -222,6 +239,8 @@ fn columnName(a: Allocator, scratch: Allocator, ctx: *const root.RunCtx, opts: O
     const s = try a.print("v({s}{s}{s})", .{ dev, if (ref.is_instance) "_" else ":", pname });
     return std.ascii.lowerString(s, s);
 }
+
+// ---- private ----
 
 test fdStep {
     // Oracle: cktsens.c's Sens_Delta, relative 1e-6 and 1e-12 only at 0.

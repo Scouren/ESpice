@@ -11,7 +11,7 @@
 //! - `pub fn distoJob(a: netlist.Analysis, sources: core.QueryBindings) !Job`
 //! - `pub fn noiseJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_args.CardContext) !Job`
 //! - `pub fn tfJob(a: netlist.Analysis, sources: core.QueryBindings) !Job`
-//! - `pub fn sensJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job`
+//! - `pub fn sensJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_args.CardContext) !Job`
 //! - `pub fn acmatchJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job`
 //! - `pub fn pzJob(a: netlist.Analysis, sources: core.QueryBindings) !Job`
 //! - `pub fn stbJob(a: netlist.Analysis, sources: core.QueryBindings) !Job`
@@ -143,14 +143,16 @@ pub fn noiseJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_
     var args = a.args;
     const node_id = a.pos;
     const node_neg = a.neg;
-    // ngspice: `v(out) [src] dec|oct|lin N f1 f2 [pts]`; HSPICE:
-    // `v(out) src [inter]` over the `.ac` sweep [CR .NOISE]. A
-    // nonzero pts or inter asks for the per-device contributions.
+    // ngspice: `v(out) [src] dec|oct|lin N f1 f2 [pts]`. A nonzero pts
+    // asks for the per-device contributions. HSPICE's `v(out) src
+    // [inter]` over the `.ac` sweep is SpiceRack's to write with the
+    // grid: ngspice 44.2 stops on it ("no such parameter", measured).
     // The input reference source does not drive the noise solve, but
     // a name no card carries is still an error, not a silent success.
     // HSPICE `.acphasenoise out in [interval] carrier= [LIST...=]`
-    // [CR .ACPHASENOISE] is the same solve read as phase noise; the
-    // carrier only scales HSPICE's jitter listing, unused here.
+    // [CR .ACPHASENOISE] is the same solve read as phase noise over the
+    // `.ac` sweep; the carrier only scales HSPICE's jitter listing,
+    // unused here.
     const phase = std.ascii.startsWithIgnoreCase(a.line, ".acphasenoise");
     if (phase) {
         const keys = std.StaticStringMap(void).initComptime(.{ .{"carrier"}, .{"listfreq"}, .{"listcount"}, .{"listfloor"}, .{"listsources"} });
@@ -196,7 +198,9 @@ pub fn noiseJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_
         const g = try analysis_args.acGrid(ctx.arena, args, i);
         sweep = g.sweep;
         i = g.end;
-    } else sweep = ctx.ac orelse return error.MissingAnalysisCard;
+    } else if (phase) {
+        sweep = ctx.ac orelse return error.MissingAnalysisCard;
+    } else return error.InvalidAnalysisArguments;
     const contributions = i < args.len and try analysis_args.number(args, i) > 0;
     if (i < args.len) i += 1;
     if (i != args.len) return error.InvalidAnalysisArguments;
@@ -236,17 +240,29 @@ pub fn tfJob(a: netlist.Analysis, sources: core.QueryBindings) !Job {
     return .{ .tf = opts };
 }
 
-/// The `sens`, `dcmatch` cards.
-pub fn sensJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job {
+/// The `sens`, `dcmatch` cards. ngspice's `.sens <out> [dc | ac dec|oct|lin
+/// N f1 f2]` (inp2dot.c:481-570); the parameter filter words ngspice reads
+/// ahead of `ac`/`dc` (cktsens.c:58-67) are refused, not dropped.
+pub fn sensJob(a: netlist.Analysis, sources: core.QueryBindings, ctx: analysis_args.CardContext) !Job {
     const args = a.args;
-    const id = a.kind;
-    const node_id = a.pos;
-    const node_neg = a.neg;
-    try analysis_args.arity(args, 1, 1);
-    const node = try analysis_args.outputNode(node_id);
-    const neg = try analysis_args.outputNeg(node_neg);
-    if (id == .sens) return .{ .sens = .{ .output_node = node, .output_neg = neg, .card_names = ctx.card_names } };
-    return .{ .dcmatch = .{ .output_node = node, .output_neg = neg, .variations = ctx.variations } };
+    const node = try analysis_args.outputNode(a.pos);
+    const neg = try analysis_args.outputNeg(a.neg);
+    if (a.kind == .dcmatch) {
+        try analysis_args.arity(args, 1, 1);
+        return .{ .dcmatch = .{ .output_node = node, .output_neg = neg, .variations = ctx.variations } };
+    }
+    var opts: requests.Sens = .{ .output_node = node, .output_neg = neg, .card_names = ctx.card_names };
+    switch (args.len) {
+        1 => {},
+        2 => if (!analysis_args.isKey(args, 1, "dc")) return error.InvalidAnalysisArguments,
+        6 => {
+            if (!analysis_args.isKey(args, 1, "ac")) return error.InvalidAnalysisArguments;
+            opts.ac = try analysis_args.frequencySweep(args, 2);
+            opts.ac_sources = sources.ac_sources;
+        },
+        else => return error.InvalidAnalysisArguments,
+    }
+    return .{ .sens = opts };
 }
 
 /// The `acmatch`, `dcsens` cards.
@@ -280,32 +296,11 @@ pub fn acmatchJob(a: netlist.Analysis, ctx: analysis_args.CardContext) !Job {
 /// The `pz` card.
 pub fn pzJob(a: netlist.Analysis, sources: core.QueryBindings) !Job {
     const args = a.args;
-    const node_id = a.pos;
-    const node_neg = a.neg;
     const ports = a.ports;
     // Bare `.pz` asks for the circuit's own poles and names no transfer.
+    // HSPICE's `.pz v(out) src` is SpiceRack's to write as the node form:
+    // ngspice 44.2 stops on it ("no such parameter", measured).
     if (args.len == 0) return .{ .pz = .{} };
-    // HSPICE `.pz v(out[,ref]) src` [CR .PZ]: the input is the
-    // source's own node pair, `vol` for a V card and `cur` for an I
-    // card; poles and zeros both.
-    if (args.len == 2) {
-        if (analysis_args.currentProbeName(args, 0) != null) return error.UnsupportedAnalysisOutput;
-        var opts: requests.Pz = .{ .out_pos = try analysis_args.outputNode(node_id), .out_neg = try analysis_args.outputNeg(node_neg), .want = .both };
-        const name = nameAt(args, 1) orelse return error.InvalidAnalysisArguments;
-        if (netlist.nameIndex(sources.v_names, name)) |v| {
-            opts.in_pos = sources.v_pos[v];
-            opts.in_neg = sources.v_neg[v];
-            opts.drive_branch = sources.v_branches[v];
-        } else if (netlist.nameIndex(sources.i_names, name)) |v| {
-            opts.in_pos = sources.i_pos[v];
-            opts.in_neg = sources.i_neg[v];
-        } else return error.AnalysisSourceNotFound;
-        // The drive's node pair is unordered for poles and zeros;
-        // keep the grounded side second, as the SPICE form must.
-        if (opts.in_pos == GROUND) std.mem.swap(u32, &opts.in_pos, &opts.in_neg);
-        _ = try analysis_args.outputNode(opts.in_pos);
-        return .{ .pz = opts };
-    }
     try analysis_args.arity(args, 6, 6);
     const drive_kind = std.StaticStringMap(enum { vol, cur })
         .initComptime(.{ .{ "vol", .vol }, .{ "cur", .cur } });

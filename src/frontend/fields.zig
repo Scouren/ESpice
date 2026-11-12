@@ -2,7 +2,7 @@
 //! line: `=`, `(`, `)` and `,` are one-byte fields, a `{...}` or quoted
 //! field keeps its delimiters (its kind is its first byte), and anything
 //! else is a word.
-//! Cites: tests/frontend/grammar/{ngspice,hspice,spectre}_lines.peg.
+//! Cites: tests/frontend/grammar/ngspice_lines.peg.
 //!
 //! Contents:
 //! - `pub fn Fields(comptime quotes: []const u8, comptime braces: bool) type`
@@ -20,8 +20,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 /// A field splitter over one line. `quotes` are the quote bytes, `braces`
-/// keeps `{...}` whole. A comptime generic (axis: the dialect's quoting;
-/// three cases today, one per dialect, plus the include reader's).
+/// keeps `{...}` whole. A comptime generic (axis: the quoting; two cases
+/// today: ngspice's cards, `Fields("'", true)`, and the include reader's
+/// file names, `Fields("\"'", false)`).
 pub fn Fields(comptime quotes: []const u8, comptime braces: bool) type {
     return struct {
         line: []const u8,
@@ -149,7 +150,7 @@ test Fields {
     try std.testing.expect(!f.takeEq());
     try std.testing.expectEqual('v', f.nextByte());
     try std.testing.expect(F.isWord("abc") and !F.isWord("=") and !F.isWord("'x'") and !F.isWord("{x}"));
-    // HSPICE: `"` quotes too, and braces are name bytes (#203).
+    // The include reader's: `"` quotes too, and braces are name bytes.
     var h = Fields("'\"", false).init("{a+b} {a b} \"b c\"");
     try std.testing.expectEqualStrings("{a+b}", h.next().?);
     try std.testing.expectEqualStrings("{a", h.next().?);

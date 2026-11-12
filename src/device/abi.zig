@@ -21,7 +21,8 @@
 //! - `pub const NoiseGenKind = enum`, `pub const NoiseGen = struct`
 //! - `pub const Planes = struct`, `pub const StampMode = enum(u8)`
 //! - `pub const ScatterTapes = struct`, `pub const LocalEval = struct`, `pub const ChargeIdentity = struct`
-//! - `pub const DerivativeCounts = struct`, `pub const Batch = struct` (`publishSim`)
+//! - `pub const DerivativeCounts = struct`, `pub const CensusCounts = struct`,
+//!   `pub const Batch = struct` (`publishSim`)
 //! - `pub const StatusHit = struct`, `pub const DeviceStatus = enum(u8)`
 //! - `pub const Hooks = struct`, `pub const Proto = struct`
 //! - `pub const PatternView = struct` (`findSlot`)
@@ -72,7 +73,21 @@ pub const Systf = contract.Systf;
 pub const SystfHost = contract.SystfHost;
 
 /// `Hooks.set_bypass`'s tolerances: the Newton test's.
-pub const BypassTol = struct { reltol: f64, vntol: f64, abstol: f64 };
+pub const BypassTol = struct {
+    reltol: f64,
+    vntol: f64,
+    abstol: f64,
+    /// The C4 lever (`ESPICE_PERF=c4`, docs/perf_research/04-levers-cpu.md):
+    /// false is the shipped bypass.
+    c4: bool = false,
+    /// Measurement only (`ESPICE_PERF=c4,c4h`): with `c4`, the review
+    /// judges each window but never turns the batch off. Ignored without
+    /// `c4`.
+    hold: bool = false,
+    /// `ZP_TRAN_STATS`: each batch counts its bypass outcomes and prints
+    /// them (`bypass-stats:`) when it frees its bypass. Changes no value.
+    stats: bool = false,
+};
 
 /// One sweepable field of a device type, as `collect_params` lists it.
 pub const ParamField = struct {
@@ -267,6 +282,14 @@ pub const DerivativeCounts = struct {
     narrow_lanes: u8,
 };
 
+/// N6's census counters (`Hooks.census_counts`), since `census(true)`.
+/// charge_pairs/charge_same: instances a serial host charge pass evaluated,
+/// and those whose gathered unknowns all kept their bits since the previous
+/// charge pass. limit_pairs/limit_same: instances a serial limit pass read,
+/// and those whose `limit` inputs held their bits since the last accepted
+/// point.
+pub const CensusCounts = struct { charge_pairs: u64 = 0, charge_same: u64 = 0, limit_pairs: u64 = 0, limit_same: u64 = 0 };
+
 /// One device type's frozen batch, made by `Proto.finalize`. `eval` and
 /// `eval_newton` add the stamps of instances `[first, last)` into the given
 /// planes; `eval_newton` skips a constant Jacobian half. ParEval stamps
@@ -351,6 +374,13 @@ pub const Hooks = struct {
     /// alone. ParEval sums the positions into each plane cell in tape order,
     /// which is the order the serial `eval` adds them in.
     stage: *const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64, StampMode) void,
+    /// N3 on ParEval: `stage` of a pass taken while `track_charges` is on,
+    /// `.full` or `.newton` only. Returns true when some instance of the
+    /// range evaluated off its gathered x (a limiter, a correction) or the
+    /// range replayed a bypass record, so its charges are not `eval_q`'s;
+    /// the caller ANDs the ranges' verdicts after the pass. Every range
+    /// stores the batch's `charges_clean` as true. Null without charge.
+    stage_moved: ?*const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64, StampMode) bool = null,
     /// The batch's scatter tapes: plane cell of every staged position.
     scatter_tapes: *const fn (*anyopaque) ScatterTapes,
     /// Runs the device's `limit` on every instance at x, against x_old (the
@@ -379,6 +409,24 @@ pub const Hooks = struct {
     /// values within the Newton tolerance, so it is opt-in. Null for a
     /// device it cannot serve (sources, history, mutable evaluation).
     set_bypass: ?*const fn (*anyopaque, ?BypassTol) void = null,
+    /// The N3 lever (`ESPICE_PERF=n3`, docs/perf_research/09-after-the-levers.md):
+    /// with `on`, every serial host pass also records the LTE tape and
+    /// whether a limiter or a correction moved an instance off its gathered
+    /// x, so `charges_clean` can answer. Off (the default) is the shipped
+    /// pass. Null for a batch without charge.
+    track_charges: ?*const fn (ctx: *anyopaque, on: bool) void = null,
+    /// Whether the batch's last serial host pass left in the planes and the
+    /// tape bitwise what `eval_q` writes at that pass's x, time and state.
+    /// False while `track_charges` is off. Null for a batch without charge.
+    charges_clean: ?*const fn (ctx: *anyopaque) bool = null,
+    /// N6's census, stats only: on starts it with fresh snapshots, off stops
+    /// and frees it. False when the snapshots could not be allocated.
+    census: ?*const fn (ctx: *anyopaque, on: bool) bool = null,
+    /// The census counters; zeros while it is off.
+    census_counts: ?*const fn (ctx: *anyopaque) CensusCounts = null,
+    /// N6's census: `x` is an accepted point, the reference the limit-pass
+    /// census compares against. Stats only; a no-op while the census is off.
+    census_accept: ?*const fn (ctx: *anyopaque, x: []const f64) void = null,
     /// Advances Newton-history state between evaluated iterates, given the
     /// previous x.
     advance_iteration: ?*const fn (*anyopaque, []const f64) void = null,
@@ -816,7 +864,15 @@ pub const GpuPayload = struct {
 //     `analog initial` latch, which resident GPU batches advance.
 // 40: `Batch.sim_offset`, the stored `SimState` a host writes without calling
 //     `set_sim_state` (`Batch.publishSim`).
-pub const abi_version: u32 = 40;
+// 41: `Hooks.track_charges` and `Hooks.charges_clean`, the N3 lever's
+//     per-batch switch and verdict; `BypassTol.c4`.
+// 42: `Hooks.census`, `Hooks.census_counts` and `CensusCounts`, N6's latency
+// census (statistics only); `Hooks.stage_moved`, N3's tracked threaded stage
+// (a verdict per range); `BypassTol.stats`.
+// 43: `Hooks.census_accept`; the limit census counts against the last
+// accepted point.
+// 44: `BypassTol.hold`, the `c4h` measurement bit.
+pub const abi_version: u32 = 44;
 
 /// A device type's construction entry points, exported by each device object
 /// and by runtime-loaded `.so` devices. Every blob pointer it takes must be

@@ -4,10 +4,8 @@
 //!
 //! Contents:
 //! - `pub fn Methods(comptime S: type) type`
-//! - `pub fn behaviouralResistor(r: *R, line: []const u8) Error!?[]const u8`
-//! - `pub fn kindOf(r: *const R, row: usize) u8`
-//! - `pub fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame, row: ?usize) Error!void`
-//! - `pub fn isModel(r: *R, name: []const u8) bool`
+//! - `pub fn readDevice(r: *R, line: []const u8, frame: *const Frame, row: ?usize) Error!void`
+//! - `pub fn isModel(r: *const R, name: []const u8) bool`
 //! - `pub fn splitTerminals(r: *R) Error!void`
 //! - `pub fn commit(r: *R, head: []const u8, letter: u8, frame: *const Frame) Error!void`
 //! - `pub fn shunts(r: *R) Error!void`
@@ -18,7 +16,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -45,7 +42,6 @@ const behavioural = card_table.behavioural;
 const Frame = reader_frame.Frame;
 const Replay = reader_frame.Replay;
 const ReplayField = reader_frame.ReplayField;
-const bTransformationWanted = card_table.bTransformationWanted;
 const binBounds = card_table.binBounds;
 const binHolds = netlist_view.binHolds;
 const kvNumber = netlist_view.kvNumber;
@@ -58,63 +54,15 @@ pub fn Methods(comptime S: type) type {
     return struct {
         const R = reader.Reader(S);
         const fixedPins = R.fixedPins;
-        const mixedPort = R.mixedPort;
 
-        /// ngspice inp_compat: an R card whose value reads `v(`, `i(`,
-        /// `time`, `temper` or `hertz` is the B source
-        /// `b<name> n1 n2 i = v(n1,n2)/(eq) tc1=.. tc2=.. reciproctc=1`, its
-        /// temperature factor dividing the current; `m=` multiplies it
-        /// (reciprocm=0). Null for any other R card. sky130's poly resistors
-        /// (`rbody`) are written this way.
-        pub fn behaviouralResistor(r: *R, line: []const u8) Error!?[]const u8 {
-            var f = F.init(line);
-            const head = f.next() orelse return null;
-            const n1 = f.next() orelse return null;
-            const n2 = f.next() orelse return null;
-            if (!F.isWord(n1) or !F.isWord(n2) or !bTransformationWanted(f.rest())) return null;
-            var eq: ?[]const u8 = null;
-            var tc1: []const u8 = "0";
-            var tc2: []const u8 = "0";
-            var m: []const u8 = "1";
-            while (f.next()) |t| {
-                if (t[0] == '{') {
-                    if (eq == null) eq = F.body(t);
-                    continue;
-                }
-                if (!F.isWord(t) or !f.takeEq()) continue;
-                const v = f.next() orelse return error.ParseError;
-                const val = if (v[0] == '{') F.body(v) else v;
-                if (std.mem.eql(u8, t, "r") or std.mem.eql(u8, t, "resistance")) {
-                    eq = val;
-                } else if (std.mem.eql(u8, t, "tc1")) {
-                    tc1 = val;
-                } else if (std.mem.eql(u8, t, "tc2")) {
-                    tc2 = val;
-                } else if (std.mem.eql(u8, t, "m")) {
-                    m = val;
-                }
-            }
-            // Without braces it is not ngspice's form: the plain R path rejects it.
-            const e = eq orelse return null;
-            return try r.arena.print("b{s} {s} {s} i={{v({s},{s})/({s})*({s})}} tc1={{{s}}} tc2={{{s}}} reciproctc=1", .{ head, n1, n2, n1, n2, e, m, tc1, tc2 });
-        }
-
-        /// The letter `kinds` gives row `row` of `lines`, 0 when its name
-        /// carries its own.
-        pub fn kindOf(r: *const R, row: usize) u8 {
-            return if (row < r.kinds.len) r.kinds[row] else 0;
-        }
-
-        /// Reads device card `line`; `kind` is its letter when its name does
-        /// not carry it (`kindOf`), else 0.
-        /// `row` is its `lines` row when it is a subcircuit body card (the
-        /// first read keeps a `Replay` there and later instances read it)
-        /// or a top-level card `scanCards` scanned (it reads that `Replay`).
-        pub fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame, row: ?usize) Error!void {
+        /// Reads device card `line`. `row` is its `lines` row when it is a
+        /// subcircuit body card (the first read keeps a `Replay` there and
+        /// later instances read it) or a top-level card `scanCards` scanned
+        /// (it reads that `Replay`).
+        pub fn readDevice(r: *R, line: []const u8, frame: *const Frame, row: ?usize) Error!void {
             r.card = line;
             const arena = r.arena;
-            const port_card = r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p';
-            var f = F.init(if (port_card) try r.portLine(line) else line);
+            var f = F.init(line);
             const head = f.next() orelse return error.ParseError;
             const was_in_card = r.in_card;
             r.in_card = true;
@@ -122,53 +70,63 @@ pub fn Methods(comptime S: type) type {
             if (r.monte) r.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
             r.site_ordinal = 0;
             if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return error.ParseError;
-            // HSPICE's P element is a port: a V card that `port=` numbers
-            // for `.lin` (`P1 in 0 port=1 z0=50`). A Spectre card's letter
-            // is its master's, kept beside it.
-            const letter = if (port_card) 'v' else if (kind != 0) kind else std.ascii.toLower(head[0]);
+            const letter = std.ascii.toLower(head[0]);
             if (row) |i| if (r.replays[i]) |rp| return r.replay(rp, line, head, letter, frame);
-            // HSPICE reads these letters as IBIS buffers and lumped lines,
-            // neither of which is built.
-            if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "bu", letter) != null)
-                return r.unsupported(line, "unsupported HSPICE element");
-            if (r.dialect == .hspice and (letter == 's' or letter == 'w')) return r.readDataElement(head, letter, &f, frame);
-            if (letter == 'r' and r.dialect == .ngspice) if (try r.behaviouralResistor(line)) |b| return r.readDevice(b, 0, frame, null);
+            if (card_table.isDataElement(letter, line)) return readDataElement(r, head, letter, &f, frame);
+            if (try r.behaviouralPassive(line, letter, frame)) return;
             if (std.mem.indexOfScalar(u8, "efgh", letter) != null) {
+                // E and G name two controls, F and H one source.
+                const controls: u8 = if (letter == 'f' or letter == 'h') 1 else 2;
                 var probe = f;
                 _ = probe.next();
                 _ = probe.next();
                 var buf: [16]u8 = undefined;
                 const at = probe.pos;
-                if (probe.next()) |t| if (t.len <= buf.len) if (behavioural.get(std.ascii.lowerString(&buf, t))) |form| {
-                    // `E1 a b VCVS c d 2`: the type word only repeats the letter.
-                    // A run of them goes in one copy, so the re-read never recurses.
+                const fourth = probe;
+                if (probe.next()) |t| if (t.len <= buf.len) if (behavioural.get(std.ascii.lowerString(&buf, t))) |form| keyword: {
                     if (form == .kind) {
                         // A word for another letter (`E1 o 0 CCCS ...`) is
                         // refused, as ngspice does, not read as this one (#75).
                         const kinds = std.StaticStringMap(u8).initComptime(.{ .{ "vcvs", 'e' }, .{ "vccs", 'g' }, .{ "ccvs", 'h' }, .{ "cccs", 'f' } });
                         if (kinds.get(std.ascii.lowerString(&buf, t)) != letter) return r.unsupported(line, "a controlled-source type word for another letter");
-                        while (probe.peek()) |u| {
-                            if (u.len > buf.len or (behavioural.get(std.ascii.lowerString(&buf, u)) orelse .refused) != .kind) break;
-                            _ = probe.next();
-                        }
-                        return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), letter, frame, null);
+                        // `E1 a b VCVS c d 2`: ngspice drops the word only
+                        // from a whole linear card (inpcom.c replace_token,
+                        // 7 fields on E and G, 6 on F and H), so the re-read
+                        // keeps its next word as a node and stops there.
+                        if (linearTail(probe, controls, false))
+                            return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), frame, null);
                     }
-                    // HSPICE: VCR and VCCAP are G-element forms only (#75).
-                    if ((form == .vcr or form == .vccap) and letter != 'g') return r.unsupported(line, "VCR or VCCAP on a card other than G");
+                    // A form word followed by a linear card's tail is a node
+                    // (a source on F and H): ngspice-44.2 reads `E1 o 0 vcr 0
+                    // 2` as v(vcr) times 2, and `vol 0 2` too. `value` and
+                    // `table` are keywords wherever they stand (inpcom.c
+                    // search_plain_identifier).
+                    const anywhere = std.ascii.eqlIgnoreCase(t, "value") or std.ascii.eqlIgnoreCase(t, "table");
+                    if (!anywhere and linearTail(probe, controls - 1, true)) break :keyword;
+                    if (form == .kind) return r.unsupported(line, "a controlled-source type word on a card ngspice does not read as linear");
                     return r.behaviouralCard(line, head, letter, f, frame, form);
                 };
+                // SPICE 2G6 lets a one-dimensional POLY drop its `POLY(1)`:
+                // ngspice inserts it when a linear card's gain is followed
+                // by more (inpcom.c inp_poly_2g6_compat), so `E1 o 0 a 0 2
+                // 3` is 2 + 3·v(a).
+                switch (polyTail(fourth, controls)) {
+                    .linear => {},
+                    .poly => return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " poly(1)", line[at..] }), frame, null),
+                    .dropped => return r.unsupported(line, "a number after a linear E, F, G or H card's m=, or after its gain when its first control starts with poly, value, vol, table, laplace, cur, vccs, vcvs, ccvs or cccs: ngspice reads no POLY(1) there and stops on it (\"unknown parameter\")"),
+                }
             }
             r.nodes.clearRetainingCapacity();
             r.positional.clearRetainingCapacity();
             r.card_kv.clearRetainingCapacity();
             var kv_text: std.ArrayList([]const u8) = .empty;
-            // An X card expands, an HSPICE P card reads a rewritten line and
-            // a top-level card is read once: none replays.
+            // An X card expands and a top-level card is read once: neither
+            // replays.
             // ponytail: a positional literal (`R1 a b 1k`) is re-read too.
-            const slot: ?usize = if (port_card or letter == 'x' or frame.sub == null) null else row;
+            const slot: ?usize = if (letter == 'x' or frame.sub == null) null else row;
             var fields: std.ArrayList(ReplayField) = .empty;
 
-            const model_word = try r.cardNodes(arena, &f, letter, port_card, &r.nodes);
+            const model_word = try R.cardNodes(arena, &f, letter, &r.nodes);
             if (model_word) |model| {
                 if (letter != 'x') try r.refuseOperatorField(line, model);
                 try r.positional.append(arena, try r.nameValue(model, frame, false));
@@ -176,7 +134,16 @@ pub fn Methods(comptime S: type) type {
                 const out = f.next() orelse return error.ParseError;
                 const eq = f.next() orelse return error.ParseError;
                 if (!F.isWord(out) or eq[0] != '=') return error.ParseError;
-                try r.card_kv.append(arena, .{ .key = out, .value = try r.exprValue(try r.exprRest(&f), frame, false) });
+                // ngspice's B card has v= and i= alone: q= is "unknown
+                // parameter (q)" there, a charge being a C card's q=.
+                if (!std.mem.eql(u8, out, "v") and !std.mem.eql(u8, out, "i"))
+                    return r.unsupported(line, "a B source output other than v= or i=: ngspice reads q= as an unknown parameter; a charge is a C card's q={...}");
+                const value = v: {
+                    r.bsource = true;
+                    defer r.bsource = false;
+                    break :v try r.exprValue(try r.exprRest(&f, frame), frame, false);
+                };
+                try r.card_kv.append(arena, .{ .key = out, .value = value });
                 // A braced expression may be followed by instance
                 // parameters (`i={...} tc1=1m reciproctc=1`).
                 while (f.next()) |t| {
@@ -186,11 +153,6 @@ pub fn Methods(comptime S: type) type {
                 return r.commit(head, letter, frame);
             }
 
-            // A third node makes a mixed-mode (balanced) port, not built.
-            if (port_card) {
-                var probe = f;
-                if (probe.next()) |t| if (F.isWord(t) and !probe.takeEq()) return r.unsupported(line, "mixed-mode P element");
-            }
             try R.readFields(false, r, arena, line, letter, &f, frame, if (slot != null) &fields else null, &kv_text);
             if (letter == 'x') return r.expand(head, frame, kv_text.items);
             if (slot) |i| {
@@ -204,7 +166,7 @@ pub fn Methods(comptime S: type) type {
             return r.commit(head, letter, frame);
         }
 
-        pub fn isModel(r: *R, name: []const u8) bool {
+        pub fn isModel(r: *const R, name: []const u8) bool {
             return r.model_ids.contains(name) or r.local_names.contains(name);
         }
 
@@ -253,6 +215,39 @@ pub fn Methods(comptime S: type) type {
             const arena = r.arena;
             try r.pins.resize(arena, r.nodes.items.len);
             for (r.nodes.items, r.pins.items) |n, *pin| pin.* = try r.netOf(frame, n);
+            // A behavioural E/F/G/H is built as a B card but keeps its own
+            // letter in a flattened name, which is what its i() probes use.
+            const name_letter = if (letter == 'b') std.ascii.toLower(head[0]) else letter;
+            // An enclosing X card's m (`Frame.mult`) multiplies the card's
+            // own, as HSPICE does; ngspice overwrites it there outside its
+            // HSPICE mode (inpcom.c:4272-4300). The letters and the v= B
+            // ngspice gives no m are left alone (inpcom.c:4253-4271).
+            if (frame.mult != 1) multiply: {
+                if (std.mem.indexOfScalar(u8, "rclgfibdqjzm", name_letter) == null) break :multiply;
+                var v_out = false;
+                if (letter == 'b') for (r.card_kv.items) |item| {
+                    if (item.key.len == 1 and std.mem.indexOfScalar(u8, "viq", item.key[0]) != null) v_out = item.key[0] == 'v';
+                };
+                if (v_out) break :multiply;
+                for (r.card_kv.items) |*item| if (std.mem.eql(u8, item.key, "m")) {
+                    const own = item.value.number() orelse return r.unsupported(r.card, "m= that is not a number inside an X card with m=");
+                    item.value = .{ .num = own * frame.mult };
+                    break :multiply;
+                };
+                try r.card_kv.append(arena, .{ .key = "m", .value = .{ .num = frame.mult } });
+            }
+            // F, H and W name a V card, K two L cards: inside a subcircuit,
+            // the instance's own, flattened as those cards' names are
+            // (subckt.c:1422-1436, 1475-1486).
+            if (frame.path) |path| if (std.mem.indexOfScalar(u8, "fhwk", letter) != null) {
+                const refs: usize = if (letter == 'k') 2 else 1;
+                const target: []const u8 = if (letter == 'k') "l" else "v";
+                // In the arena: the card keeps the name, and `joined`'s
+                // scratch is the next name's.
+                for (r.positional.items[0..@min(refs, r.positional.items.len)]) |*p| if (p.* == .name) {
+                    p.* = .{ .name = try std.mem.concat(r.arena, u8, &.{ target, ".", path, ".", p.name }) };
+                };
+            };
             const positional = try appendSpan(Value, arena, &r.values, r.positional.items);
             const kv = try appendSpan(Kv, arena, &r.kvs, r.card_kv.items);
             // After the spans: reading an instance model reuses the card scratch.
@@ -261,9 +256,6 @@ pub fn Methods(comptime S: type) type {
             const pv = r.positional.items;
             const model_at: ?usize = if (pv.len > 0 and pv[0] == .name) 0 else if (std.mem.indexOfScalar(u8, "rcl", letter) != null and pv.len > 1 and pv[0] == .num and pv[1] == .name) 1 else null;
             const model: u32 = if (model_at) |k| try r.modelRow(letter, pv[k].name, positional.start, frame) else none;
-            // A behavioural E/F/G/H is built as a B card but keeps its own
-            // letter in a flattened name, which is what its i() probes use.
-            const name_letter = if (letter == 'b') std.ascii.toLower(head[0]) else letter;
             const name = try r.internName(if (frame.path) |path| try r.joined(&[_][]const u8{ &.{name_letter}, ".", path, ".", head }) else head);
             _ = r.hg.addEdge(arena, .{
                 .kind = letter,
@@ -317,7 +309,7 @@ pub fn Methods(comptime S: type) type {
 
         /// `.option scale` and `wnflag`, which bin selection reads.
         pub fn binOptions(r: *R) Error!void {
-            r.wnflag = r.dialect != .ngspice;
+            r.wnflag = false;
             for (r.config.items) |c| {
                 if (c.temp) continue;
                 for (c.args, 0..) |arg, i| {
@@ -416,6 +408,85 @@ pub fn Methods(comptime S: type) type {
                 }
                 if (bin == none) return error.ModelBinNotFound;
             }
+        }
+
+        // ---- private ----
+
+        /// A W RLGC line or S N-port card (`card_table.isDataElement`):
+        /// nodes and `key=value` pairs in any order (`W1 N=3 1 3 5 0 2 4 6
+        /// 0 RLGCMODEL=m L=0.97`). A file key's value is the raw path in
+        /// the deck's own case.
+        fn readDataElement(r: *R, head: []const u8, letter: u8, f: *F, frame: *const Frame) Error!void {
+            r.nodes.clearRetainingCapacity();
+            r.positional.clearRetainingCapacity();
+            r.card_kv.clearRetainingCapacity();
+            while (f.next()) |t| {
+                if (t[0] == ',') continue;
+                if (!F.isWord(t)) return error.ParseError;
+                if (!f.takeEq()) {
+                    try r.nodes.append(r.arena, t);
+                } else if (card_table.data_file_keys.has(t)) {
+                    try r.card_kv.append(r.arena, .{ .key = t, .value = .{ .name = try r.dataPath(f) } });
+                } else {
+                    try r.card_kv.append(r.arena, .{ .key = t, .value = try r.kvValue(f, frame, false) });
+                }
+            }
+            return r.commit(head, letter, frame);
+        }
+
+        /// True when `f` holds `names` words, a gain and nothing more, or
+        /// only `m=` pairs more when `m_ok`: a linear E, F, G or H card's
+        /// tail. ngspice-44.2 reads `G1 0 o vcr 0 2m m=2` as linear, and
+        /// `E1 o 0 delay a 0 td=1n` as no linear card.
+        fn linearTail(f: F, names: u8, m_ok: bool) bool {
+            var g = f;
+            for (0..names) |_| {
+                const n = g.next() orelse return false;
+                if (!F.isWord(n) or g.nextByte() == '=') return false;
+            }
+            const gain = g.next() orelse return false;
+            if (std.mem.indexOfScalar(u8, "=(),", gain[0]) != null or g.nextByte() == '=') return false;
+            while (g.next()) |k| {
+                if (!m_ok or !std.mem.eql(u8, k, "m") or !g.takeEq()) return false;
+                const v = g.next() orelse return false;
+                if (std.mem.indexOfScalar(u8, "=(),", v[0]) != null) return false;
+            }
+            return true;
+        }
+
+        /// What ngspice-44.2 reads after the gain of a linear E, F, G or H
+        /// card, `f` at its first control (inpcom.c inp_poly_2g6_compat):
+        /// nothing, or `m=` or `ic=` and more pairs, is `.linear`; anything
+        /// else makes the numbers from the gain on SPICE 2G6 POLY(1)
+        /// coefficients (`.poly`), unless the first control starts like a
+        /// form word (ciprefix): there, and after `m=`, a number is one
+        /// ngspice stops on (`.dropped`). `(`, `)` and `,` separate, as
+        /// ngspice reads them in POLY.
+        fn polyTail(f: F, controls: u8) enum { linear, poly, dropped } {
+            const poly_free = [_][]const u8{ "poly", "value", "vol", "table", "laplace", "cur", "vccs", "vcvs", "ccvs", "cccs" };
+            var g = f;
+            const first = R.word(&g) catch return .linear;
+            for (1..controls) |_| _ = R.word(&g) catch return .linear;
+            const plain = for (poly_free) |p| {
+                if (std.ascii.startsWithIgnoreCase(first, p)) break false;
+            } else true;
+            var gain = false;
+            var pairs = false;
+            while (g.next()) |k| {
+                if (k[0] == ',' or k[0] == '(' or k[0] == ')') continue;
+                const pair = F.isWord(k) and g.takeEq();
+                if (pair) _ = g.next();
+                if (!gain) {
+                    if (pair) return .linear;
+                    gain = true;
+                    continue;
+                }
+                const linear_key = pair and (std.ascii.eqlIgnoreCase(k, "m") or std.ascii.eqlIgnoreCase(k, "ic"));
+                if (!pairs and plain and !linear_key) return .poly;
+                if (!pair) return .dropped;
+                pairs = true;
+            }
+            return .linear;
         }
     };
 }

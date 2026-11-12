@@ -1,6 +1,20 @@
-// Inductor: linear, V(p,n) = l * d/dt I(br).
+// Inductor: linear, V(p,n) = d/dt (L(T) * I(br)).
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.
+// Based on: ngspice inductor (ind/indtemp.c).
+//   ngspice: Copyright Regents of the University of California and others,
+//   modified BSD license.
+//
+// Temperature (indtemp.c:35-48, 63-79):
+//   dt   = (temp + dtemp) - tnom
+//   L(T) = l * (1 + tc1*dt + tc2*dt^2)
+// Instance `temp` replaces the circuit temperature, and `dtemp` is then
+// ignored; otherwise `dtemp` offsets the circuit's. `tnom` is the host's
+// `.options tnom` unless a card gives it.
+//
+// The value (the card's or its model's IND) and the `scale`/`m` factors are
+// resolved by the host (frontend builder addPassive) before the value
+// reaches `l`, so one branch carries the card's whole current.
 
 `include "constants.vams"
 `include "disciplines.vams"
@@ -9,7 +23,25 @@ module inductor(p, n);
     inout p, n;
     electrical p, n;
     branch (p, n) br;
-    parameter real l = 1e-9 from (0:inf);  // H  inductance
+    // `l` must stay the first parameter, the device's principal one for
+    // `.sens`/`.mc` (analysis/eval.zig appendParams).
+    parameter real l     = 1e-9 from (0:inf);    // H         inductance
+    parameter real tnom  = $simparam("tnom");    // degC      nominal temperature
+    parameter real temp  = 27.0;                 // degC      absolute override
+    parameter real dtemp = 0.0;                  // degC      offset, unless temp
+    parameter real tc1   = 0.0;                  // 1/degC    linear tempco
+    parameter real tc2   = 0.0;                  // 1/degC^2  quadratic tempco
 
-    analog V(br) <+ l * ddt(I(br));
+    // ngspice's `inductance` is this times m, as the frontend folds m into
+    // `l` (indtemp.c:77-79, indask.c:33-35).
+    (* desc = "Inductance at the device temperature", units = "H" *) real inductance;
+    real tdev, dt;
+
+    analog begin
+        tdev = $temperature - 273.15 + dtemp;
+        if ($param_given(temp)) tdev = temp;
+        dt = tdev - tnom;
+        inductance = l * (1.0 + dt * (tc1 + tc2 * dt));
+        V(br) <+ ddt(inductance * I(br));
+    end
 endmodule

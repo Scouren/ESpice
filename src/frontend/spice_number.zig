@@ -1,15 +1,12 @@
-//! SPICE number literals. In: one field's text. Out: its value, as each
-//! simulator reads it: ngspice's and HSPICE's scale suffixes through
-//! ngspice's INPevaluate arithmetic (not the correctly rounded value),
-//! Spectre's case-sensitive suffixes, and plain decimal numbers for data
-//! files.
-//! Cites: ngspice inpeval.c INPevaluate; HSPICE User Guide B-2008.09 p. 49;
-//! glibc's pow(10, e) for the scale (#36); Touchstone 2.0 rule 6.
+//! SPICE number literals. In: one field's text. Out: its value, as ngspice
+//! reads it: scale suffixes through ngspice's INPevaluate arithmetic (not
+//! the correctly rounded value), and plain decimal numbers for data files.
+//! Cites: ngspice inpeval.c INPevaluate; glibc's pow(10, e) for the scale
+//! (#36); Touchstone 2.0 rule 6.
 //!
 //! Contents:
 //! - `pub fn plainNumber(t: []const u8) ?f64`
-//! - `pub fn spiceNumber(text: []const u8, comptime hspice_suffix: bool) ?f64`
-//! - `pub fn spectreNumber(text: []const u8) ?f64`
+//! - `pub fn spiceNumber(text: []const u8) ?f64`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -42,11 +39,10 @@ pub fn plainNumber(t: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, t) catch null;
 }
 
-/// A number with a SPICE scale suffix (`10meg`, `2.5u`); HSPICE also reads
-/// `x` as 1e6. An unknown suffix scales by 1. Null when `text` starts with
-/// no number.
-pub inline fn spiceNumber(text: []const u8, comptime hspice_suffix: bool) ?f64 {
-    const end = numberEnd(text, true) orelse return null;
+/// A number with a SPICE scale suffix (`10meg`, `2.5u`). An unknown
+/// suffix scales by 1. Null when `text` starts with no number.
+pub inline fn spiceNumber(text: []const u8) ?f64 {
+    const end = numberEnd(text) orelse return null;
     const s = text[end..];
     const scale_exp: i32 = if (s.len == 0)
         0
@@ -57,7 +53,6 @@ pub inline fn spiceNumber(text: []const u8, comptime hspice_suffix: bool) ?f64 {
     else switch (s[0]) {
         't' => 12,
         'g' => 9,
-        'x' => if (hspice_suffix) 6 else 0,
         'k' => 3,
         'm' => -3,
         'u' => -6,
@@ -70,38 +65,14 @@ pub inline fn spiceNumber(text: []const u8, comptime hspice_suffix: bool) ?f64 {
     return inpEvaluate(text[0..end], scale_exp, std.mem.startsWith(u8, s, "mil"));
 }
 
-/// A number literal with a case-sensitive Spectre suffix (`M` mega, `m` milli).
-pub fn spectreNumber(text: []const u8) ?f64 {
-    const end = numberEnd(text, false) orelse return null;
-    const base = std.fmt.parseFloat(f64, text[0..end]) catch return null;
-    const s = text[end..];
-    const scale: f64 = if (s.len == 0) 1 else switch (s[0]) {
-        'P' => 1e15,
-        'T' => 1e12,
-        'G' => 1e9,
-        'M' => 1e6,
-        'K', 'k' => 1e3,
-        '%', 'c' => 1e-2,
-        'm' => 1e-3,
-        'u' => 1e-6,
-        'n' => 1e-9,
-        'p' => 1e-12,
-        'f' => 1e-15,
-        'a' => 1e-18,
-        else => 1,
-    };
-    return base * scale;
-}
-
 // ---- private ----
 
 /// Length of the leading decimal literal of `text`: sign, digits, point
 /// and exponent, as SPICE delimits a number before its scale suffix. Null
 /// when `text` starts with no digit, or with a malformed exponent (`1e+`,
-/// `1e+k`). With `d_exp`, `d` is an exponent letter like `e` (`1d3`), as
-/// SPICE reads it (ngspice inpeval.c INPevaluate; HSPICE User Guide
-/// B-2008.09 p. 49).
-fn numberEnd(text: []const u8, comptime d_exp: bool) ?usize {
+/// `1e+k`). `d` is an exponent letter like `e` (`1d3`), as ngspice reads
+/// it (inpeval.c INPevaluate).
+fn numberEnd(text: []const u8) ?usize {
     var end: usize = 0;
     var seen_digit = false;
     var seen_dot = false;
@@ -112,7 +83,7 @@ fn numberEnd(text: []const u8, comptime d_exp: bool) ?usize {
             seen_digit = true;
         } else if (c == '.' and !seen_dot and !seen_exp) {
             seen_dot = true;
-        } else if ((c == 'e' or c == 'E' or d_exp and (c == 'd' or c == 'D')) and !seen_exp and seen_digit and end + 1 < text.len and
+        } else if ((c == 'e' or c == 'E' or c == 'd' or c == 'D') and !seen_exp and seen_digit and end + 1 < text.len and
             (std.ascii.isDigit(text[end + 1]) or text[end + 1] == '-' or text[end + 1] == '+'))
         {
             seen_exp = true;

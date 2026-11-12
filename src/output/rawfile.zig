@@ -20,9 +20,8 @@ const Plot = @import("plot.zig").Plot;
 pub const Body = enum { binary, ascii };
 
 /// Writes `plot`, which must have passed `plot.validatePlot(.binary, ...)`.
-/// Asserts that it has variables and one sample row per point.
+/// Asserts one sample row per point; a plot of no variables has none.
 pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
-    assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     try writeHeader(w, plot, .binary);
     try w.writeAll(std.mem.sliceAsBytes(plot.result.data));
@@ -30,7 +29,7 @@ pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
 
 /// Writes the raw header up to and including `Binary:` or `Values:`. The
 /// date is fixed so output is reproducible. Reads no samples, so a streamed
-/// plot's empty data is fine. Asserts that `plot` has variables.
+/// plot's empty data is fine.
 pub fn writeHeader(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void {
     try writeHeaderHead(w, plot);
     try w.print("{d}", .{plot.result.npoints});
@@ -38,9 +37,7 @@ pub fn writeHeader(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void {
 }
 
 /// The header up to the point count: everything through `No. Points: `.
-/// Asserts that `plot` has variables.
 pub fn writeHeaderHead(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
-    assert(plot.result.varnames.len > 0);
     try w.print("Title: {s}\n", .{plot.title});
     try w.writeAll("Date: Thu Jan  1 00:00:00 1970\n");
     try w.print("Plotname: {s}\n", .{plot.result.plotname});
@@ -48,10 +45,9 @@ pub fn writeHeaderHead(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     try w.print("No. Variables: {d}\nNo. Points: ", .{plot.result.varnames.len});
 }
 
-/// The header after the point count: the variable table and the body marker.
-/// Asserts that `plot` has variables.
+/// The header after the point count: the variable table, empty for a plot
+/// of no variables as ngspice-44.2 writes one, and the body marker.
 pub fn writeHeaderTail(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void {
-    assert(plot.result.varnames.len > 0);
     try w.writeAll("\nVariables:\n");
     for (plot.result.varnames, 0..) |name, i| try w.print("\t{d}\t{s}\t{s}\n", .{ i, name, varType(name) });
     try w.writeAll(switch (body) {
@@ -100,6 +96,20 @@ test "binary raw: complex plot" {
         .data = &.{ 1.0, 0.0, 0.5, -0.5, 10.0, 0.0, 0.1, -0.9 },
     } }, "Title: test ac\nDate: Thu Jan  1 00:00:00 1970\nPlotname: AC Analysis\nFlags: complex\n" ++
         "No. Variables: 2\nNo. Points: 2\nVariables:\n\t0\tfrequency\tfrequency\n\t1\tvdd#branch\tcurrent\nBinary:\n");
+}
+
+test "binary raw: an empty circuit's .op is a plot of no variables, as ngspice-44.2 writes it" {
+    // Golden: `ngspice -b -r` (44.2) on `empty op\n.op\n.end\n` writes
+    // `No. Variables: 0`, `No. Points: 1`, an empty `Variables:` table and
+    // no sample bytes after `Binary:` (tests/regression/misc/empty-1.sp).
+    try expectRaw(.{ .title = "empty op", .result = .{
+        .plotname = "Operating Point",
+        .varnames = &.{},
+        .is_complex = false,
+        .npoints = 1,
+        .data = &.{},
+    } }, "Title: empty op\nDate: Thu Jan  1 00:00:00 1970\nPlotname: Operating Point\nFlags: real\n" ++
+        "No. Variables: 0\nNo. Points: 1\nVariables:\nBinary:\n");
 }
 
 test "binary raw round-trips every f64 bit pattern, NaN payloads included" {

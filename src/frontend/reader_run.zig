@@ -4,13 +4,12 @@
 //!
 //! Contents:
 //! - `pub fn Methods(comptime S: type) type`
-//! - `pub fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist`
+//! - `pub fn run(arena: Allocator, src: []const u8, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist`
 //! - `pub fn nodeValues(arena: Allocator, cards_args: []const []const Value, nets: NetLookup) Error![]const Ic`
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -25,7 +24,7 @@ const card_rows = @import("card_rows.zig");
 const netlist_view = @import("netlist_view.zig");
 const card_table = @import("card_table.zig");
 const reader_frame = @import("reader_frame.zig");
-const Dialect = card_rows.Dialect;
+const temper_slots = @import("temper_slots.zig");
 const EdgeId = card_rows.EdgeId;
 const none = card_rows.none;
 const Error = card_rows.Error;
@@ -48,7 +47,7 @@ const setsKey = card_table.setsKey;
 /// that a DRAM miss lands before the read, near enough to stay in cache.
 const prefetch_ahead = 8;
 
-/// The stage's `Reader` methods over dialect syntax `S`; `Reader(S)`
+/// The stage's `Reader` methods over line syntax `S`; `Reader(S)`
 /// aliases each one as its own decl.
 pub fn Methods(comptime S: type) type {
     return struct {
@@ -57,7 +56,7 @@ pub fn Methods(comptime S: type) type {
         const isStep = R.isStep;
         const isWcd = R.isWcd;
 
-        pub fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
+        pub fn run(arena: Allocator, src: []const u8, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
             var line_hint: usize = undefined;
             const text: []const u8 = if (S.fold_case) blk: {
                 const buf = try arena.alloc(u8, src.len);
@@ -67,9 +66,15 @@ pub fn Methods(comptime S: type) type {
                 line_hint = std.mem.countScalar(u8, src, '\n');
                 break :blk src;
             };
-            var r: R = try .init(arena, src, text, dialect);
-            errdefer if (!r.logged and r.card.len > 0 and !@import("builtin").is_test)
-                std.log.err("netlist: cannot read the card: {s}", .{r.written(r.card)});
+            var r: R = try .init(arena, src, text);
+            errdefer if (!r.logged and r.card.len > 0 and !@import("builtin").is_test) {
+                const card = r.written(r.card);
+                // A card with no visible byte prints escaped, never blank.
+                const blank = for (card) |c| {
+                    if (c > ' ' and c < 0x7f) break false;
+                } else true;
+                if (blank) std.log.err("netlist: cannot read the card: {f}", .{std.ascii.hexEscape(card, .lower)}) else std.log.err("netlist: cannot read the card: {s}", .{card});
+            };
             r.global_scopes = .{&r.globals};
             var split: S.Lines = .{ .rest = text, .arena = arena };
             var title: []const u8 = "";
@@ -84,18 +89,6 @@ pub fn Methods(comptime S: type) type {
             // end) is no card (#164, #38).
             while (try split.next()) |line| {
                 if (std.mem.trim(u8, line, " \t").len > 0) try r.lines.append(arena, line);
-            }
-            // HSPICE forbids an exponent and a scale factor together (#203).
-            if (dialect == .hspice) for (r.lines.items) |line| if (lines.hspice.exponentWithScale(line)) {
-                r.card = line;
-                return r.unsupported(line, "a number with both an exponent and a scale factor (`1e-6u`)");
-            };
-            // Spectre statements become the SPICE cards the walks read.
-            if (dialect == .spectre) {
-                const translated = try spectre_rewrite.translate(arena, r.lines.items);
-                r.lines = .empty;
-                try r.lines.appendSlice(arena, translated.lines);
-                r.kinds = translated.kinds;
             }
             pattern.rewrite(arena, r.lines.items) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -118,6 +111,7 @@ pub fn Methods(comptime S: type) type {
             var model_lines: std.ArrayList(ModelLine) = .empty;
             var directive_lines: std.ArrayList(u32) = .empty;
             try r.declarations(&top_devices, &model_lines, &directive_lines);
+            r.top_devices = top_devices.items;
             // Flattened, a hierarchical deck holds more cards than lines:
             // sized for that too, so `expand` never regrows the tables (an
             // arena regrowth copies them and keeps the old block).
@@ -153,7 +147,6 @@ pub fn Methods(comptime S: type) type {
                 monte_card = monte_card or setsKey(line, "monte");
                 mismatch = mismatch or kind == .dcmatch or kind == .acmatch or kind == .dcsens;
             }
-            seed = seed and dialect == .ngspice;
             r.draw_seed = seed and !monte_card;
             r.monte = monte_card or seed or mismatch;
             // The caller's live names, registered before any model,
@@ -208,7 +201,7 @@ pub fn Methods(comptime S: type) type {
                         for (rp.nodes) |n| r.pool.prefetch(n);
                     }
                 }
-                try r.readDevice(r.lines.items[i], r.kindOf(i), &top, if (scanned > 0) i else null);
+                try r.readDevice(r.lines.items[i], &top, if (scanned > 0) i else null);
             }
             // The passes below read no one card.
             r.card = "";
@@ -227,6 +220,11 @@ pub fn Methods(comptime S: type) type {
             const graph = try r.hg.finish(arena);
             const models = try arena.alloc(Model, r.models.items.len);
             for (models, r.models.items) |*m, row| m.* = .{ .name = row.name, .kind = row.kind, .kv = r.kvs.items[row.kv.start..][0..row.kv.len] };
+            // After `resolveLive`, which reads a live name inside a kept
+            // value from a constant-pool row.
+            const model_kvs = try arena.alloc(card_rows.Span, r.models.items.len);
+            for (model_kvs, r.models.items) |*span, row| span.* = row.kv;
+            const temper = try temper_slots.find(arena, &graph, model_kvs, r.values.items, r.kvs.items, r.ops.items, r.consts.items);
 
             // Stable counting sort of devices by card letter.
             const kinds = graph.edges.items(.kind);
@@ -240,7 +238,7 @@ pub fn Methods(comptime S: type) type {
                 next[k - 'a'] += 1;
             }
 
-            const nets: NetLookup = .{ .pool = &r.pool, .net_of = r.net_of.items, .dialect = dialect };
+            const nets: NetLookup = .{ .pool = &r.pool, .net_of = r.net_of.items };
             for (r.analyses.items) |*a| resolve(a, nets);
 
             return .{
@@ -255,17 +253,16 @@ pub fn Methods(comptime S: type) type {
                 .models = models,
                 .model_ids = r.model_ids,
                 .live = live,
+                .temper = temper,
                 .tunable = tunable,
                 .deck = .{
                     .title = title,
-                    .dialect = dialect,
                     .analyses = r.analyses.items,
                     .config = r.config.items,
                     .ic = try nodeValues(arena, r.ic_cards.items, nets),
                     .nodeset = try nodeValues(arena, r.nodeset_cards.items, nets),
                     .saves = if (r.save_all) &.{} else r.saves.items,
                     .opvar_saves = r.opvar_saves.items,
-                    .probe_op = r.probe_op,
                     .foreign = r.foreign.items,
                     .vpi_apps = r.vpi_apps.items,
                     .soa_file = r.soa_file,
@@ -286,8 +283,9 @@ pub fn Methods(comptime S: type) type {
             };
         }
 
-        /// `v(net)=value` pairs (or bare `net value`, as `.dcvolt` allows) of
-        /// `.ic`-style cards; a net no card names is dropped.
+        /// `v(net)=value` pairs of `.ic` and `.nodeset` cards; a net no card
+        /// names is dropped, and so is `.nodeset all=` (`readDirective`
+        /// refuses every other bare name).
         pub fn nodeValues(arena: Allocator, cards_args: []const []const Value, nets: NetLookup) Error![]const Ic {
             var out: std.ArrayList(Ic) = .empty;
             for (cards_args) |args| {
@@ -296,7 +294,7 @@ pub fn Methods(comptime S: type) type {
                 while (i + 1 < args.len) : (i += 2) {
                     const name = switch (args[i]) {
                         .group => |g| if (std.ascii.eqlIgnoreCase(g.name(), "v") and g.args().len > 0) nodeText(g.args()[0], &buf) else null,
-                        else => nodeText(args[i], &buf),
+                        else => null,
                     } orelse continue;
                     const value = switch (args[i + 1]) {
                         .num => |n| n,

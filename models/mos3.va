@@ -31,6 +31,7 @@ module mos3(d, g, s, b);
     // ---- channel (level 3) ---------------------------------------------
     parameter integer tpg      = 1 from [-1:1];            // gate: +1 opp, -1 same, 0 aluminium
     parameter real    vto    = 0.0;                      // zero-bias threshold [V]
+    aliasparam vt0 = vto;                    // ngspice mos3.c:115 IOPR spelling
     parameter real    kp     = 2.07189e-5 from (0:inf);  // transconductance [A/V^2]
     parameter real    gamma  = 0.0 from [0:inf);         // body effect [sqrt(V)]
     parameter real    phi    = 0.6 from (0:inf);         // surface potential [V]
@@ -465,10 +466,19 @@ module mos3(d, g, s, b);
             cgsh = 0.0;
             cgdh = 0.0;
         end else if (vgst <= 0.0) begin             // weak inversion
+            // Split by vds like the linear region (devsup.c DEVqmeyer):
+            // cgdh = 0 here swapped the caps at the vds = 0 mode flip and
+            // Newton 2-cycled there at any dt.
             cgbh = -vgst * coxp * weff * leff * m / (2.0 * phit);
             cgsh = vgst * coxp * weff * leff * m / (1.5 * phit)
                    + coxp * weff * leff * m / 3.0;
             cgdh = 0.0;
+            if (vdsx < vdsp) begin
+                argb = 2.0 * vdsp - vdsx;
+                arga = vdsp - vdsx;
+                cgdh = cgsh * (1.0 - vdsp * vdsp / (argb * argb));
+                cgsh = cgsh * (1.0 - arga * arga / (argb * argb));
+            end
         end else if (vdsp <= vdsx) begin            // saturation
             cgbh = 0.0;
             cgsh = coxp * weff * leff * m / 3.0;

@@ -6,8 +6,6 @@
 //!
 //! Contents:
 //! - `pub const title_line = true`
-//! - `pub const remainder_ops = "%\\"`
-//! - `pub const unary_not = true`
 //! - `pub const fold_case = true`
 //! - `pub const Split = Fields("'", true)`
 //! - `pub const Lines = struct`
@@ -23,11 +21,6 @@ const physical_lines = @import("physical_lines.zig");
 
 /// The first line is the deck title, not a card.
 pub const title_line = true;
-/// Operator bytes beyond `* /` at their level: numparam's remainder and
-/// integer division (ngspice-syntax.md §2.2).
-pub const remainder_ops = "%\\";
-/// Unary `!` is numparam's logical not (ngspice-syntax.md §2.2).
-pub const unary_not = true;
 /// Cards are case-insensitive: the text is lowercased before parsing.
 pub const fold_case = true;
 /// Field splitter over one logical line.
@@ -45,6 +38,14 @@ pub const Lines = struct {
     /// warning.
     fn isCommentLead(c: u8) bool {
         return std.mem.indexOfScalar(u8, "*#$;=[]?()&%\"!:,\x0c", c) != null;
+    }
+
+    /// True when `t` is one control byte alone or before a blank, as a DOS
+    /// end-of-file `^Z`: ngspice rewrites that card to a comment
+    /// (inpcom.c:3515-3520, `inp_casefix`).
+    fn isLoneControl(t: []const u8) bool {
+        return !std.ascii.isWhitespace(t[0]) and !std.ascii.isPrint(t[0]) and
+            (t.len == 1 or std.ascii.isWhitespace(t[1]));
     }
 
     /// `line` up to its end-of-line comment [§1.5], trimmed: `;` or `//`
@@ -105,7 +106,7 @@ pub const Lines = struct {
         while (true) {
             const raw = physical_lines.nextPhysicalLine(&self.rest) orelse return null;
             const t = std.mem.trim(u8, raw, " \t");
-            if (t.len == 0 or isCommentLead(t[0])) continue;
+            if (t.len == 0 or isCommentLead(t[0]) or isLoneControl(t)) continue;
             // §1.3: a line starting with `@` ends the file.
             if (t[0] == '@') {
                 self.rest = "";
@@ -149,5 +150,5 @@ pub const Lines = struct {
 
 /// A number literal with an ngspice scale suffix; null when `text` is not one.
 pub fn parseNum(text: []const u8) ?f64 {
-    return spice_number.spiceNumber(text, false);
+    return spice_number.spiceNumber(text);
 }

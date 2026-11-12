@@ -51,7 +51,8 @@ STYLE = {"figure.facecolor": "#fcfcfb", "axes.facecolor": "#fcfcfb", "axes.edgec
 
 def read_report(report: Path, vendor: bool = False):
     """The bench report as (header, rows, verdict_cols, verdicts); a row is
-    (deck, [median ms or None per column]). HSPICE/Spectre go unless `vendor`."""
+    (deck, [median ms or None per column]). HSPICE/Spectre go unless `vendor`;
+    SpiceRack's translation time always goes: it is no simulator."""
     header, rows, verdict_cols, verdicts = None, [], [], {}
     for line in report.read_text().splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -64,10 +65,9 @@ def read_report(report: Path, vendor: bool = False):
             verdicts[cells[0]] = dict(zip(verdict_cols, cells[1 + len(header) :]))
     if not rows:
         sys.exit(f"no rows in {report}")
-    if not vendor:
-        keep = [i for i, h in enumerate(header) if not re.match(r"(HSPICE|Spectre)\b", h)]
-        header = [header[i] for i in keep]
-        rows = [(rel, [t[i] for i in keep]) for rel, t in rows]
+    keep = [i for i, h in enumerate(header) if h != "SpiceRack" and (vendor or not re.match(r"(HSPICE|Spectre)\b", h))]
+    header = [header[i] for i in keep]
+    rows = [(rel, [t[i] for i in keep]) for rel, t in rows]
     return header, rows, verdict_cols, verdicts
 
 

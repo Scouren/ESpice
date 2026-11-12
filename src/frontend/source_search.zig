@@ -1,8 +1,7 @@
 //! Where a file a deck names is found and how its name is read. In: the
-//! naming file's path, a name as written, the `.option search=` directories.
-//! Out: a resolved path, and the file's bytes read once per expansion.
-//! Cites: HSPICE [CR] .OPTION SEARCH; ngspice inpcom.c (paths relative to
-//! the including file).
+//! naming file's path and a name as written. Out: a resolved path, and the
+//! file's bytes read once per expansion.
+//! Cites: ngspice-45 inpcom.c inp_pathresolve_at.
 //!
 //! Contents:
 //! - `pub const Fields = lines.Fields("\"'", false)`
@@ -23,11 +22,10 @@ const lines = @import("lines.zig");
 /// A card's fields with `"` and `'` quoting, no braces.
 pub const Fields = lines.Fields("\"'", false);
 
-/// Where a file a deck names is looked for: beside the file naming it, then
-/// in `dirs`; `deck` is the top-level deck, whose stem names `.load`'s
-/// default file. Borrows every slice.
+/// Where a file a deck names is looked for (`locate`). Borrows every slice.
 pub const Search = struct {
-    dirs: []const []const u8,
+    /// The top-level deck: `locate` looks beside it last, and its stem
+    /// names `.load`'s default file.
     deck: []const u8,
     /// The files read so far, so a library named by several `.lib` cards
     /// (one per section) is read once; null reads each time.
@@ -64,22 +62,30 @@ pub const Files = struct {
     }
 };
 
-/// `name` beside `path`, else in the first search directory holding it;
-/// beside `path` when none does, so the open reports the usual error.
+/// Where the file at `path` finds `name`, as ngspice does: `name` itself
+/// when absolute, else the first that exists of `./name` in the work
+/// directory, then beside `path` (ngspice-45 inp_pathresolve_at,
+/// inpcom.c:2207-2252; `dir` is the naming file's directory, inp.c:530,
+/// inpcom.c:594 and 1564). Then, an ESPice extension, beside the top deck
+/// with a warning, so a nested file named from the deck's directory reads
+/// the same from wherever espice runs. Beside `path` when none exists, so
+/// the open reports the usual error. Not followed: ngspice's `sourcepath` (`.`, its own scripts
+/// directory and $NGSPICE_INPUT_DIR, cpitf.c:248-253) and `.include`'s
+/// retry from the last included file's directory (inpcom.c:1535-1536).
 /// Caller owns returned string and must free with `gpa`.
 pub fn locate(io: Io, gpa: Allocator, search: Search, path: []const u8, name: []const u8) Allocator.Error![]u8 {
     const here = try std.fs.path.resolve(gpa, &.{ std.fs.path.dirname(path) orelse ".", name });
     errdefer gpa.free(here);
-    if (search.dirs.len == 0 or std.fs.path.isAbsolute(name)) return here;
-    if (Io.Dir.cwd().access(io, here, .{})) |_| return here else |_| {}
-    for (search.dirs) |dir| {
-        const there = try std.fs.path.resolve(gpa, &.{ dir, name });
-        if (Io.Dir.cwd().access(io, there, .{})) |_| {
-            gpa.free(here);
-            return there;
-        } else |_| gpa.free(there);
-    }
-    return here;
+    if (std.fs.path.isAbsolute(name)) return here;
+    const found = blk: {
+        if (try existing(io, gpa, &.{name})) |p| break :blk p;
+        if (Io.Dir.cwd().access(io, here, .{})) |_| return here else |_| {}
+        const top = (try existing(io, gpa, &.{ std.fs.path.dirname(search.deck) orelse ".", name })) orelse return here;
+        if (!@import("builtin").is_test) std.log.warn("{s}: '{s}' is not beside it; read {s}", .{ path, name, top });
+        break :blk top;
+    };
+    gpa.free(here);
+    return found;
 }
 
 /// The next field as a name: a quoted body or a bare word; null at the end
@@ -96,6 +102,16 @@ pub fn word(fields: *Fields) error{InvalidInclude}!?[]const u8 {
 /// The text before the first blank or tab.
 pub fn firstWord(t: []const u8) []const u8 {
     return t[0 .. std.mem.indexOfAny(u8, t, " \t") orelse t.len];
+}
+
+// ---- private ----
+
+/// `parts` joined, owned by `gpa`, when that file exists; else null.
+fn existing(io: Io, gpa: Allocator, parts: []const []const u8) Allocator.Error!?[]u8 {
+    const p = try std.fs.path.resolve(gpa, parts);
+    if (Io.Dir.cwd().access(io, p, .{})) |_| return p else |_| {}
+    gpa.free(p);
+    return null;
 }
 
 test word {

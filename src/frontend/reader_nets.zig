@@ -9,7 +9,6 @@
 //! - `pub fn connect(r: *R, a: []const u8, b: []const u8) Error!void`
 //! - `pub fn joined(r: *R, parts: []const []const u8) Error![]const u8`
 //! - `pub fn netOf(r: *R, frame: *const Frame, node: []const u8) Error!VertexId`
-//! - `pub fn mixedPort(f: F) bool`
 //! - `pub fn fixedPins(letter: u8) ?usize`
 //! - `pub fn expand(r: *R, head: []const u8, frame: *const Frame, kv_text: []const []const u8) Error!void`
 //! - `pub fn expandedExtra(r: *R, top: []const u32) Error!struct { cards: usize, kvs: usize }`
@@ -20,7 +19,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lines = @import("lines.zig");
-const spectre_rewrite = @import("spectre.zig");
 const source = @import("source.zig");
 const hypergraph = @import("hypergraph.zig");
 const expr = @import("expr.zig");
@@ -39,10 +37,9 @@ const VertexId = card_rows.VertexId;
 const ground = card_rows.ground;
 const none = card_rows.none;
 const Error = card_rows.Error;
-const isGround = netlist_view.isGround;
+const isGroundName = netlist_view.isGroundName;
 const Card = card_table.Card;
 const Branches = card_table.Branches;
-const port_source_words = card_table.port_source_words;
 const cards = card_table.cards;
 const cardOf = card_table.cardOf;
 const Scope = reader_frame.Scope;
@@ -65,7 +62,7 @@ pub fn Methods(comptime S: type) type {
         }
 
         pub fn intern(r: *R, s: []const u8) Error!VertexId {
-            if (isGround(r.dialect, s)) return ground;
+            if (isGroundName(s)) return ground;
             const n = try r.internName(s);
             const slot = &r.net_of.items[n.index()];
             if (slot.* == none) {
@@ -84,7 +81,7 @@ pub fn Methods(comptime S: type) type {
         pub fn connect(r: *R, a: []const u8, b: []const u8) Error!void {
             // Name rows, not pointers into `net_of`: interning `b` can grow it.
             var rows: [2]?u32 = .{ null, null };
-            for ([_][]const u8{ a, b }, &rows) |name, *row| if (!isGround(r.dialect, name)) {
+            for ([_][]const u8{ a, b }, &rows) |name, *row| if (!isGroundName(name)) {
                 row.* = (try r.internName(try r.arena.dupe(u8, name))).index();
             };
             var ids: [2]u32 = .{ 0, 0 };
@@ -95,7 +92,8 @@ pub fn Methods(comptime S: type) type {
             if (ids[0] == none) r.net_of.items[rows[0].?] = ids[1] else if (ids[1] == none) r.net_of.items[rows[1].?] = ids[0] else if (ids[0] != ids[1]) return error.ParseError;
         }
 
-        /// `parts` joined, in reused scratch.
+        /// `parts` joined, in reused scratch: valid until the next call, so
+        /// a name kept past it is interned or copied.
         pub fn joined(r: *R, parts: []const []const u8) Error![]const u8 {
             r.name_buf.clearRetainingCapacity();
             for (parts) |part| try r.name_buf.appendSlice(r.arena, part);
@@ -103,30 +101,15 @@ pub fn Methods(comptime S: type) type {
         }
 
         /// A node as the frame names it: a port maps to the caller's net,
-        /// ground (`isGround`) and `.global` names stay global, anything else
-        /// is `<path>.<node>`.
+        /// ground (`isGroundName`) and `.global` names stay global, anything
+        /// else is `<path>.<node>`.
         pub fn netOf(r: *R, frame: *const Frame, node: []const u8) Error!VertexId {
             const path = frame.path orelse return r.intern(node);
             if (frame.port_index) |index| {
                 if (index.get(node)) |k| return frame.actuals[k];
             } else for (frame.ports, frame.actuals) |p, a| if (std.mem.eql(u8, p, node)) return a;
-            if (isGround(r.dialect, node) or r.global_nets.contains(node)) return r.intern(node);
+            if (isGroundName(node) or r.global_nets.contains(node)) return r.intern(node);
             return r.intern(try r.joined(&.{ path, ".", node }));
-        }
-
-        /// A mixed-mode P card, `P1 n+ n- ref port=1 ...` [SA Ch.17]: a
-        /// third word that is neither a key (`port=`) nor a source keyword.
-        /// The manual writes a P card's DC value as `DC mag`, so a bare
-        /// third word is the reference node, not a value.
-        pub fn mixedPort(f: F) bool {
-            var p = f;
-            _ = p.next();
-            _ = p.next();
-            const t = p.next() orelse return false;
-            if (!F.isWord(t)) return false;
-            if (p.next()) |u| if (u[0] == '=') return false;
-            var buf: [8]u8 = undefined;
-            return t.len > buf.len or !port_source_words.has(std.ascii.lowerString(&buf, t));
         }
 
         pub fn fixedPins(letter: u8) ?usize {
@@ -169,6 +152,16 @@ pub fn Methods(comptime S: type) type {
                 .name => |n| .{ .text = n },
                 else => .{ .text = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text },
             });
+            // `m=` on an X card whose subcircuit declares no `m` makes m
+            // parallel copies of it (ngspice inpcom.c:4334-4344, HSPICE's
+            // instance multiplier).
+            var mult = frame.mult;
+            const declares_m = for (sub.defaults) |d| {
+                if (std.mem.eql(u8, d.key, "m")) break true;
+            } else false;
+            if (!declares_m) for (r.card_kv.items) |kv| if (std.mem.eql(u8, kv.key, "m")) {
+                mult *= kv.value.number() orelse return r.unsupported(r.card, "an X card's m= that is not a number");
+            };
             const actuals = try arena.alloc(VertexId, r.nodes.items.len);
             for (r.nodes.items, actuals) |n, *a| a.* = try r.netOf(frame, n);
             const scopes = try std.mem.concat(arena, *const Scope, &.{ frame.scopes, &.{scope} });
@@ -182,6 +175,7 @@ pub fn Methods(comptime S: type) type {
                 .instance = instance,
                 .sub = id,
                 .models_mark = @intCast(r.instance_models.items.len),
+                .mult = mult,
             };
             defer r.instance_models.shrinkRetainingCapacity(child.models_mark);
             if (r.replays.len == 0) {
@@ -214,7 +208,7 @@ pub fn Methods(comptime S: type) type {
             var nested: u32 = 0;
             for (r.lines.items[sub.first..sub.end], sub.first..) |line, i| {
                 if (line[0] != '.') {
-                    if (nested == 0 and branches.active()) try r.readDevice(line, r.kindOf(i), &child, i);
+                    if (nested == 0 and branches.active()) try r.readDevice(line, &child, i);
                     continue;
                 }
                 if (!sub.has_cond and !sub.has_nested) continue;
@@ -275,8 +269,7 @@ pub fn Methods(comptime S: type) type {
         /// whose last word before its parameters names one, else null.
         pub fn xTarget(r: *const R, i: usize) ?u16 {
             const line = r.lines.items[i];
-            const letter = if (r.kindOf(i) != 0) r.kindOf(i) else std.ascii.toLower(line[0]);
-            if (letter != 'x') return null;
+            if (std.ascii.toLower(line[0]) != 'x') return null;
             var f = F.init(line);
             _ = f.next();
             var last: ?[]const u8 = null;

@@ -7,7 +7,7 @@
 //! Cites Verilog-AMS LRM §4.6.4; ngspice's `.noise ... pts` naming; #83.
 //!
 //! Contents:
-//! - `pub const Columns = struct` (`labels`, `gen`, `total`, `Error`, `build`, `sum`)
+//! - `pub const Columns = struct` (`labels`, `gen`, `total`, `none`, `Error`, `build`, `sum`)
 //! - `pub fn sourceCount(batches: []const Batch) usize`
 
 const std = @import("std");
@@ -20,10 +20,16 @@ const root = @import("../types.zig");
 pub const Columns = struct {
     /// `<inst>_<gen>` or `<inst>`, in column order.
     labels: []const []const u8 = &.{},
-    /// Per source, in `collectNoiseSources` order: its generator column.
+    /// Per source, in `collectNoiseSources` order: its generator column, or
+    /// `none`.
     gen: []const u32 = &.{},
-    /// Per source: its instance's total column.
+    /// Per source: its instance's total column, or `none`.
     total: []const u32 = &.{},
+
+    /// The column of a source of an internal add (`CardNames.internal`,
+    /// such as a portnum V's z0 resistor): it has none. ngspice's vsrc
+    /// publishes no noise row, so such an instance adds to the totals only.
+    pub const none = std.math.maxInt(u32);
 
     /// Every way `build` fails. Everything is allocated in an arena the
     /// caller frees whole, so nothing is freed on error.
@@ -34,8 +40,9 @@ pub const Columns = struct {
 
     /// Labels the `n_sources` generators `collectNoiseSources` yields, batch
     /// by batch and instance by instance, from each batch's `noise_names`
-    /// and the card names in `names`. Allocates from `arena`, which owns the
-    /// result.
+    /// and the card names in `names` (`<type>#<index>` for an instance of a
+    /// table that names none); an internal add gets no column (`none`).
+    /// Allocates from `arena`, which owns the result.
     pub fn build(arena: Allocator, batches: []const abi.Batch, types: []const abi.DeviceType, names: root.CardNames, n_sources: usize) Error!Columns {
         assert(types.len == batches.len);
         var labels: std.ArrayList([]const u8) = .empty;
@@ -49,6 +56,12 @@ pub const Columns = struct {
             if (s + b.count * gens.len > n_sources) return error.NoiseLabelMismatch;
             if (gens.len == 0) continue;
             for (0..b.count) |id| {
+                if (names.internal(t, @intCast(id))) {
+                    @memset(gen[s..][0..gens.len], none);
+                    @memset(total[s..][0..gens.len], none);
+                    s += gens.len;
+                    continue;
+                }
                 const inst = names.get(t, @intCast(id)) orelse try arena.print("{s}#{d}", .{ b.type_name, id });
                 const first = labels.items.len;
                 for (gens, 0..) |name, k| {
@@ -72,11 +85,12 @@ pub const Columns = struct {
         return .{ .labels = labels.items, .gen = gen, .total = total };
     }
 
-    /// Adds each per-source value into its generator and instance columns.
-    /// Asserts one value per source.
+    /// Adds each per-source value into its generator and instance columns;
+    /// a `none` source adds to neither. Asserts one value per source.
     pub fn sum(self: Columns, per_source: []const f64, cols: []f64) void {
         assert(per_source.len == self.gen.len);
         for (per_source, self.gen, self.total) |v, g, t| {
+            if (g == none) continue;
             cols[g] += v;
             cols[t] += v;
         }

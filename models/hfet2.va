@@ -55,14 +55,19 @@ module hfet2(d, g, s);
     // --- geometry / ambient ---
     parameter real w     = 20e-6  from (0:inf);   // gate width [m]
     parameter real l     = 1e-6   from (0:inf);   // gate length [m]
-    parameter real temp  = -1.0;                 // instance temperature [K]; <=0 uses ambient
+    // A given temp [degC] (hfet2param.c:52-54) wins over dtemp (hfet2temp.c:42-45).
+    parameter real temp  = 27.0;                 // instance temperature [degC]
     parameter real dtemp = 0.0;                   // temperature offset [K]
-    parameter real tnom  = $simparam("tnom") + 273.15 from (0:inf);   // nominal temperature [K]
+    // No model TNOM: ngspice refers every tempco to .options tnom
+    // (CKTnomTemp, hfet2temp.c:48) and 44.2 prints "unrecognized parameter
+    // (tnom) - ignored" for one on the card, which a degC card value read
+    // here as kelvin would not.
 
     // --- DC channel.  vto/eta/mu/vs defaults are per-polarity in
     // hfet2setup.c (NHFET / PHFET); the signed vto_t = type_nfet*vto below is
     // ngspice's TVTO = TYPE*VTO, so the PHFET default must itself be negative.
     parameter real vto     = (type_nfet > 0) ?  0.15 : -0.15; // threshold [V]
+    aliasparam vt0 = vto;                    // ngspice hfet2.c:82-83 IOPR spelling
     parameter real lambda  = 0.15;                // output conductance (CLM) [1/V]
     parameter real mu      = ((type_nfet > 0) ? 0.4 : 0.03) from (0:inf); // low-field mobility [m^2/Vs]
     parameter real nmax    = 2e16   from (0:inf); // max sheet charge density [1/m^2]
@@ -114,7 +119,7 @@ module hfet2(d, g, s);
     parameter real mult = 1.0 from (0:inf);       // device multiplicity
 
     // bias-independent prep
-    real tdev, dtn, vth, vto_t, lambda_t, mu_t, nmax_t;
+    real tdev, tnom, dtn, vth, vto_t, lambda_t, mu_t, nmax_t;
     real n0, n02, gchi0, imax, jslw, ggrlw, vl, vtn, wl, rt, vcrit;
     integer two_layer;
     real eta_vth, eta2_vth, eta1_vth, d1_epsi, delta2, invgamma, invm, invmc;
@@ -132,7 +137,9 @@ module hfet2(d, g, s);
         // ---- bias-independent prep: temperature, geometry, junction area
         // scaling.  No V() below this line, so none of it enters the
         // derivative chains (doc §2 spine; hfet2temp.c does it once per temp).
-        tdev     = temp > 0.0 ? temp : $temperature + dtemp;
+        if ($param_given(temp)) tdev = temp + 273.15;
+        else tdev = $temperature + dtemp;
+        tnom     = $simparam("tnom") + 273.15;   // .options tnom [K]
         dtn      = tdev - tnom;
         vth      = 1.38064852e-23 / 1.6021766208e-19 * tdev;
         vto_t    = type_nfet * vto - kvto * dtn;

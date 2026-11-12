@@ -169,8 +169,8 @@ pub fn jobAt(self: *const Session, i: usize) requests.Query {
         const g = @backingInt(owner);
         const lane: u32 = @intCast(i - (g - self.rows.items(.lanes)[g]));
         switch (job) {
-            inline .mc, .temp => |*o| o.lane = lane,
-            else => unreachable, // else: only `.mc` and `.temp` split (`splitLanes`)
+            inline .mc, .temp, .dc => |*o| o.lane = lane,
+            else => unreachable, // else: only `.mc`, `.temp` and `.dc` split (`splitLanes`)
         }
     }
     return job;
@@ -187,8 +187,9 @@ pub fn opKey(self: *const Session, i: usize) OpKey {
 /// Appends job `r` after the OP it needs, shared when one matches, and
 /// returns its id; a `requested` row joins `outputs`. A split query
 /// (`splitLanes`) reads its OP only through its `lane` rows, so it is
-/// not one of the OP's readers. Infallible: `appendAt` reserved every
-/// row, OP index entry and output first.
+/// not one of the OP's readers, but for a `.dc`, which reruns whole from
+/// its OP when a seam disagrees (`Session.assemble`). Infallible:
+/// `appendAt` reserved every row, OP index entry and output first.
 pub fn addRow(self: *Session, r: JobRef, lane: bool, template: u32, requested: bool, roots: *u32) QueryId {
     const job = self.jobs.items[r.job];
     const split = if (lane) 0 else splitLanes(job);
@@ -214,7 +215,7 @@ pub fn addRow(self: *Session, r: JobRef, lane: bool, template: u32, requested: b
     if (dependency == none) {
         assert(split == 0);
         roots.* += 1;
-    } else if (split == 0) {
+    } else if (split == 0 or job == .dc) {
         const d = @backingInt(dependency);
         self.rows.items(.readers)[d] += 1;
         sibling = self.rows.items(.child)[d];
@@ -280,13 +281,15 @@ pub fn addTemplate(self: *Session, circuit: *const Circuit) !void {
 
 /// Points each `.four`/`.fft` row from `from` on at a `.tran` row of
 /// the same call that runs its transient (`resultSource`), so it reads
-/// that result instead of integrating again (#231). The `.tran` comes
-/// first, so `deinit` (newest first) joins a reader before the rows it
-/// reads die, and the reader joins its component.
+/// that result instead of integrating again (#231), and each `.pss`
+/// spectrum (`Pss.harms`) at its card's period row, so one shooting
+/// serves both plots. The source comes first, so `deinit` (newest first)
+/// joins a reader before the rows it reads die, and the reader joins its
+/// component.
 fn linkReaders(self: *Session, from: usize) void {
     for (from..self.rows.len) |f| {
-        const kind = self.kindAt(f);
-        if (kind != .four and kind != .fft) continue;
+        const job = self.jobAt(f);
+        if (job != .four and job != .fft and !(job == .pss and job.pss.harms != 0)) continue;
         const src = resultSource(self, from, f) orelse continue;
         const rows = self.rows.slice();
         rows.items(.reads)[f] = @fromBackingInt(@intCast(src));
@@ -323,13 +326,22 @@ fn resultSource(self: *const Session, from: usize, f: usize) ?usize {
 /// that records every probe column with no stream, measures or
 /// tangents, the reader's nodes among those probes, and no device that
 /// prints display tasks or calls VPI at each step, whose output for
-/// the reader's own run would be lost.
+/// the reader's own run would be lost. A `.pss` spectrum row `f` reads
+/// `.pss` row `t` on the same circuit, variant and OP row whose options
+/// are its own but `harms` 0: its card's period, on any backend, since
+/// ngspice's spectrum is that period's.
 fn reusable(self: *const Session, f: usize, t: usize) bool {
     const rows = self.rows.slice();
-    if (self.kindAt(t) != .tran or self.config.backend != .cpu or self.config.gpu_lanes) return false;
     if (rows.items(.template)[f] != rows.items(.template)[t] or rows.items(.variant)[f] != rows.items(.variant)[t] or
         rows.items(.dependency)[f] != rows.items(.dependency)[t]) return false;
     const reader = self.jobs.items[rows.items(.job)[f]];
+    if (reader == .pss) {
+        const source = self.jobAt(t);
+        var period = self.jobAt(f).pss;
+        period.harms = 0;
+        return source == .pss and jobs_mod.sameDeep(period, source.pss);
+    }
+    if (self.kindAt(t) != .tran or self.config.backend != .cpu or self.config.gpu_lanes) return false;
     const tran = self.jobs.items[rows.items(.job)[t]].tran;
     const p = tran.point;
     if (p.measures_only or p.early_stop or p.abort_after != null or p.tangent_step != 0) return false;

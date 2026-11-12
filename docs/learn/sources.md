@@ -110,11 +110,11 @@ E and G also accept the classic nonlinear forms (`POLY`, `VALUE=`,
 [language reference](../using/reference.md#controlled-sources) lists them.
 
 !!! warning "Keyword node names"
-    In an E, F, G or H card, the word in the first control-node position is
-    checked against the behavioural keywords first (`poly`, `value`,
-    `table`, `laplace`, `pole`, `delay`, `vcr`, `vccap`, `vol`, `cur`, ...).
-    A node named `pole` there turns the card into a POLE source and the deck
-    fails with `ParseError`. Pick another node name.
+    In an E, F, G or H card, a node in the first control-node position
+    named for a behavioural form (`poly`, `laplace`, `pole`, `delay`,
+    `vcr`, ...) stays a node only on a linear card (`E1 o 0 pole 0 2`), as
+    in ngspice. `value` and `table` are forms wherever they stand: a node
+    named `table` there fails the deck. Pick another node name.
 
 ## Exercises
 

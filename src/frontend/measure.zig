@@ -19,6 +19,7 @@
 //! - `pub const Levels = measure_check.Levels`
 //! - `pub const parseCheck = measure_check.parseCheck`
 //! - `pub fn parse(arena: Allocator, text: []const u8, ctx: anytype, default: ?Kind, hspice: bool) !core.Measure`
+//! - `pub fn knowsAnalysis(word: []const u8) bool`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -174,6 +175,11 @@ pub fn parse(arena: Allocator, text: []const u8, ctx: anytype, default: ?Kind, h
     }
     assert(m.name.len > 0);
     return m;
+}
+
+/// Whether `word`, lowercased, is an analysis type `parse` reads.
+pub fn knowsAnalysis(word: []const u8) bool {
+    return analyses.has(word) or cont_analyses.has(word);
 }
 
 // ---- private ----

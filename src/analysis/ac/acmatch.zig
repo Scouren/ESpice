@@ -8,11 +8,16 @@
 //! real and imaginary spreads sum each group's linear change in quadrature.
 //! In: a run context and the variation table. Out: complex point-major rows
 //! (frequency, four spreads, then each group's dy/dsigma).
+//! The forward and adjoint sweep and the per-parameter shifts are also
+//! `.sens ... ac`'s (`sens_ac.zig`).
 //! Cites the HSPICE `.acmatch` manual; dev/analysis/dcmatch.md.
 //!
 //! Contents:
 //! - `pub const Options = core.query.Acmatch`
+//! - `pub const Solutions = struct` (`x`, `adjoint`)
 //! - `pub fn run(ctx: *const RunCtx, opts: Options) !Result`
+//! - `pub fn solveSweep(ctx: *const RunCtx, output_node: u32, output_neg: u32, omegas: []const f64) !Solutions`
+//! - `pub fn groupShifts(ctx: *const RunCtx, refs: []const ParamRef, groups: dcmatch.Groups, omegas: []const f64, sol: Solutions, dy: []Complex) !void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -29,24 +34,27 @@ const freq = @import("freq.zig");
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Acmatch;
 
-/// The spread columns ahead of the per-group sensitivities: 1-sigma of the
-/// magnitude, of the phase in degrees, and of the real and imaginary parts.
-const spread_names = [_][]const u8{ "acm_mag", "acm_phase", "acm_re", "acm_im" };
-
 /// Every point's AC solution x(w), then its adjoint z(w) = A^-H e_out (the
 /// stacked-real transpose solve, so lambda = conj(z)), each 2n per point.
-const Solutions = struct {
+pub const Solutions = struct {
     all: []f64,
     n_points: usize,
     nn: usize,
 
-    fn x(s: Solutions, k: usize) []const f64 {
+    /// Returns point `k`'s AC solution, stacked real (re then im).
+    pub fn x(s: Solutions, k: usize) []const f64 {
         return s.all[k * s.nn ..][0..s.nn];
     }
-    fn adjoint(s: Solutions, k: usize) []const f64 {
+
+    /// Returns point `k`'s adjoint z, stacked real; lambda = conj(z).
+    pub fn adjoint(s: Solutions, k: usize) []const f64 {
         return s.all[(s.n_points + k) * s.nn ..][0..s.nn];
     }
 };
+
+/// The spread columns ahead of the per-group sensitivities: 1-sigma of the
+/// magnitude, of the phase in degrees, and of the real and imaginary parts.
+const spread_names = [_][]const u8{ "acm_mag", "acm_phase", "acm_re", "acm_im" };
 
 /// Contract entry: complex point-major rows (frequency, the four spreads as
 /// real values, then each group's dy/dsigma, or dy/dp per parameter without
@@ -63,32 +71,20 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const freqs, const omegas = try freq.axis(scratch, opts.sweep);
     defer freq.freeAxis(scratch, freqs);
 
-    const sol = try solveSweep(ctx, opts, omegas);
+    const sol = try solveSweep(ctx, opts.output_node, opts.output_neg, omegas);
     defer scratch.free(sol.all);
-
-    // lambda(w)[row] x(w)[col] per slot and point, once: every parameter
-    // then reads its dy/dp off four contiguous dot products per point.
-    // ponytail: holds 16 points nnz bytes; chunk the points when a long
-    // sweep meets a large pattern.
-    const nnz: usize = ckt.nnz;
-    const prod = try scratch.alloc(f64, 2 * omegas.len * nnz);
-    defer scratch.free(prod);
-
-    const prod_re = prod[0 .. omegas.len * nnz];
-    const prod_im = prod[omegas.len * nnz ..];
-    for (0..omegas.len) |k| adjointProducts(ckt.col_ptr, ckt.row_idx, ckt.n, sol.x(k), sol.adjoint(k), prod_re[k * nnz ..][0..nnz], prod_im[k * nnz ..][0..nnz]);
 
     const dy = try scratch.alloc(Complex, groups.count() * omegas.len);
     defer scratch.free(dy);
 
-    try groupShifts(ctx, sel.refs, groups, omegas, prod_re, prod_im, dy);
+    try groupShifts(ctx, sel.refs, groups, omegas, sol, dy);
     return publish(ctx, opts, groups, sel.refs, freqs, sol, dy);
 }
 
-// ---- private ----
-
-/// Solves the forward and adjoint sweeps on one `FreqSolver`.
-fn solveSweep(ctx: *const root.RunCtx, opts: Options, omegas: []const f64) !Solutions {
+/// Solves the forward sweep of the deck's AC drive and the adjoint sweep of
+/// the output v(output_node) - v(output_neg) on one `FreqSolver`. The
+/// caller frees `Solutions.all` on the scratch allocator.
+pub fn solveSweep(ctx: *const root.RunCtx, output_node: u32, output_neg: u32, omegas: []const f64) !Solutions {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const nn = 2 * @as(usize, ckt.n);
@@ -99,7 +95,7 @@ fn solveSweep(ctx: *const root.RunCtx, opts: Options, omegas: []const f64) !Solu
     const drive = all[2 * n_points * nn ..][0..nn];
     const e_out = all[2 * n_points * nn + nn ..][0..nn];
     if (ctx.ac_drive.len == nn) @memcpy(drive, ctx.ac_drive) else @memset(drive, 0);
-    root.outputDrive(e_out, opts.output_node, opts.output_neg);
+    root.outputDrive(e_out, output_node, output_neg);
     var fs = try FreqSolver.fromCircuit(scratch, ckt, ctx.x_op);
     defer fs.deinit();
 
@@ -113,19 +109,32 @@ fn solveSweep(ctx: *const root.RunCtx, opts: Options, omegas: []const f64) !Solu
     return .{ .all = all, .n_points = n_points, .nn = nn };
 }
 
-/// dy per group and point: each member parameter's operating-point shift
-/// and plane derivatives, folded against the adjoint products. Leaves the
-/// planes at the nominal point, as the sweep found them.
+/// dy per group and point from `solveSweep`'s solutions: each member
+/// parameter's operating-point shift and plane derivatives, folded against
+/// lambda(w)[row] x(w)[col]. Leaves the planes at the nominal point, as the
+/// sweep found them.
 // ponytail: dG/dp and dC/dp come from the plain eval, so an `ac=` value
 // (Circuit.linearizeAc) and the frequency-dependent `acDyn` terms carry no
 // parameter derivative; add them when a varied device has either.
-fn groupShifts(ctx: *const root.RunCtx, refs: []const root.ParamRef, groups: dcmatch.Groups, omegas: []const f64, prod_re: []const f64, prod_im: []const f64, dy: []Complex) !void {
+pub fn groupShifts(ctx: *const root.RunCtx, refs: []const root.ParamRef, groups: dcmatch.Groups, omegas: []const f64, sol: Solutions, dy: []Complex) !void {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const n: usize = ckt.n;
     const nnz: usize = ckt.nnz;
     const n_points = omegas.len;
     assert(dy.len == groups.count() * n_points);
+    assert(sol.n_points == n_points);
+    // lambda(w)[row] x(w)[col] per slot and point, once: every parameter
+    // then reads its dy/dp off four contiguous dot products per point.
+    // ponytail: holds 16 points nnz bytes; chunk the points when a long
+    // sweep meets a large pattern.
+    const prod = try scratch.alloc(f64, 2 * n_points * nnz);
+    defer scratch.free(prod);
+
+    const prod_re = prod[0 .. n_points * nnz];
+    const prod_im = prod[n_points * nnz ..];
+    for (0..n_points) |k| adjointProducts(ckt.col_ptr, ckt.row_idx, n, sol.x(k), sol.adjoint(k), prod_re[k * nnz ..][0..nnz], prod_im[k * nnz ..][0..nnz]);
+
     const planes = try scratch.alloc(f64, 4 * nnz + 3 * n);
     defer scratch.free(planes);
 
@@ -177,6 +186,8 @@ fn groupShifts(ctx: *const root.RunCtx, refs: []const root.ParamRef, groups: dcm
     }
     ckt.eval(ctx.x_op, 0);
 }
+
+// ---- private ----
 
 /// The result rows: the spreads summed in quadrature per point, then each
 /// group's column.

@@ -14,10 +14,9 @@ export ESPICE_CACHE="$work/cache" exe n work
 one() {
   deck=$1
   key=$(printf %s "$deck" | tr / _)
-  tok=$(sed -n 's/.*"tokenizer": *"\([^"]*\)".*/\1/p' "${deck%.sp}.expected.json")
   for t in 1 "$n"; do
     (cd "$(dirname "$deck")" && ESPICE_THREADS=$t ESPICE_SOLVER_THREADS=$t timeout 900 \
-      "$exe" --backend cpu --format=binary -b -r "$work/$key.$t.raw" --tokenizer "${tok:-ngspice}" \
+      "$exe" --backend cpu --format=binary -b -r "$work/$key.$t.raw" --tokenizer ngspice \
       "$(basename "$deck")" >/dev/null 2>&1)
     echo $? >"$work/$key.$t.rc"
   done
@@ -30,9 +29,13 @@ one() {
 }
 export -f one
 
-find "$fixtures" -name '*.sp' | while read -r d; do [ -e "${d%.sp}.expected.json" ] && echo "$d"; done |
-  sort | xargs -P "$(nproc)" -I{} bash -c 'one "$1"' _ {} | sort | tee "$work/diffs"
-total=$(find "$fixtures" -name '*.expected.json' | wc -l)
+# A deck in another dialect reaches ESPice only as SpiceRack's translation,
+# so its determinism is SpiceRack's; its `_ngspice` twin runs here instead.
+find "$fixtures" -name '*.sp' | while read -r d; do
+  j=${d%.sp}.expected.json
+  [ -e "$j" ] && ! grep -Eq '"tokenizer": *"(hspice|spectre)"' "$j" && echo "$d"
+done | sort | tee "$work/decks" | xargs -P "$(nproc)" -I{} bash -c 'one "$1"' _ {} | sort | tee "$work/diffs"
+total=$(wc -l <"$work/decks")
 bad=$(wc -l <"$work/diffs")
 echo "determinism: $bad of $total decks differ between 1 and $n threads"
 [ "$bad" -eq 0 ]
