@@ -515,7 +515,8 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     const models_mod = c.make(b.addWriteFiles().add("models.zig", agg.items), &.{});
     for (models, dev_mods) |m, dm| models_mod.addImport(m.name, dm);
 
-    const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options });
+    // gompute: `kernels/lane_step.zig`'s exp and log, the same on the host and in the kernels.
+    const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options, gomp });
     // `.meas` evaluation: output prints it, a transient watches its cards resolve.
     const measure: Import = .{ .name = "measure", .module = c.make(b.path("src/output/measure/root.zig"), &.{core}) };
     const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/Netlist.zig"), &.{core}) };
@@ -634,7 +635,13 @@ fn treeFiles(b: *Build, dirs: []const []const u8) []const Build.LazyPath {
     var paths: std.ArrayList([]const u8) = .empty;
     for (dirs) |sub| {
         b.dependOnDirectoryContents(b.path(sub));
-        var dir = b.root.openDir(io, sub, .{ .iterate = true }) catch |err| std.debug.panic("{s}: {t}", .{ sub, err });
+        // A flake's source has no submodules (tests/conformance), and an
+        // install reads none of these: declare nothing. A test run still
+        // fails without them; the corpus runner refuses an empty catalog.
+        var dir = b.root.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("{s}: {t}", .{ sub, err }),
+        };
         defer dir.close(io);
         var walker = dir.walk(b.allocator) catch @panic("OOM");
         defer walker.deinit();

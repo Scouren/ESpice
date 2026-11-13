@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const lk = @import("lane.zig");
+const gmath = @import("gompute").math;
 
 /// The LTE inputs of one step, per lane (uploaded with `LaneScalars`).
 pub const LteIn = extern struct { dt: f64, dt1: f64, dt2: f64, reltol: f64, abstol: f64, chgtol: f64, trtol: f64, ag0: f64, ag1: f64, ag2: f64 };
@@ -302,7 +303,9 @@ pub fn stepBoundGear(method: u8, cur_method: u8, q: anytype, ip: anytype, len: u
         vmin = @min(vmin, del);
     }
     if (std.math.isNan(poison)) return std.math.nan(f64);
-    return if (p == 2) @sqrt(vmin) else @exp(@log(vmin) / @as(f64, @floatFromInt(p)));
+    // gompute's exp and log: a kernel has no libm to call, and the host
+    // takes the same bodies so both bound the step alike.
+    return if (p == 2) @sqrt(vmin) else gmath.exp(gmath.log(vmin) / @as(f64, @floatFromInt(p)));
 }
 
 /// x = -A^-1 b by LU with partial pivoting, for a lane whose replayed
