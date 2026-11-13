@@ -1469,6 +1469,10 @@ test "same deck, same bytes: run twice, any solver_threads, any device_threads" 
         "tests/conformance/tests/netlist/tran/device_mos6_inverter.sp",
         "tests/conformance/tests/netlist/stress/scaling_inverter_chain_256.sp",
         "tests/conformance/tests/netlist/stress/vacask_ring.sp",
+        // MOS6 with gate, source and bulk on one node: the bypass replays
+        // its source row by the wrong Jacobian row unless serial recording
+        // skips the unwritten gate row (`RecordSink`).
+        "tests/conformance/tests/netlist/tran/device_mos6_inverter.sp",
     };
     // A ReleaseFast run of vacask_ring takes 3.5 s and inverter_chain_256
     // 0.74 s (2026-11-11), eight runs each: past the 5-minute test timeout
