@@ -634,7 +634,6 @@ fn treeFiles(b: *Build, dirs: []const []const u8) []const Build.LazyPath {
     const io = b.graph.io;
     var paths: std.ArrayList([]const u8) = .empty;
     for (dirs) |sub| {
-        b.dependOnDirectoryContents(b.path(sub));
         // A flake's source has no submodules (tests/conformance), and an
         // install reads none of these: declare nothing. A test run still
         // fails without them; the corpus runner refuses an empty catalog.
@@ -642,6 +641,7 @@ fn treeFiles(b: *Build, dirs: []const []const u8) []const Build.LazyPath {
             error.FileNotFound => continue,
             else => std.debug.panic("{s}: {t}", .{ sub, err }),
         };
+        b.dependOnDirectoryContents(b.path(sub));
         defer dir.close(io);
         var walker = dir.walk(b.allocator) catch @panic("OOM");
         defer walker.deinit();

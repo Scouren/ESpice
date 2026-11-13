@@ -35,6 +35,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
+const gmath = @import("gompute").math;
 const Method = @import("types.zig").Method;
 
 /// Integration coefficients, ngspice `CKTag[]` (nicomcof.c). `ag0` multiplies
@@ -588,7 +589,9 @@ fn stepBoundGearMin(comptime lanes: bool, method: Method, cur_method: Method, q:
     return switch (p) {
         1 => min_del,
         2 => @sqrt(min_del),
-        else => @exp(@log(min_del) / @as(f64, @floatFromInt(p))),
+        // gompute's exp and log, as the lane kernels take (kernels/lane_step.zig):
+        // the two bounds agree bitwise (tran/gpu_gear_test.zig).
+        else => gmath.exp(gmath.log(min_del) / @as(f64, @floatFromInt(p))),
     };
 }
 
