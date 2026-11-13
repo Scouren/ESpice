@@ -92,6 +92,7 @@ Each line is a yes or a number a script reads; none is typed from memory.
 - **GPU in CI**: no GPU runner; the GPU corpus runs locally, and HIP is checked by compilation only.
 - **Merge gate budget**: a cold 4-core runner takes over an hour, past the 15-minute target.
 - **The browser build**: wasm32 does not compile on this branch (the performance round's `u64`/`usize` sites in `src/solver/subtree.zig`, `src/analysis/executor.zig`, `src/analysis/gpu/devices.zig`), so the playground and its differential do not run; `pages.yml` deploys without them.
+- **The SpiceRack route**: `spice2rack` is pinned at SpiceRack `espice-kit` (231d9c9c, unmerged there); 37 corpus decks that need it are `KNOWN GAP` XFAILs (Scouren/SpiceRack#24). The release smokes one translated HSPICE deck per archive; the HIP bundle (`tools/hip_bundle.sh`) and the Homebrew formula carry no `spice2rack` yet.
 - **Tolerance ratchet**: the LOOSE list is reported, not gated; it becomes a name list like `VERDICTS.tsv` once triaged.
 - **Coverage**: no line or branch tool for Zig; kcov over the test binary is the cheap first step.
 - **Mutation testing**: no tool; the substitute is a script flipping one comparison at a time.

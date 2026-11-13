@@ -64,8 +64,9 @@ pub fn run(arena: Allocator, deck: *const Ast, live_params: []const []const u8) 
     // Logged once, at the end, success or not; the fallback below runs
     // first (errdefers unwind in reverse), so it is the last row.
     defer reader_diag.render(r);
+    try reader_diag.reserve(r);
     errdefer if (r.diag.refusals == 0 and r.diag.card.len > 0)
-        reader_diag.note(r, .{ .code = .unreadable, .subject = r.ast.written(r.diag.card) }) catch {};
+        reader_diag.noteUnreadable(r, r.ast.written(r.diag.card));
     r.decl.global_scopes = .{&r.decl.globals};
     const ast = &r.ast;
     const tags = ast.cards.items(.tag);

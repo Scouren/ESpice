@@ -52,6 +52,27 @@ fn outcome(gpa: std.mem.Allocator, src: []const u8) Outcome {
     return .{ .digest = digest(&nl) };
 }
 
+/// `outcome` with the reader's `k`-th allocation failing. The failing
+/// allocator sits above the arena, so `k` counts the reader's own
+/// requests and names the same one on every run; under the arena it
+/// counted the arena's, which follow the backing allocator's state.
+fn outcomeFailing(gpa: std.mem.Allocator, src: []const u8, k: usize) struct { Outcome, bool } {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = k, .resize_fail_index = k });
+    const got: Outcome = if (netlist.parse(failing.allocator(), src)) |nl| .{ .digest = digest(&nl) } else |err| .{ .err = err };
+    return .{ got, failing.has_induced_failure };
+}
+
+/// The reader's allocation requests for a clean parse of `src`.
+fn allocations(gpa: std.mem.Allocator, src: []const u8) usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var counting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    _ = netlist.parse(counting.allocator(), src) catch {};
+    return counting.allocations;
+}
+
 /// Hashes the devices (name, letter, pins by net name, values, model),
 /// the models and the analyses. Leaves out what keeps the deck's own case
 /// (the title, paths, cards as written), so an uppercased deck matches.
@@ -180,14 +201,12 @@ fn expectSame(what: []const u8, want: Outcome, got: Outcome, before: []const u8,
 /// count a clean parse makes: the parse must fail with `OutOfMemory`, or
 /// with the clean parse's own error when it stops before reaching `k`.
 fn failOnce(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8, base: Outcome) !void {
-    var counting = std.testing.FailingAllocator.init(gpa, .{});
-    _ = outcome(counting.allocator(), deck_text);
-    if (counting.allocations == 0) return;
-    const k = src.index(counting.allocations);
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = k, .resize_fail_index = k });
-    const got = outcome(failing.allocator(), deck_text);
+    const n = allocations(gpa, deck_text);
+    if (n == 0) return;
+    const k = src.index(n);
+    const got, const induced = outcomeFailing(gpa, deck_text, k);
     if (got == .err and got.err == error.OutOfMemory) return;
-    if (!failing.has_induced_failure and base.eql(got)) return;
+    if (!induced and base.eql(got)) return;
     std.debug.print("allocation {d} failing gave {any}, clean parse {any}:\n{s}\n", .{ k, got, base, deck_text });
     return error.TestUnexpectedResult;
 }
@@ -340,6 +359,23 @@ test "netlist.parse holds every oracle on 1000 seeded generated decks" {
     }
     // The generator is only worth its oracles while most decks parse.
     try std.testing.expect(parsed > 300);
+}
+
+test "a read that stops with no refusal fails with OutOfMemory at every allocation, the unreadable note's included" {
+    // Oracle: the contract, every induced failure is `OutOfMemory`. The
+    // `.if` over a probe stops the read with no refusal naming the card,
+    // so its errdefer records the "cannot read the card" note last. Red
+    // before the reserved row: that note's allocation failed under
+    // `catch {}` and the parse returned the clean `ParseError`.
+    const text = "t\n.if (v(a))\nr1 a 0 1\n.endif\n.end\n";
+    try std.testing.expectEqual(Outcome{ .err = error.ParseError }, outcome(std.testing.allocator, text));
+    const n = allocations(std.testing.allocator, text);
+    try std.testing.expect(n > 0);
+    for (0..n) |k| {
+        const got, const induced = outcomeFailing(std.testing.allocator, text, k);
+        try std.testing.expect(induced);
+        try std.testing.expectEqual(Outcome{ .err = error.OutOfMemory }, got);
+    }
 }
 
 test "the seed decks hold every oracle" {
@@ -680,3 +716,4 @@ fn put(w: *std.Io.Writer, bytes: []const u8) void {
 fn print(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
     w.print(fmt, args) catch {};
 }
+

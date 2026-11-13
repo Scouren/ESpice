@@ -39,7 +39,7 @@ Usage: espice [OPTION]... FILE...
       --tangent-step=S        Relative step of --tangents (default 1e-6)
       --tokenizer=FMT         ngspice|hspice|spectre|ltspice|xyce|vacask (default: detected from the deck,
                               else ngspice); any but ngspice is translated by SpiceRack's spice2rack first
-      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else spice2rack on PATH)
+      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else the one beside espice, else spice2rack on PATH)
       --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
   -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
                               directory; repeatable, in order
@@ -109,7 +109,9 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
 
 `--spicerack=PATH`
 : The `spice2rack` binary that translates a deck in another dialect;
-  default `$ESPICE_SPICERACK`, else `spice2rack` on `PATH`. It runs as
+  default `$ESPICE_SPICERACK`, else the `spice2rack` a release ships in
+  `bin/` beside `espice` (the executable's real directory, so a symlink to
+  it finds it too), else `spice2rack` on `PATH`. It runs as
   `spice2rack --dialect D --to espice --kit -o DIR DECK` into a fresh
   directory under `$TMPDIR`, deleted when the deck ends. A missing binary
   is `SpiceRackNotFound`, a refused deck `SpiceRackRefused`, a crash or

@@ -214,6 +214,8 @@ fn readNames(root: []const u8, k: *Keys) void {
 }
 
 test "machine_keys: live keys from a fake tree, refusal names the row" {
+    // Linux-only: card discovery reads procfs and is compiled out elsewhere.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     // Oracle: a hand-made sysfs/procfs tree with this machine's files (the
     // same RTX 4060 Laptop and i9-14900HX as machine.zig's identity test),
     // and expectations written by hand per row.

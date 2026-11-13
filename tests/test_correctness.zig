@@ -366,8 +366,9 @@ const spicerack_checks = [_][]const u8{
     "spicerack/translated", "spicerack/missing",   "spicerack/refused",    "spicerack/refused_exit3", "spicerack/crashed",
     "spicerack/include",    "spicerack/fifo",      "spicerack/touchstone", "spicerack/data",          "spicerack/vec",
     "spicerack/load",       "spicerack/soalimits", "spicerack/vpi",        "spicerack/lin",           "spicerack/hdl",
+    "spicerack/sibling",
 };
-const SpicerackCheck = enum { translated, missing, refused, refused_exit3, crashed, include, fifo, touchstone, data, vec, load, soalimits, vpi, lin, hdl };
+const SpicerackCheck = enum { translated, missing, refused, refused_exit3, crashed, include, fifo, touchstone, data, vec, load, soalimits, vpi, lin, hdl, sibling };
 
 /// Every check of the CLI's own handling that runs after the decks, as the
 /// spicerack ones do: those, then `vpi/bare_name` (`runVpiBareName`) and
@@ -490,7 +491,7 @@ fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, ti
     const exe = try Io.Dir.cwd().realPathFileAlloc(io, app, a);
     const kind = std.meta.stringToEnum(SpicerackCheck, name["spicerack/".len..]).?;
     const fake = try std.fmt.allocPrint(a, "{s}/{s}", .{ fixtures, switch (kind) {
-        .translated, .fifo => "fake_spice2rack.sh",
+        .translated, .fifo, .sibling => "fake_spice2rack.sh",
         .missing => "no_such_spice2rack",
         .refused => "refusing_spice2rack.sh",
         .refused_exit3 => "exit3_spice2rack.sh",
@@ -511,13 +512,14 @@ fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, ti
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "* never read: files_spice2rack.sh writes the kit this name picks\n.end\n" });
             break :stub path;
         },
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include => "deck.hsp",
+        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .sibling => "deck.hsp",
     };
+    if (kind == .sibling) return runSibling(a, io, exe, fake, out, dir, deck);
     const raw = try std.fmt.allocPrint(a, "{s}/translated.raw", .{out});
     const result = try runEspice(a, io, &.{ exe, "--backend", backend_name, "--format=binary", "-b", "-r", raw, "--tokenizer", "hspice", "--spicerack", fake, deck }, dir, timeout_seconds);
     switch (kind) {
         .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl => return checkKitFile(a, io, kind, deck, raw, result),
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo => {},
+        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo, .sibling => {},
     }
     if (kind == .include) {
         try requireSuccess(result);
@@ -541,7 +543,7 @@ fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, ti
             .refused, .refused_exit3 => "Error: deck.hsp: SpiceRackRefused",
             .crashed => "Error: deck.hsp: SpiceRackFailed",
             .fifo => try std.fmt.allocPrint(a, "Error: {s}: SpiceRackNeedsFile", .{deck}),
-            .translated, .include, .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl => unreachable, // returned above
+            .translated, .include, .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl, .sibling => unreachable, // returned above
         });
         if (kind == .refused) _ = try stderrLine(result.stderr, "error: spicerack: deck.hsp: deck:2:1: W0001 a statement kept as another dialect's text");
         if (kind == .refused_exit3) _ = try stderrLine(result.stderr, "error: spicerack: deck.hsp: deck:2:1: W0336 a construct no ngspice form expresses");
@@ -590,6 +592,35 @@ fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, ti
 /// in the kit's data; the S element's fit is exact on a rational network.
 /// `lin` reads no file (1 file): oracle, the `.save`/`.stim` rule that a
 /// side file lands beside the -r output, so lin.s2p is there after the run.
+/// `sibling`: oracle, the fake's own stderr note. espice and the fake, as
+/// `spice2rack`, share a `bin/`, and the run passes no `--spicerack` and
+/// no `ESPICE_SPICERACK`: it must take the sibling over PATH's, as a
+/// release archive ships it. Red before the sibling lookup: PATH's
+/// spice2rack ran, or none was found.
+fn runSibling(a: Allocator, io: Io, exe: []const u8, fake: []const u8, out: []const u8, cwd: []const u8, deck: []const u8) !void {
+    const bin = try std.fmt.allocPrint(a, "{s}/bin", .{out});
+    try Io.Dir.cwd().createDirPath(io, bin);
+    const copy = try std.fmt.allocPrint(a, "{s}/espice", .{bin});
+    // The fake copies the twin.sp beside it into the kit.
+    const twin = try std.fmt.allocPrint(a, "{s}/twin.sp", .{std.fs.path.dirname(fake).?});
+    for ([_][2][]const u8{ .{ exe, copy }, .{ fake, try std.fmt.allocPrint(a, "{s}/spice2rack", .{bin}) }, .{ twin, try std.fmt.allocPrint(a, "{s}/twin.sp", .{bin}) } }) |pair| {
+        const cp = try std.process.run(a, io, .{ .argv = &.{ "cp", pair[0], pair[1] } });
+        if (!cp.term.success()) return error.CopyFailed;
+    }
+    var env = try child_env.?.clone(a);
+    _ = env.swapRemove("ESPICE_SPICERACK");
+    const raw = try std.fmt.allocPrint(a, "{s}/sibling.raw", .{out});
+    const result = try std.process.run(a, io, .{
+        .argv = &.{ copy, "--backend", backend_name, "--format=binary", "-b", "-r", raw, "--tokenizer", "hspice", deck },
+        .cwd = .{ .path = cwd },
+        .environ_map = &env,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    try requireSuccess(result);
+    _ = try stderrLine(result.stderr, "note: fake spice2rack translated deck.hsp");
+}
+
 fn checkKitFile(a: Allocator, io: Io, kind: SpicerackCheck, deck: []const u8, raw: []const u8, result: std.process.RunResult) !void {
     const files: u8 = if (kind == .lin) 1 else 2;
     _ = try stderrLine(result.stderr, try std.fmt.allocPrint(a, "espice: spicerack translated {s} (hspice -> ngspice, {d} files) in ", .{ deck, files }));
@@ -631,7 +662,7 @@ fn checkKitFile(a: Allocator, io: Io, kind: SpicerackCheck, deck: []const u8, ra
             if (Io.Dir.cwd().access(io, raw, .{})) |_| return error.RanPastRefusal else |_| {}
             return;
         },
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo => unreachable, // runSpicerackCheck's own
+        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo, .sibling => unreachable, // runSpicerackCheck's own
     };
     try requireSuccess(result);
     const plots = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited));
@@ -684,7 +715,7 @@ test "droppedInput: a drop warning the oracle does not list is the verdict" {
     try std.testing.expectEqualStrings(bdf, (try droppedInput(bdf ++ "\n", &.{})).?);
 }
 
-/// Whether the deck at `path` (under tests/) is marked `* KNOWN GAP:`.
+/// Whether the deck at `path` (under tests/) is marked `* KNOWN GAP:` (`//` in Spectre).
 fn knownGap(a: Allocator, io: Io, path: []const u8) bool {
     const full = std.fmt.allocPrint(a, "tests/{s}", .{path}) catch return false;
     return marked(a, io, full, "KNOWN GAP:");
@@ -697,8 +728,9 @@ fn marked(a: Allocator, io: Io, netlist: []const u8, marker: []const u8) bool {
     const source = Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited) catch return false;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |text| {
-        if (text.len == 0 or text[0] != '*') continue;
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, text[1..], " \t"), marker)) return true;
+        // `*` in SPICE dialects, `//` in Spectre.
+        const body = if (std.mem.startsWith(u8, text, "*")) text[1..] else if (std.mem.startsWith(u8, text, "//")) text[2..] else continue;
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, body, " \t"), marker)) return true;
     }
     return false;
 }
@@ -780,6 +812,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
         }
         try measure(measures.?, result.stdout, check);
     };
+    for (oracle.expect.checks) |check| if (try checkKind(check) == .display) try display(result.stdout, check);
     for (oracle.expect.checks) |check| if (try checkKind(check) == .stderr_line) {
         _ = try stderrLine(result.stderr, try string(try field(check, "prefix")));
     };
@@ -1289,7 +1322,9 @@ fn sample(p: Plot, axis: usize, col: usize, t: f64, rtol: f64, atol: f64) !Compl
 }
 
 /// `stderr_line`: some stderr line starts with `prefix`, such as a note.
-const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure, stderr_line };
+/// `display`: an `.hdl` display task's stdout line `name = value`
+/// (`$strobe`, `$display`), which `--measures` does not hold.
+const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure, stderr_line, display };
 fn checkKind(check: Json) !Check {
     const kinds = std.StaticStringMap(Check).initComptime(.{
         .{ "selected_values", .selected_values },             .{ "fourier_thd", .fourier_thd },
@@ -1297,6 +1332,7 @@ fn checkKind(check: Json) !Check {
         .{ "pole_zero_sets", .pole_zero_sets },               .{ "axis_bounds", .axis_bounds },
         .{ "time_weighted_moments", .time_weighted_moments }, .{ "oscillation", .oscillation },
         .{ "measure", .measure },                             .{ "stderr_line", .stderr_line },
+        .{ "display", .display },
     });
     return kinds.get(try string(try field(check, "kind"))) orelse error.UnknownCheck;
 }
@@ -1327,6 +1363,24 @@ fn measure(doc: Measures, stdout: []const u8, check: Json) !void {
     diagnostic("  measure {s}: expected {e}, got {e}\n", .{ name, expected, got });
     return error.MeasureMismatch;
 }
+/// `display`: the stdout line `name = value` a display task printed, as
+/// printed (`%g`, six digits): |value - expected| <= atol + rtol * |expected|.
+fn display(stdout: []const u8, check: Json) !void {
+    const name = try string(try field(check, "name"));
+    const expected = try nfield(check, "value");
+    const rtol = try nfield(check, "rtol");
+    const atol = try nfield(check, "atol");
+    try tolerance(rtol, atol);
+    const text = printed(stdout, name) orelse {
+        diagnostic("  display line {s} not printed\n", .{name});
+        return error.MissingDisplay;
+    };
+    const got = std.fmt.parseFloat(f64, text) catch return error.MeasurePrint;
+    if (close(.init(got, 0), .init(expected * perturb, 0), rtol, atol)) return;
+    diagnostic("  display {s}: expected {e}, got {e}\n", .{ name, expected, got });
+    return error.MeasureMismatch;
+}
+
 /// The entry whose exact value the stdout line `name = ...` prints, in the
 /// line order: an optimized parameter (the summaries print first), a
 /// `.meas` result, or a Monte Carlo statistic's `mean(card)`,
@@ -1389,7 +1443,7 @@ fn measured(name: []const u8, got: f64, expected: f64, rtol: f64) !void {
 
 fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     const kind = try checkKind(check);
-    if (kind == .measure or kind == .stderr_line) return; // runCase reads them off stdout and stderr.
+    if (kind == .measure or kind == .stderr_line or kind == .display) return; // runCase reads them off stdout and stderr.
     if (kind == .repeatability) {
         if ((try field(check, "same_netlist")) != .bool or !(try field(check, "same_netlist")).bool or
             !equal(try string(try field(check, "comparison")), "bitwise_numeric_results")) return error.InvalidOracle;
@@ -1397,7 +1451,7 @@ fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     }
     const p = try findPlot(plots, if (kind == .fourier_thd) "Fourier Analysis" else try string(try field(check, "plot")));
     switch (kind) {
-        .repeatability, .measure, .stderr_line => unreachable,
+        .repeatability, .measure, .stderr_line, .display => unreachable,
         .axis_bounds => {
             const col = try p.column(try string(try field(check, "axis")));
             const minimum = try nfield(check, "minimum");

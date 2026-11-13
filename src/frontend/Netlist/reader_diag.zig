@@ -10,6 +10,8 @@
 //! - `pub fn failed(r: *Reader, line: []const u8, err: Error) Error`
 //! - `pub fn unsupported(r: *Reader, line: []const u8, what: []const u8) Error`
 //! - `pub fn note(r: *Reader, row: Row) Allocator.Error!void`
+//! - `pub fn reserve(r: *Reader) Allocator.Error!void`
+//! - `pub fn noteUnreadable(r: *Reader, card: []const u8) void`
 //! - `pub fn render(r: *const Reader) void`
 
 const std = @import("std");
@@ -66,7 +68,21 @@ pub fn unsupported(r: *Reader, line: []const u8, what: []const u8) Error {
 /// logs its own line). Its `subject` is already as the deck spells it.
 pub fn note(r: *Reader, row: Row) Allocator.Error!void {
     std.debug.assert(row.code != .malformed and row.code != .refused);
-    try r.diag.rows.append(r.arena, row);
+    try push(r, row);
+}
+
+/// Reserves the row `noteUnreadable` takes; every append keeps it free.
+/// Call once, before an errdefer that may call `noteUnreadable`.
+pub fn reserve(r: *Reader) Allocator.Error!void {
+    try r.diag.rows.ensureUnusedCapacity(r.arena, 1);
+}
+
+/// Records that the read stopped on `card` (as the deck spells it) with no
+/// refusal naming it. Allocates nothing, so an errdefer cannot lose the
+/// row to `OutOfMemory`: it takes the slot `reserve` and `push` keep free.
+pub fn noteUnreadable(r: *Reader, card: []const u8) void {
+    std.debug.assert(r.diag.rows.unusedCapacitySlice().len >= 1);
+    r.diag.rows.appendAssumeCapacity(.{ .code = .unreadable, .subject = card });
 }
 
 /// Logs every row, in order. The test runner fails any test that logs an
@@ -98,8 +114,15 @@ pub fn render(r: *const Reader) void {
 
 /// Appends refusal `row`, counting it only once it is stored.
 fn refusal(r: *Reader, row: Row) Allocator.Error!void {
-    try r.diag.rows.append(r.arena, row);
+    try push(r, row);
     r.diag.refusals += 1;
+}
+
+/// Appends `row`, leaving one row free for `noteUnreadable`. A failed
+/// append leaves the rows and the free row as they were.
+fn push(r: *Reader, row: Row) Allocator.Error!void {
+    try r.diag.rows.ensureUnusedCapacity(r.arena, 2);
+    r.diag.rows.appendAssumeCapacity(row);
 }
 
 test "rows: refusals count apart from notes, in the order met, spelled as written" {

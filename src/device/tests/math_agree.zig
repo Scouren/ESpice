@@ -140,8 +140,16 @@ fn sweep(ctx: anytype, comptime visit: anytype) void {
 /// commit). Each differs in the last bit on some inputs because the two sides
 /// run different bodies on the host; `contract.gm` takes std or the builtin
 /// there and Gompute its own port.
+/// macOS only: one side reaches the platform libm there, Apple's, which
+/// rounds 4-7% of these inputs one ulp from the other side's body (macos-15
+/// CI, run 43444945696: sin 59897, cos 63678, tan 108806 of 1.47M); on
+/// glibc both agree on every input.
+const known_differ_macos = .{ "sin", "cos", "tan" };
+
 fn knownDiffer(comptime name: []const u8) bool {
     inline for (known_differ) |k| if (comptime std.mem.eql(u8, k, name)) return true;
+    if (comptime @import("builtin").os.tag.isDarwin())
+        inline for (known_differ_macos) |k| if (comptime std.mem.eql(u8, k, name)) return true;
     return false;
 }
 

@@ -749,6 +749,8 @@ test "machine: format then parse is bit-exact, and parse refuses a short file" {
 }
 
 test "machine: identity reads a fake sysfs root, and staleness follows driver, cards and threads" {
+    // Linux-only: card discovery reads procfs and is compiled out elsewhere.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     // Oracle: a hand-made sysfs/procfs tree with this RTX 4060 Laptop's
     // files, its uuid bytes transcribed by hand from the hex.
     var tmp = std.testing.tmpDir(.{});
@@ -811,6 +813,8 @@ test "machine: identity reads a fake sysfs root, and staleness follows driver, c
 }
 
 test "machine: write then load, a stale identity loads nothing, an empty cache root has no file" {
+    // Linux-only: card discovery reads procfs and is compiled out elsewhere.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [128]u8 = undefined;
@@ -893,6 +897,8 @@ test "machine: lu, lane and identity-key rows round-trip; a refused file names i
 }
 
 test "machine: loadKeyed loads this machine's file and refuses another build's" {
+    // Linux-only: card discovery reads procfs and is compiled out elsewhere.
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
     // Oracle: the live machine's own keys written and read back, then one
     // row changed by hand; HEAD's `load` beside it ignores the new rows.
     var tmp = std.testing.tmpDir(.{});

@@ -72,7 +72,7 @@ const help =
     \\      --lanes                 Solve sweep points' OPs and .dc sweeps as SIMD lanes (CPU)
     \\      --tokenizer=FMT         ngspice|hspice|spectre|ltspice|xyce|vacask (default: detected from the deck,
     \\                              else ngspice); any but ngspice is translated by SpiceRack's spice2rack first
-    \\      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else spice2rack on PATH)
+    \\      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else the one beside espice, else spice2rack on PATH)
     \\      --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
     \\  -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
     \\                              directory; repeatable, in order
@@ -328,10 +328,11 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
         };
         break :real real_buf[0..n];
     };
+    var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var kit: ?spicerack.Kit = if (dialect == .ngspice) null else spicerack.translate(init.gpa, init.io, .{
         // `--spicerack`'s default, read here and nowhere else: only the CLI
         // runs spice2rack (the library reads ngspice alone, c_api.zig).
-        .exe = cli.spicerack_exe orelse if (std.c.getenv("ESPICE_SPICERACK")) |v| std.mem.span(v) else "spice2rack",
+        .exe = spicerackExe(cli.spicerack_exe, init.io, &exe_buf),
         .dialect = dialect,
         .deck = path,
         .path = real,
@@ -530,6 +531,19 @@ fn autoJobs() u16 {
 /// value is taken from `args`.
 // `args` is anytype: argv's iterator and the tests' split iterator both
 // have `next() ?[]const u8`.
+/// The spice2rack the CLI runs: `--spicerack`, else `ESPICE_SPICERACK`,
+/// else the one a release archive ships beside this executable, else the
+/// first on PATH. `buf` holds the sibling's path.
+fn spicerackExe(flag: ?[]const u8, io: std.Io, buf: []u8) []const u8 {
+    if (flag) |exe| return exe;
+    if (std.c.getenv("ESPICE_SPICERACK")) |v| return std.mem.span(v);
+    const dir = std.process.executableDirPath(io, buf) catch return "spice2rack";
+    const sibling = std.fmt.bufPrint(buf[dir..], "{c}spice2rack", .{std.fs.path.sep}) catch return "spice2rack";
+    const path = buf[0 .. dir + sibling.len];
+    std.Io.Dir.cwd().access(io, path, .{}) catch return "spice2rack";
+    return path;
+}
+
 fn optionValue(arg: []const u8, short: []const u8, long: []const u8, args: anytype) ??[]const u8 {
     std.debug.assert(long.len > 2);
     if ((short.len != 0 and std.mem.eql(u8, arg, short)) or std.mem.eql(u8, arg, long)) {
