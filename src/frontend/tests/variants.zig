@@ -4,8 +4,8 @@
 //! their seed/trial/site independence and LHS stratum coverage.
 const std = @import("std");
 const t = std.testing;
-const input = @import("../prepare.zig");
-const variants = @import("../variants.zig");
+const input = @import("../Jobs.zig");
+const variants = @import("../Jobs/variants.zig");
 const netlist = @import("netlist");
 const device = @import("device");
 

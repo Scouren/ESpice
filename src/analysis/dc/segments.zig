@@ -1,16 +1,21 @@
 //! A single-axis `.dc` the session ran as segments (`Dc.segments`), each
 //! its own row from its own cold operating point, stitched back into the
-//! sweep's table. ngspice's dctrcurv.c continues every point from the last,
-//! so where a circuit has two solutions the path picks the branch: each
-//! segment past the first also solves the previous one's last point cold
-//! (its overlap), and the stitch takes the segments only where that point's
-//! two solutions are one by the Newton acceptance test, at twice its
-//! tolerance for two independent convergences. A seam that is not sends
-//! the sweep back to run whole (`Session.assemble`): a curve is never
-//! stitched across two branches.
+//! sweep's table. The contract: the values sit within twice the Newton
+//! tolerance of the serial sweep and are identical at every job and lane
+//! count, and a seam that disagrees reruns the whole sweep.
+//! ngspice's dctrcurv.c continues every point from the last, so where a
+//! circuit has two solutions the path picks the branch: each segment past
+//! the first also solves the previous one's last `Dc.overlap` points, the
+//! first cold, so its first own point starts from a two-point predictor as
+//! the serial sweep's does. The stitch takes the segments only where the
+//! previous segment's last point and this one's solve of it are one
+//! solution by the Newton acceptance test, at twice its tolerance for two
+//! independent convergences. A seam that is not sends the sweep back to run
+//! whole (`Session.assemble`): a curve is never stitched across two branches.
 //! In: the segments' tables and seam solutions. Out: the sweep's table, or
 //! the seam that disagrees.
-//! Cites ngspice dctrcurv.c (continuation; steps accumulated at :469) and
+//! Cites ngspice dctrcurv.c (continuation; the predictor at :375, from one
+//! point at a sweep's second, :457-462; steps accumulated at :469) and
 //! niconv.c (the acceptance test).
 //!
 //! Contents:
@@ -47,10 +52,11 @@ pub fn agree(a: []const f64, b: []const f64, current_row: []const bool, tol: Tol
 }
 
 /// Writes the sweep's table to `out`: segment s's rows (`parts[s]`,
-/// `ncols` values each, as `opts.segment(s)` solved them) in order, each
-/// overlap row dropped, once every seam agrees (`agree` on segment s-1's
-/// last solution and segment s's first: `seams[s]` holds a segment's
-/// first then last full solution, `2n` values). Returns null then, else
+/// `ncols` values each, as `opts.segment(s)` solved them) in order, the
+/// overlap rows dropped, once every seam agrees (`agree` on segment s-1's
+/// last solution and segment s's of the same point, its last overlap
+/// point: `seams[s]` holds a segment's solutions at its point
+/// `Dc.overlap - 1` then its last, `2n` values). Returns null then, else
 /// the first seam s that disagrees, with `out` unwritten. Asserts the
 /// shapes, and that each segment's first own row holds the sweep value the
 /// whole sweep's accumulated steps reach there.
@@ -67,7 +73,7 @@ pub fn stitch(out: []f64, parts: []const []const f64, seams: []const []const f64
     for (parts, 0..) |part, s| {
         const seg = opts.segment(@intCast(s));
         assert(part.len == seg.len * ncols);
-        const skip: usize = @intFromBool(s != 0);
+        const skip: usize = if (s == 0) 0 else Options.overlap;
         const own = seg.first + skip;
         // `+=` from `start`, as dctrcurv.c:469 and `Sweep.beginPoint` step.
         while (point < own) : (point += 1) v += opts.step;
@@ -97,10 +103,11 @@ pub fn note(names: CardNames, opts: Options, seam: u32, at: f64) void {
     std.debug.print("note: .dc {s} reruns whole: at seam {d} of {d} ({d:.6}) a cold start lands on another solution than the continued sweep\n", .{ sweep, seam, opts.segments() - 1, at });
 }
 
-test "a sweep splits by its points alone: every point owned once, each overlap the previous segment's last" {
+test "a sweep splits by its points alone: every point owned once, each overlap the previous segment's last two" {
     const t = std.testing;
     // Oracle: the rule written out: n / 16 segments, at most 64, one row
-    // below 2; segment s owns floor(s n / k) up to floor((s + 1) n / k).
+    // below 2; segment s owns floor(s n / k) up to floor((s + 1) n / k)
+    // and solves the two points before too.
     const Case = struct { opts: Options, k: u32 };
     const list: [40]f64 = @splat(0);
     const cases = [_]Case{
@@ -127,8 +134,8 @@ test "a sweep splits by its points alone: every point owned once, each overlap t
         var next: usize = 0;
         for (0..c.k) |s| {
             const seg = c.opts.segment(@intCast(s));
-            // Segment s > 0 starts at segment s-1's last point.
-            try t.expectEqual(if (s == 0) next else next - 1, seg.first);
+            // Segment s > 0 starts on segment s-1's last two points.
+            try t.expectEqual(if (s == 0) next else next - 2, seg.first);
             try t.expectEqual(s * n / c.k, next);
             try t.expect(seg.first + seg.len - next >= Options.split.points);
             next = seg.first + seg.len;
@@ -163,7 +170,8 @@ test "stitch joins the segments into the whole sweep without their overlap rows,
     const t = std.testing;
     // Oracle: the whole sweep's table, one row per point with the axis
     // stepped `+=` from start (the serial sweep's), and each segment's
-    // rows and seam solutions cut from it as `segment` lays them out.
+    // rows and seam solutions (its second point's, its last's) cut from it
+    // as `segment` lays them out.
     const opts: Options = .{ .start = -1, .stop = 1, .step = 0.05 };
     const k = opts.segments();
     try t.expectEqual(@as(u32, 2), k);
@@ -184,8 +192,9 @@ test "stitch joins the segments into the whole sweep without their overlap rows,
     for (0..k) |s| {
         const seg = opts.segment(@intCast(s));
         parts[s] = whole[seg.first * ncols ..][0 .. seg.len * ncols];
+        const lead = seg.first + 1;
         const last = seg.first + seg.len - 1;
-        seam_bufs[s] = .{ x[seg.first * 2], x[seg.first * 2 + 1], x[last * 2], x[last * 2 + 1] };
+        seam_bufs[s] = .{ x[lead * 2], x[lead * 2 + 1], x[last * 2], x[last * 2 + 1] };
         seams[s] = &seam_bufs[s];
     }
     const current_row = [_]bool{ false, true };

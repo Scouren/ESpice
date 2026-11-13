@@ -81,7 +81,7 @@ pub const SolverPin = enum {
 };
 
 /// Developer switches (`Workspace.knobs`). The facade reads them from the
-/// environment once (`espice.zig`); the solver reads no environment.
+/// environment once (`espice/config.zig`); the solver reads no environment.
 pub const Knobs = struct {
     /// `ESPICE_SOLVER`.
     pin: SolverPin = .auto,

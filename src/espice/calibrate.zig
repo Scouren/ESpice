@@ -13,7 +13,7 @@
 //! Contents:
 //! - `pub const Options = struct`
 //! - `pub const Error`
-//! - `pub fn run(gpa: Allocator, io: std.Io, opts: Options, log: *std.Io.Writer) !void`
+//! - `pub fn run(gpa: Allocator, io: std.Io, given: Options, log: *std.Io.Writer) !void`
 //! - `pub fn probe(which: Probe, out: *std.Io.Writer) !void`, `pub const Probe`
 
 const std = @import("std");
@@ -21,6 +21,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const analysis = @import("analysis");
 const frontend = @import("frontend");
+const config = @import("config.zig");
 
 const machine = analysis.machine;
 const cal = analysis.calibrate;
@@ -32,7 +33,8 @@ pub const Options = struct {
     compile_all: bool = false,
     /// Root of sysfs and procfs: "" for the live system, a fake tree in tests.
     sys_root: []const u8 = "",
-    /// The cache root (`xdg_cache_home`, `home`) the file goes under.
+    /// The cache root (`xdg_cache_home`, `home`) the file goes under; a null
+    /// root reads `$XDG_CACHE_HOME` or `$HOME` (`config.cacheRoots`).
     knobs: analysis.Knobs = .{},
     /// This executable, which the start probes run as children.
     exe: []const u8 = "/proc/self/exe",
@@ -134,7 +136,9 @@ const policy = .{ .margin = 1.3, .min_ratio = 2.0, .hist_ns_per_byte = 0.3, .his
 /// write error (`machine.WriteError`) or out of memory. A model that cannot
 /// be built or measured is skipped with a line on `log`: it has no row, so
 /// `auto` keeps it on the host.
-pub fn run(gpa: Allocator, io: std.Io, opts: Options, log: *std.Io.Writer) !void {
+pub fn run(gpa: Allocator, io: std.Io, given: Options, log: *std.Io.Writer) !void {
+    var opts = given;
+    opts.knobs = config.cacheRoots(given.knobs);
     const t_run = cal.nowNs();
     const vendor = machine.vendor orelse return Error.NoGpuArtifacts;
     const id = machine.identity(opts.sys_root, vendor);
@@ -244,7 +248,7 @@ fn measureModel(gpa: Allocator, io: std.Io, card: Card, cpus: cal.Cpus, opts: Op
         const text = try deck(arena, card, count);
         var library = try frontend.Library.init(gpa);
         defer library.deinit();
-        const ast = try frontend.prepare(io, arena, .{ .bytes = .{ .data = text, .origin = "calibrate.sp" } }, &.{}, .{});
+        const ast = try frontend.prepare(io, arena, .{ .bytes = .{ .data = text, .origin = "calibrate.sp" } }, &.{});
         try frontend.loadModels(io, &library, arena, ast, "calibrate.sp", &.{});
         var prepared = try frontend.build(&library, arena, arena, ast);
         defer prepared.deinit();

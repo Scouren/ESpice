@@ -1,10 +1,12 @@
 //! The `.noise` contribution columns: one label per generator name and per
 //! instance, and where each noise source lands in them. Generators of one
 //! instance that share a name (LRM §4.6.4 `name`) share a column; each
-//! instance's total column follows its generator columns.
-//! In: the batches, their types, the deck's card names. Out: the labels and
-//! two per-source column maps.
-//! Cites Verilog-AMS LRM §4.6.4; ngspice's `.noise ... pts` naming; #83.
+//! instance's total column follows its generator columns. A quiet resistor
+//! (`noisy=0`) gets none, as ngspice's resnoise.c:57 skips it.
+//! In: the batches, their types, the deck's card names and quiet
+//! resistors. Out: the labels and two per-source column maps.
+//! Cites Verilog-AMS LRM §4.6.4; ngspice's `.noise ... pts` naming,
+//! resnoise.c:57; #83.
 //!
 //! Contents:
 //! - `pub const Columns = struct` (`labels`, `gen`, `total`, `none`, `Error`, `build`, `sum`)
@@ -26,9 +28,10 @@ pub const Columns = struct {
     /// Per source: its instance's total column, or `none`.
     total: []const u32 = &.{},
 
-    /// The column of a source of an internal add (`CardNames.internal`,
-    /// such as a portnum V's z0 resistor): it has none. ngspice's vsrc
-    /// publishes no noise row, so such an instance adds to the totals only.
+    /// The column of a source that publishes none: one of an internal add
+    /// (`CardNames.internal`, such as a portnum V's z0 resistor), as
+    /// ngspice's vsrc publishes no noise row, or of a quiet resistor, as
+    /// ngspice's resnoise.c:57 skips it. It adds to the totals only.
     pub const none = std.math.maxInt(u32);
 
     /// Every way `build` fails. Everything is allocated in an arena the
@@ -41,9 +44,10 @@ pub const Columns = struct {
     /// Labels the `n_sources` generators `collectNoiseSources` yields, batch
     /// by batch and instance by instance, from each batch's `noise_names`
     /// and the card names in `names` (`<type>#<index>` for an instance of a
-    /// table that names none); an internal add gets no column (`none`).
+    /// table that names none); an internal add, and an instance `quiet`
+    /// names (a `noisy=0` resistor), gets no column (`none`).
     /// Allocates from `arena`, which owns the result.
-    pub fn build(arena: Allocator, batches: []const abi.Batch, types: []const abi.DeviceType, names: root.CardNames, n_sources: usize) Error!Columns {
+    pub fn build(arena: Allocator, batches: []const abi.Batch, types: []const abi.DeviceType, names: root.CardNames, quiet: root.CardNames, n_sources: usize) Error!Columns {
         assert(types.len == batches.len);
         var labels: std.ArrayList([]const u8) = .empty;
         const map = try arena.alloc(u32, 2 * n_sources);
@@ -56,7 +60,7 @@ pub const Columns = struct {
             if (s + b.count * gens.len > n_sources) return error.NoiseLabelMismatch;
             if (gens.len == 0) continue;
             for (0..b.count) |id| {
-                if (names.internal(t, @intCast(id))) {
+                if (names.internal(t, @intCast(id)) or quiet.get(t, @intCast(id)) != null) {
                     @memset(gen[s..][0..gens.len], none);
                     @memset(total[s..][0..gens.len], none);
                     s += gens.len;

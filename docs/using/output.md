@@ -89,8 +89,9 @@ frequency_re,frequency_im,i(v1)_re,i(v1)_im,v(in)_re,v(in)_im,v(out)_re,v(out)_i
 
 ### Touchstone and CITIfile
 
-These hold S-parameters only, so they accept only an `.sp` (or `.lin`,
-`.net`) result; anything else fails with `NotSParameterData`, and a deck
+These hold S-parameters only (an `.sp` plot's probe columns stay out),
+so they accept only an `.sp` (or `.lin`, `.net`) result; anything else
+fails with `NotSParameterData`, and a deck
 with no ports with `NoPorts`. Touchstone needs the full S matrix, written
 in real-imaginary form at the ports' reference impedance. Ports with
 different reference impedances write Touchstone 2.0, with each port's z0
@@ -206,6 +207,9 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
     {"name": "ph", "analysis": "ac", "variant": {"kind": "monte", "trial": 17}, "value": -1.667081},
     {"name": "off", "analysis": "dc", "variant": {"kind": "nominal"}, "value": null, "error": "out of interval"}
   ],
+  "optimized": [
+    {"name": "rx", "optimization": "opt1", "value": 666.6666667}
+  ],
   "statistics": [
     {"name": "ph", "analysis": "ac", "kind": "monte", "n": 30, "failed": 0, "mean": -1.66, "sigma": 0.02, "min": -1.71, "max": -1.61}
   ],
@@ -229,6 +233,11 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   analysis failed), never a sentinel number.
 - Results keep the stdout order, so the JSON and the text agree line for
   line; a `_CONT` card's events are `name[1]`, `name[2]`, ... as printed.
+- `optimized` holds each optimization's final parameter values
+  ([reference](reference.md#statistics)), one per `rx = 6.666667e2 $ ...` line of its
+  summary and in the same order: the parameter's `name`, the
+  `optimization`, the `.step` `point` label it started from when it has
+  one, and the exact `value` the line rounds.
 - `statistics` holds, per card and Monte Carlo analysis, the trial count
   `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
   correction), min and max. An analysis run with `SIGMA_SCALE=` has one
@@ -292,7 +301,8 @@ source, for electromigration and IR-drop sign-off (values abridged):
   names (a binned card's bin; null for a card without one), `terminal` the
   device's port and `net` the node it connects to. Internal nodes of a
   device are not terminals. A source lists both of its terminals, so every
-  net's entries sum to zero.
+  net's entries sum to zero. A `portnum` V is one source between its n+
+  and n−, its z0 inside it, as ngspice's is: the z0 has no entry.
 - `.options emirfile="FILE"` sets the flag and names the file, JSON
   whatever the name; `--emir=FILE` names the file over it.
 - Under `.step`, `.alter` or a sweep, each variant writes its own file
@@ -301,7 +311,8 @@ source, for electromigration and IR-drop sign-off (values abridged):
 - The file is the same at any `--jobs`. The transient runs on the CPU, to
   its end (no early stop).
 
-`.stim` writes transient signals as PWL sources or a `.data` table, and
-`.save type=ic` writes the operating point; both go beside the output
-file, or the working directory without one. HSPICE's own listing files
+`.stim` writes transient signals as PWL sources or a `.data` table,
+`.save type=ic` writes the operating point, and `.lin format=touchstone`
+writes `<deck>.s<N>p`; all three go beside the output file, or the
+working directory without one, never beside the deck. HSPICE's own listing files
 (`.mt0`, `.lis`, `.err`) are not written.

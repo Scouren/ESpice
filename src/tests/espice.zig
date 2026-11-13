@@ -41,6 +41,61 @@ fn construct(allocator: std.mem.Allocator) !void {
     defer p.deinit();
 }
 
+/// The period `.pss` found in `source`: its time column's last row.
+fn pssPeriod(source: []const u8) !f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    return r.data[(r.npoints - 1) * r.varnames.len + try columnIndex(r, "time")];
+}
+
+/// The period `.pss` found in `source` and `node`'s fundamental amplitude
+/// over it, 2/N |sum_k v_k exp(-2 pi i k/N)| over the period's N steps.
+fn pssOrbit(source: []const u8, node: []const u8) ![2]f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    const w = r.varnames.len;
+    const col = try columnIndex(r, node);
+    const steps = r.npoints - 1;
+    var re: f64 = 0;
+    var im: f64 = 0;
+    for (0..steps) |k| {
+        const phi = 2 * std.math.pi * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(steps));
+        re += r.data[k * w + col] * @cos(phi);
+        im -= r.data[k * w + col] * @sin(phi);
+    }
+    return .{ r.data[steps * w + try columnIndex(r, "time")], 2 * std.math.hypot(re, im) / @as(f64, @floatFromInt(steps)) };
+}
+
+/// The largest Nyquist component (1/N) |sum_k (-1)^k x_k| of any `.pss`
+/// column in `source` over the period's N steps, relative to that column's
+/// peak (columns at zero aside).
+fn pssRinging(source: []const u8) !f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    const w = r.varnames.len;
+    const steps = r.npoints - 1;
+    const time = try columnIndex(r, "time");
+    var worst: f64 = 0;
+    for (0..w) |col| {
+        if (col == time) continue;
+        var sum: f64 = 0;
+        var peak: f64 = 0;
+        for (0..steps) |k| {
+            const x = r.data[k * w + col];
+            sum += if (k % 2 == 0) x else -x;
+            peak = @max(peak, @abs(x));
+        }
+        if (peak != 0) worst = @max(worst, @abs(sum) / @as(f64, @floatFromInt(steps)) / peak);
+    }
+    return worst;
+}
+
 test "Problem: construction releases partial ownership at every allocation failure" {
     try construct(t.allocator);
     try t.checkAllAllocationFailures(@import("core").testing.fixed_growth, construct, .{});
@@ -260,10 +315,15 @@ test "Problem: source and appended port slices are owned after the call returns"
     const result = try p.result(ids[0]);
     try t.expectEqual(@as(usize, 2), result.npoints);
     // A 50-ohm load matches the original port. Borrowing the modified slice
-    // would produce S11 = (50 - 150) / (50 + 150) = -0.5.
+    // would produce S11 = (50 - 150) / (50 + 150) = -0.5. The probes come
+    // before S, so S11 is found by name.
+    const s11 = for (result.varnames, 0..) |name, c| {
+        if (std.mem.eql(u8, name, "v(S_1_1)")) break c;
+    } else return error.MissingColumn;
+    const stride = 2 * result.varnames.len;
     for (0..result.npoints) |i| {
-        try t.expectApproxEqAbs(@as(f64, 0), result.data[4 * i + 2], 1e-9);
-        try t.expectApproxEqAbs(@as(f64, 0), result.data[4 * i + 3], 1e-9);
+        try t.expectApproxEqAbs(@as(f64, 0), result.data[stride * i + 2 * s11], 1e-9);
+        try t.expectApproxEqAbs(@as(f64, 0), result.data[stride * i + 2 * s11 + 1], 1e-9);
     }
 }
 
@@ -476,9 +536,11 @@ test {
     _ = @import("analyses.zig");
     _ = @import("instance_params.zig");
     _ = @import("card_keys.zig");
+    _ = @import("breakdown.zig");
     _ = @import("mfactor.zig");
     _ = @import("tempco.zig");
     _ = @import("noise_gap.zig");
+    _ = @import("noise_quiet.zig");
     _ = @import("expressions.zig");
     _ = @import("temper.zig");
     _ = @import("unknown_functions.zig");
@@ -489,28 +551,39 @@ test {
     _ = @import("pss_keys.zig");
     _ = @import("source_dc.zig");
     _ = @import("source_port.zig");
+    _ = @import("sp_plot.zig");
+    _ = @import("sp_balanced.zig");
     _ = @import("dc_segments.zig");
+    _ = @import("hdl_include.zig");
 }
 
-test "Problem: .lin format=touchstone writes <deck>.s2p beside the deck with the noise block" {
+test "Problem: .lin format=touchstone writes <deck>.s2p beside the output file, not the deck, with the noise block" {
     // The ports are ngspice's portnum V cards (vsrc.c), each with its z0 in
-    // series in the circuit.
+    // series in the circuit. The file goes where `.save` and `.stim` files
+    // go (`Problem.out_dir`): beside the deck it was lost under SpiceRack,
+    // whose kit directory the CLI deletes.
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
-    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/amp.sp", .{tmp.sub_path});
+    try tmp.dir.createDirPath(t.io, "deck");
+    try tmp.dir.createDirPath(t.io, "out");
+    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/deck/amp.sp", .{tmp.sub_path});
     defer t.allocator.free(origin);
+    const raw = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/out/amp.raw", .{tmp.sub_path});
+    defer t.allocator.free(raw);
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{
             .data = "pad\nV1 a 0 dc 0 portnum 1 z0 50\nR1 a b 50\nR2 b 0 50\nV2 b 0 dc 0 portnum 2 z0 50\n.ac dec 1 1k 10k\n.lin noisecalc=1 format=touchstone\n.end\n",
             .origin = origin,
         } },
+        .output = .{ .path = raw },
     });
     defer p.deinit();
     try p.run_all();
-    const written = try tmp.dir.readFileAlloc(t.io, "amp.s2p", t.allocator, .unlimited);
+    const written = try tmp.dir.readFileAlloc(t.io, "out/amp.s2p", t.allocator, .unlimited);
     defer t.allocator.free(written);
     try t.expect(std.mem.indexOf(u8, written, "# Hz S RI R 50\n1e3 ") != null);
     try t.expect(std.mem.indexOf(u8, written, "! noise parameters\n1e3 ") != null);
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "deck/amp.s2p", .{}));
 }
 
 test "Problem: parameter sweeps cannot mutate concurrently running transient state" {
@@ -1357,6 +1430,11 @@ fn runThreaded(path: []const u8, device_threads: u32, solver_threads: u8) ![]con
         .backend = .{ .device_threads = device_threads, .solver_threads = solver_threads },
     });
     defer p.deinit();
+    // An exported ESPICE_THREADS or ESPICE_SOLVER_THREADS replaces both
+    // counts (`config.threadsFromEnv`), which would make every comparison
+    // of the caller one run against itself: fail instead.
+    try t.expectEqual(device_threads, p.session.config.device_threads);
+    try t.expectEqual(solver_threads, p.session.config.solver_threads);
     // device_threads > 1 always builds a ParEval; with an instance per
     // lane at least, every lane can claim a chunk.
     try t.expect(p.device_count() >= device_threads);
@@ -1412,6 +1490,30 @@ test "same deck, same bytes: run twice, any solver_threads, any device_threads" 
             defer t.allocator.free(lanes);
             try t.expectEqualSlices(u64, serial, lanes);
         }
+    }
+}
+
+test "ESPICE_THREADS=1 holds a Zig API run to one worker, as it holds the CLI's" {
+    // Oracle: the config the session runs with. `device_threads` 1 and no
+    // `thread_pool` mean each query stamps on one lane and borrows none
+    // (executor.zig `runQuery`). The options ask for the pool the CLI asks
+    // for; when only main.zig read the variable, a library caller kept the
+    // pool. No query runs while the variable is set, so no worker reads
+    // the process-wide environment.
+    try t.expectEqual(@as(c_int, 0), setenv("ESPICE_THREADS", "1", 1));
+    defer _ = unsetenv("ESPICE_THREADS");
+    const options: api.Options = .{ .source = .{ .bytes = .{ .data = deck, .origin = "threads.cir" } }, .auto_threads = true };
+    const p = try api.Problem.init(t.allocator, t.io, options);
+    defer p.deinit();
+    try t.expectEqual(@as(u32, 1), p.session.config.device_threads);
+    try t.expect(p.session.config.thread_pool == null);
+    // The parse the CLI's own test pinned: a positive integer, else 1.
+    for ([_]struct { [*:0]const u8, u32 }{ .{ "8", 8 }, .{ "0", 1 }, .{ "-3", 1 }, .{ "abc", 1 }, .{ "", 1 } }) |case| {
+        try t.expectEqual(@as(c_int, 0), setenv("ESPICE_THREADS", case[0], 1));
+        const q = try api.Problem.init(t.allocator, t.io, options);
+        defer q.deinit();
+        try t.expectEqual(case[1], q.session.config.device_threads);
+        try t.expect(q.session.config.thread_pool == null);
     }
 }
 
@@ -2055,6 +2157,33 @@ test "--measures (#235): a .step deck's JSON is its printed .meas lines, each la
     try t.expectEqualStrings(json.written(), again.written());
 }
 
+test "--measures: an optimized parameter is an object named as its summary line, with the exact value the line rounds" {
+    // Oracle: analytic, 5 rx / (1k + rx) = 2 V at rx = 2k/3; bisection keeps
+    // the last passing value, within RELIN * 9900 ohm of it
+    // (optimize/bisection_divider_ngspice.sp at RELIN = 1e-12): 1e-8 ohm,
+    // far inside the line's 6.666667e2, which is 3.3e-5 ohm off.
+    const source: api.Source = .{ .bytes = .{ .data = "bisect\n.param rx=opt1(5k, 100, 10k)\nv1 in 0 5\nr1 in out 1k\nr2 out 0 rx\n" ++
+        ".model optmod opt method=bisection relin=1e-12 relout=1e-6 itropt=60\n.dc v1 0 5 1 sweep optimize=opt1 result=vout model=optmod\n" ++
+        ".meas dc vout find v(out) at=5 goal=2\n.end\n", .origin = "bisect.sp" } };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, &text, &json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    const optimized = parsed.value.object.get("optimized").?.array.items;
+    try t.expectEqual(@as(usize, 1), optimized.len);
+    const o = optimized[0].object;
+    try t.expectEqualStrings("rx", o.get("name").?.string);
+    try t.expectEqualStrings("opt1", o.get("optimization").?.string);
+    try t.expect(o.get("point") == null);
+    const rx = jsonFloat(o.get("value").?);
+    try t.expectApproxEqAbs(2000.0 / 3.0, rx, 1e-12 * 9900);
+    const line = text.written()[std.mem.indexOf(u8, text.written(), "  rx = ").? + 7 ..];
+    try t.expectEqualStrings("6.666667e2", line[0..std.mem.indexOfScalar(u8, line, ' ').?]);
+}
+
 test "--measures (#238): each SOA excursion is an object with its instance, limit, peak, window and variant; soa_count() per point" {
     // Oracle: V2 sweeps v(g) over 0..2 V at v(d) = vd. vgs passes 1.5 V at
     // the 2 V point alone, at both steps; vds = 2 V passes 1.5 V at every
@@ -2552,6 +2681,31 @@ test "--emir (#237): without a .tran, the .op or the .dc's first point: every st
         };
         try expectKcl(doc, 1e-12);
     }
+}
+
+test "--emir (#237): a portnum V's z0 writes no entry, and the port is one source between n+ and n-" {
+    // Red before: the z0 wrote two terminals under the instance name
+    // "resistor", and V1's p sat at net `v1#res`.
+    var r = try emirRun("emir port\nV1 a 0 dc 1 portnum 1 z0 50\nR1 a 0 50\n.op\n.end\n", 1, .{ 0, 0 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    const terms = doc.get("terminals").?.array.items;
+    const sources = doc.get("sources").?.array.items;
+    try t.expectEqual(@as(usize, 2), terms.len);
+    try t.expectEqual(@as(usize, 2), sources.len);
+    for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+        const o = entry.object;
+        try t.expect(std.ascii.eqlIgnoreCase(if (std.mem.eql(u8, key, "sources")) "v1" else "r1", o.get("instance").?.string));
+        const p = std.mem.eql(u8, "p", o.get("terminal").?.string);
+        try t.expect(std.ascii.eqlIgnoreCase(if (p) "a" else "0", o.get("net").?.string));
+        // Oracle: 1 V behind z0 = 50 into R1 = 50 is 10 mA, into R1's p
+        // and out of the port's.
+        const into = p != std.mem.eql(u8, key, "sources");
+        try t.expectApproxEqAbs(@as(f64, if (into) 1e-2 else -1e-2), emirField(entry, "avg"), 1e-12);
+    };
+    try expectKcl(doc, 1e-12);
 }
 
 test "--emir (#237): a CMOS inverter driving C: the load's EM_AVG is C·V·f, so is the supply's mean, and the peak is the PMOS saturation current at the edge" {
@@ -3634,15 +3788,6 @@ test "auto: no calibration keeps the driver unloaded and notes it once; the fixt
     try t.expectEqual(notes, m.test_hooks.notes.load(.monotonic));
 }
 
-/// The period `.pss` found in `source`: its time column's last row.
-fn pssPeriod(source: []const u8) !f64 {
-    const p = try create(source);
-    defer p.deinit();
-    try p.run_all();
-    const r = try p.result(try find(p, .pss));
-    return r.data[(r.npoints - 1) * r.varnames.len + try columnIndex(r, "time")];
-}
-
 test "ngspice's .pss card and ESPice's oscillator card find one ring oscillator's period" {
     // Metamorphic: the ring of tests/conformance/tests/netlist/pss/
     // ring_oscillator.sp under `.pss v(c1) 300k 256` and under ngspice's
@@ -3674,9 +3819,12 @@ test "ngspice's .pss whose oscnob names no net picks its phase node and finds th
 
 test "ngspice's .pss: colpitt's PWL start-up plays once, and its orbit is ngspice-45's" {
     // The start-up integrated fixed-step periods each from t = 0, so vee's
-    // 1 ns PWL step replayed every period (red: error.Singular). ngspice
-    // runs one transient to tstab and shoots on from there (dcpss.c:
-    // 3560-3566, 4218). Golden: ngspice-45 -b -r on this deck with
+    // 1 ns PWL step replayed every period. ngspice runs one transient to
+    // tstab and shoots on from there (dcpss.c: 3560-3566, 4218). Red:
+    // error.Singular, which outlived that fix: vcc, c2, c1 and ccs are a
+    // capacitor and voltage source loop, whose current rings with
+    // multiplier +1 over the 256 steps, a zero column in the shooting
+    // Jacobian (gdb on unit run 9; 255 steps converge). Golden: ngspice-45 -b -r on this deck with
     // `.tran 0.5n 520u 500u 0.5n` for the `.pss` (no ngspice build here
     // implements .pss): v(3)'s rising mid-swing crossings 2.990807822e-07 s
     // apart, DFT bin 1 at 4096 points a period 0.2514609521 V; reltol=1e-4
@@ -3696,7 +3844,11 @@ test "ngspice's .pss: colpitt's PWL start-up plays once, and its orbit is ngspic
 test "ngspice's .pss ... uic: hartley starts from the .ic values and its orbit is ngspice-45's" {
     // uic is ngspice's MODEUIC for the settling transient (psssetp.c:38-
     // 40): no operating point, vcc ramping from 0 starts the tank (red:
-    // OscillatorDidNotStart, uic ignored and the OP's BJT off). Golden:
+    // OscillatorDidNotStart, uic ignored and the OP's BJT off). Red after:
+    // NoPeriodicSteadyState at residual 8.8e7: c1 alone holds charge at
+    // nodes 3 and 4, and the seam seed rang their common mode with
+    // multiplier +1 over the 1024 steps, a near-null Newton direction that
+    // moved v(3) by 2e4 V (gdb on unit run 9; 1023 steps converge). Golden:
     // ngspice-45 -b -r on this deck with `.tran 20u 2 1.8 20u uic` for
     // the `.pss`: v(2)'s crossings 8.174787063e-03 s apart, DFT
     // bin 1 1.137868852 V; reltol=1e-4 moves them by 1.2e-5 and 2.6e-5.
@@ -3728,24 +3880,35 @@ test "ngspice's .pss on vackar, whose oscillation decays, publishes no periodic 
     } else |err| try t.expect(err == error.NoPeriodicSteadyState);
 }
 
-/// The period `.pss` found in `source` and `node`'s fundamental amplitude
-/// over it, 2/N |sum_k v_k exp(-2 pi i k/N)| over the period's N steps.
-fn pssOrbit(source: []const u8, node: []const u8) ![2]f64 {
-    const p = try create(source);
-    defer p.deinit();
-    try p.run_all();
-    const r = try p.result(try find(p, .pss));
-    const w = r.varnames.len;
-    const col = try columnIndex(r, node);
-    const steps = r.npoints - 1;
-    var re: f64 = 0;
-    var im: f64 = 0;
-    for (0..steps) |k| {
-        const phi = 2 * std.math.pi * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(steps));
-        re += r.data[k * w + col] * @cos(phi);
-        im -= r.data[k * w + col] * @sin(phi);
-    }
-    return .{ r.data[steps * w + try columnIndex(r, "time")], 2 * std.math.hypot(re, im) / @as(f64, @floatFromInt(steps)) };
+// Analytic oracle for the two tests below: on a linear circuit driven by a
+// sampled sine, trapezoid's periodic orbit over N steps of dt is the phasor
+// solution at the warped s = j(2/dt)tan(w dt/2) (the bilinear map of
+// (2/dt)(z-1)/(z+1) at z = exp(j w dt)): DFT bin 1 is |H(s)| and every
+// other bin is zero, the Nyquist bin among them. A trapezoid current no
+// charge backs rings (-1)^k with multiplier +1 over an even N, so it
+// shows up only in that bin. N = 64, T = 1 ms.
+
+test ".pss on a capacitor and voltage source loop: an even step count publishes the warped phasor, the loop current unringing" {
+    // H = s c1 / (s (c1 + c2) + 1/r1): 0.4984268547 at the warped s
+    // (0.4984243361 at s = jw). vs, c1, c2 is a loop: its current rings
+    // in vs's column alone. Red: error.Singular (that column of the
+    // shooting Jacobian is exactly zero); with a gauge that only zeroes the
+    // old trajectory's ringing, i(vs) keeps 2e-5 A of it (gdb, 2026-11-11).
+    const cvloop = "cvloop\nvs a 0 sin(0 1 1k)\nc1 a b 1u\nc2 b 0 1u\nr1 b 0 1k\n.pss 1k 64\n.end\n";
+    try t.expectApproxEqRel(@as(f64, 0.4984268547), (try pssOrbit(cvloop, "v(b)"))[1], 1e-8);
+    try t.expect(try pssRinging(cvloop) < 1e-6);
+}
+
+test ".pss on a floating capacitor island: an even step count publishes the warped phasor, the island unringing" {
+    // Nodal: [1/r1 + s c1, -s c1; -s c1, s c1 + 1/(s l1) + 1/r2] v = [1/r1; 0]
+    // at the warped s gives |v(b)| 0.1135029113, |v(c)| 0.0514505927. c1
+    // alone holds charge at b and c, so rows b + c sum no dynamic current.
+    // Red (espice 2026-11-11, unit run 9): bin 1 right, but v(b) and v(c)
+    // ringing at a Nyquist 157 V on a 1 V drive, published as converged.
+    const island = "island\nvs a 0 sin(0 1 1k)\nr1 a b 1k\nc1 b c 1u\nl1 c 0 10m\nr2 c 0 100\n.pss 1k 64\n.end\n";
+    try t.expectApproxEqRel(@as(f64, 0.1135029113), (try pssOrbit(island, "v(b)"))[1], 1e-8);
+    try t.expectApproxEqRel(@as(f64, 0.0514505927), (try pssOrbit(island, "v(c)"))[1], 1e-8);
+    try t.expect(try pssRinging(island) < 1e-6);
 }
 
 test "an empty circuit's .op publishes a plot of no variables and one point (empty-1.sp)" {

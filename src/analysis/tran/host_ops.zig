@@ -154,7 +154,7 @@ pub fn lteSnap(c: *root.Circuit, dst: []f64, zero: []const [2]u32, rows: []const
 }
 
 /// Prints the operands of the state that bound a rejected step
-/// (`ESPICE_TRAN_LTE_TRACE`), replayed from the captured history. Asserts
+/// (`ZP_TRAN_LTE_TRACE`), replayed from the captured history. Asserts
 /// that the replay reproduces `bound` bit for bit.
 pub fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrator.LteIn, bound: f64) void {
     const hit = integrator.diagnoseBound(a.method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);

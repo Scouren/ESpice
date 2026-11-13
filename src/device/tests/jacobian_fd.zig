@@ -2,7 +2,8 @@
 //! (TESTING.md, wrong device derivative): at random voltages each stamped G entry
 //! must match a central difference of the stamped residual, and each C entry
 //! one of the stamped charge; and at fixed points for a card whose terms
-//! the defaults switch off (diode tunnelling). An entry whose differences
+//! the defaults switch off (diode tunnelling, VDMOS LAMBDA in reverse
+//! mode, a lateral pnp's substrate junction). An entry whose differences
 //! do not converge fails too (`FdNotConverged`), unless their spread is
 //! within `row_reltol` of the row's largest partial and holds the dual.
 //! Reaches each model through its object's vtable, as the builder does, so
@@ -296,6 +297,48 @@ test "diode tunnelling jacobian == finite difference at three reverse biases" {
     const fixed = [_][]const f64{ &.{ 0, 2 }, &.{ 0, 4 }, &.{ 0, 6 } };
     const g = try checkModel(arena.allocator(), "diode", catalog.vtable("diode"), &params, &fixed, prng.random());
     try std.testing.expect(g >= 4.1e-5);
+}
+
+test "vdmos jacobian == finite difference in reverse mode with lambda" {
+    // Oracle: a central difference of the stamped residual where the
+    // default LAMBDA = 0 leaves t0 = 1 + LAMBDA*vds (signed vds,
+    // vdmosload.c:366) out: vds < 0 with vgs above VTO, the reversed linear
+    // region. IS = 1e-30 keeps the body diode, forward there, out of the d-s
+    // entries t0's slope shares. The largest entry is the channel's
+    // |dI/dV(d)| at (-2, 4, 0), vgst*t0 - I0*LAMBDA = 4*0.8 - 6*0.1 = 2.6 S
+    // by hand (I0 the current before t0), which a channel left off would
+    // not reach. RD = RG = RS = RB = 0 collapse every internal.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0);
+    const params = [_]abi.Param{
+        .{ .key = "vto", .value = 2 },      .{ .key = "kp", .value = 1 },
+        .{ .key = "lambda", .value = 0.1 }, .{ .key = "is", .value = 1e-30 },
+    };
+    // (V(d), V(g), V(s)).
+    const fixed = [_][]const f64{ &.{ -1, 3, 0 }, &.{ -2, 4, 0 }, &.{ -0.5, 2.5, 0 } };
+    const g = try checkModel(arena.allocator(), "vdmos", catalog.vtable("vdmos"), &params, &fixed, prng.random());
+    try std.testing.expect(g >= 2.5);
+}
+
+test "lateral pnp substrate jacobian == finite difference with cjs and iss" {
+    // Oracle: a central difference of the stamped residual and charge where
+    // the defaults CJS = ISS = 0 leave the substrate junction at gmin. A pnp
+    // without SUBS is lateral (bjtsetup.c:40-46): the junction runs S to b'
+    // in type*subs's frame (bjtload.c:139, 185-187), reversed 2.3 V at the
+    // first point and forward 0.7 V at the second, where ISS draws
+    // 1e-16*exp(0.7/Vt) ~ 5e-5 A. Forward active: vbe 0.7 V, vbc -1.3 V.
+    // RB = RC = RE = 0 and TF = 0 collapse every internal.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var prng = std.Random.DefaultPrng.init(0);
+    const params = [_]abi.Param{
+        .{ .key = "type", .value = -1 }, .{ .key = "cjs", .value = 1e-12 },
+        .{ .key = "mjs", .value = 0.3 }, .{ .key = "iss", .value = 1e-16 },
+    };
+    // (V(c), V(b), V(e), V(s)).
+    const fixed = [_][]const f64{ &.{ -2, -0.7, 0, -3 }, &.{ -2, -0.7, 0, 0 } };
+    _ = try checkModel(arena.allocator(), "gummel_poon", catalog.vtable("gummel_poon"), &params, &fixed, prng.random());
 }
 
 test "judge: a true slope passes, one 3% off is a mismatch, and differences across a kink are no oracle" {

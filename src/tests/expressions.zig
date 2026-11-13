@@ -663,6 +663,10 @@ test "a form word followed by a linear card's tail is a node, as ngspice-44.2 re
     // this deck failed ("VCR or VCCAP on a card other than G"), e1 o 0 vcvs
     // 0 2 and g1 0 o vccs vccs 0 2m read 0, e1 o 0 poly 0 2 and laplace 0 2
     // were ParseErrors, G VCCAP PWL(1) ran (0) and vcvs a 0 2 3 ran (1).
+    // e12 and e13 read `delay` as a node too (scratchpad u8/twins.sp, sha256
+    // 357205f9145c5cb2910e853f3298f01dc25b0080044ef03f26d7eb99f2fb9b0f, less
+    // its e14), and ngspice stops on `vcvs vcvs a 0 2` ("unknown parameter
+    // (a)"); before, the delay cards were ParseErrors and that one read 1.
     try expectOp(
         \\form words as nodes
         \\va a 0 dc 0.5
@@ -691,13 +695,17 @@ test "a form word followed by a linear card's tail is a node, as ngspice-44.2 re
         \\h10 o10 0 vol 2k
         \\vw11 cur 0 0.25
         \\e11 o11 0 cur 0 2
+        \\vw12 delay 0 0.25
+        \\e12 o12 0 delay a 2
+        \\e13 o13 0 delay a 0
         \\.op
         \\.end
-    , &.{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1, 1, -0.5, 0.5 });
+    , &.{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1, 1, -0.5, 0.5, -0.5, 0 });
     try expectRefused("form words\nva a 0 dc 0.5\nra a 0 1k\n", error.UnsupportedCard, &.{
         "e1 o 0 vcr pwl(1) a 0 0,1k 1,2k\n",
         "g1 0 o vccap pwl(1) a 0 0,1p 1,2p\n",
         "e1 o 0 vcvs a 0 2 3\n",
+        "e1 o 0 vcvs vcvs a 0 2\n",
     });
 }
 

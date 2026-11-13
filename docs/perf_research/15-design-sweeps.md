@@ -32,12 +32,12 @@ GPU needs thousands of lanes.
 
 | Card | Becomes | Anchor |
 |---|---|---|
-| `.step` | One variant row per grid point; every analysis runs per row | `frontend/card_table.zig:122`, `frontend/variants.zig:205-212` |
-| `.data` with `SWEEP DATA=name`, inline or `MER`/`LAM FILE=` | One row per table row | `frontend/reader_sweeps.zig:85`, `frontend/source_data.zig:1-4`, `variants.zig:164-173` |
+| `.step` | One variant row per grid point; every analysis runs per row | `frontend/Netlist/card_table.zig:122`, `frontend/Jobs/variants.zig:205-212` |
+| `.data` with `SWEEP DATA=name`, inline or `MER`/`LAM FILE=` | One row per table row | `frontend/Netlist/reader_sweeps.zig:85`, `frontend/source/source_data.zig:1-4`, `variants.zig:164-173` |
 | `SWEEP MONTE=n`, `MONTE=list(...)`, `SIGMA_SCALE=` | One row per trial | `variants.zig:174-198` |
 | `.mc n` and `.temp start stop step` (ngspice) | One query split into lane rows, reassembled in lane order | `analysis/session_jobs.zig:216-227`, `session_sched.zig:338-370` |
 | HSPICE `.temp t1 t2 ...` | Every analysis once per temperature (`tol.temp_c`) | `session_jobs.zig:137-145` |
-| `.alter`, and corners as `.alter` with `.del lib` | A row when the circuit matches the nominal one and the deck has no other variants; otherwise a rebuild with its own session | `frontend/source_alter.zig:1-3`, `variant_planner.zig:256-274`, `espice/Problem.zig:277` |
+| `.alter`, and corners as `.alter` with `.del lib` | A row when the circuit matches the nominal one and the deck has no other variants; otherwise a rebuild with its own session | `frontend/source/source_alter.zig:1-3`, `variant_planner.zig:256-274`, `espice/Problem.zig:277` |
 | `.dc` | One query; its points are warm-started in sequence, not rows. A bare `.dc DATA=`/`MONTE=` is a row ensemble | `analysis/dc/dc.zig:1-5`, `variants.zig:149` |
 | `SWEEP OPTIMIZE=` with `.model OPT`, `.param p=optrange(...)` | Levenberg-Marquardt or bisection; each round is a private session of variant rows | `reader_sweeps.zig:80-84`, `espice/optimizer.zig:131-175` |
 | `.wcd` | FORM search; gradients from tangent rows or a finite-difference batch | `espice/wcd.zig`, `docs/using/analyses.md:704-740` |
@@ -379,7 +379,7 @@ no GPU-first sizing path: in [hist] and [tsv] small batches lose there.
 | 1 | Where the optimizer lives | Outside, through the C points API, for everything beyond HSPICE's own cards; inside, only what a deck-only user needs |
 | 2 | Syntax | No new card: one new `METHOD=` value on `.model OPT` and one population key; tables stay `.data` |
 | 3 | Which methods ship | In order: K-section pass/fail (small, and setup and hold searches are the common case), multi-start LM on tangents, then one population method. Differential evolution is the least code that fills a wide batch [est]; CMA-ES's default population is small [web C1]. Decide after stage 0 |
-| 4 | Objective language | Keep `.meas ... GOAL=` with `WEIGHT=` and the `GOAL < v` form for constraints (`frontend/measure_words.zig:66-72`, `core/measure_card.zig:161-176`); a general expression is already a `.meas ... PARAM=` card |
+| 4 | Objective language | Keep `.meas ... GOAL=` with `WEIGHT=` and the `GOAL < v` form for constraints (`frontend/Parse/measure_words.zig:66-72`, `core/measure_card.zig:161-176`); a general expression is already a `.meas ... PARAM=` card |
 | 5 | The LM path | Trying several dampings per iteration would use a batch but leaves HSPICE's CLOSE/CUT rule, which the owner kept [#97, 2026-10-08]. Keep it; use multi-start |
 | 6 | The GPU contract | Batch-independent on a fixed backend (stage 1). Bitwise equal to the CPU also needs the host to start from the template's pivot order (rounding class): not now |
 | 7 | `--jobs auto` | One per logical CPU against a measured gain of 11 to 17 [hist]: set it from the `job` row |

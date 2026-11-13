@@ -1,12 +1,14 @@
 //! Deck text through the public API, for the metamorphic tests beside it.
 //! In: a deck. Out: the solved problem, a result and its columns by name,
-//! or the deck's refusal.
+//! its column names as a set, or the deck's refusal.
 //!
 //! Contents:
 //! - `pub fn solve(source: []const u8) !*api.Problem`
 //! - `pub fn column(r: api.Result, name: []const u8) !usize`
 //! - `pub fn resultOf(p: *api.Problem, kind: api.requests.Kind) !api.Result`
 //! - `pub fn at(r: api.Result, k: usize, name: []const u8) !f64`
+//! - `pub fn atComplex(r: api.Result, k: usize, name: []const u8) ![2]f64`
+//! - `pub fn expectSameNames(want: [][]const u8, got: []const []const u8) !void`
 //! - `pub fn expectRefused(text: []const u8) !void`
 const std = @import("std");
 const api = @import("espice");
@@ -46,6 +48,30 @@ pub fn resultOf(p: *api.Problem, kind: api.requests.Kind) !api.Result {
 /// Column `name` of `r` at point `k`.
 pub fn at(r: api.Result, k: usize, name: []const u8) !f64 {
     return r.data[k * r.varnames.len + try column(r, name)];
+}
+
+/// Column `name` of complex result `r` at point `k`, as (re, im). Asserts a
+/// complex result.
+pub fn atComplex(r: api.Result, k: usize, name: []const u8) ![2]f64 {
+    std.debug.assert(r.is_complex);
+    return r.data[2 * (k * r.varnames.len + try column(r, name)) ..][0..2].*;
+}
+
+/// Expects `got` to hold exactly the names in `want`, in any order; sorts
+/// `want` in place.
+pub fn expectSameNames(want: [][]const u8, got: []const []const u8) !void {
+    const sorted = try t.allocator.dupe([]const u8, got);
+    defer t.allocator.free(sorted);
+    const lt = struct {
+        fn f(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.f;
+    std.mem.sort([]const u8, sorted, {}, lt);
+    std.mem.sort([]const u8, want, {}, lt);
+    errdefer for (sorted) |n| std.debug.print("got {s}\n", .{n});
+    try t.expectEqual(want.len, sorted.len);
+    for (want, sorted) |w, g| try t.expectEqualStrings(w, g);
 }
 
 /// Expects `text` refused at parse time, as every unsupported name is.

@@ -1,0 +1,9 @@
+// The decoy of files_spice2rack.sh's `hdl` kit file: 3k where the kit's
+// is 1k, so a run that compiled this one reads v(out) = 1.5 V, not 1 V.
+`include "disciplines.vams"
+module kitres(p, n);
+    inout p, n;
+    electrical p, n;
+    parameter real R = 3000.0 from (0:inf);
+    analog I(p, n) <+ V(p, n) / R;
+endmodule

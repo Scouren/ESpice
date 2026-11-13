@@ -2,7 +2,7 @@
 //! The oracle: no panic, no leak, `InvalidVector` or `OutOfMemory` only,
 //! and on success one `vvec_` source or `.dout` card per line.
 const std = @import("std");
-const vec = @import("../vec.zig");
+const vec = @import("../source/vec.zig");
 const Smith = std.testing.Smith;
 const Seeded = @import("seeded.zig").Seeded;
 

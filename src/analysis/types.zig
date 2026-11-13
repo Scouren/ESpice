@@ -81,8 +81,8 @@ pub const RunCtx = struct {
     /// Empty: solve live.
     freq_pre: []const f64 = &.{},
     /// A `.dc` segment's (`Dc.lane`) seam solutions, `2 * circuit.n`
-    /// values the sweep writes: its first point's full x, then its last
-    /// point's, NaN where a point did not converge. `Session.assemble`
+    /// values the sweep writes: its point `Dc.overlap - 1`'s full x, then
+    /// its last point's, NaN where a point did not converge. `Session.assemble`
     /// compares them across segments (dc/segments.zig). Empty otherwise.
     seam: []f64 = &.{},
 };

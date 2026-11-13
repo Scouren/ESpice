@@ -2,7 +2,7 @@
 //! Y, Z and H per frequency, group delays from a central difference at
 //! omega (1 +- gd_step) (two more lanes per point, so frequency-dependent
 //! elements are differentiated too), the stability factors, and the
-//! two-port noise parameters off one adjoint solve per port of the pair.
+//! two-port noise parameters off one adjoint solve per mode of the pair.
 //! In: the `.sp` rows with S filled, the port drives and the terminated
 //! `FreqSolver`. Out: the same rows with every `.lin` column filled.
 //! Cites HSPICE [SA Ch.17]; dev/analysis/s-parameters.md.
@@ -10,7 +10,7 @@
 //! Contents:
 //! - `pub fn columns(n_ports: usize, lin: ?Lin) usize`
 //! - `pub fn names(a: Allocator, n_ports: usize, lin: Lin) Allocator.Error![]const []const u8`
-//! - `pub fn fill(ctx: *const RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, lin: Lin) !void`
+//! - `pub fn fill(ctx: *const RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, lin: Lin) !void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,11 +19,11 @@ const Allocator = std.mem.Allocator;
 const Complex = @import("core").numerics.Complex;
 const FreqSolver = @import("solver").freq_solve.FreqSolver;
 const Lin = @import("core").query.Sp.Lin;
-const Port = @import("core").query.Port;
 const root = @import("../types.zig");
 const freq = @import("freq.zig");
 const net = @import("sp_network.zig");
 const sp_noise = @import("sp_noise.zig");
+const Basis = @import("sp_basis.zig").Basis;
 
 /// The two-port noise columns, in `net.noiseParams` order.
 const noise_names = [_][]const u8{ "NFMIN", "NF", "RN", "YOPT", "GAMMA_OPT" };
@@ -32,15 +32,13 @@ const stab_names = [_][]const u8{ "K_STABILITY_FACTOR", "MU_STABILITY_FACTOR" };
 /// Relative half-width of the group-delay central difference. Truncation is
 /// O(gd_step^2) and roundoff O(1e-16 / gd_step), both near 1e-10 relative.
 const gd_step = 1e-5;
-/// The ports H, the stability factors and the noise parameters read.
-const pair = [2]usize{ 0, 1 };
 
 comptime {
     assert(noise_names.len == net.noise_count);
     assert(stab_names.len == net.stability_count);
 }
 
-/// Returns the columns `.sp` publishes for `n_ports` ports, the frequency
+/// Returns the columns `.sp` publishes for `n_ports` modes, the frequency
 /// included; `session.schemaOf` sizes the result with it before the run.
 pub fn columns(n_ports: usize, lin: ?Lin) usize {
     const l = lin orelse return 1 + n_ports * n_ports;
@@ -86,12 +84,12 @@ pub fn names(a: Allocator, n_ports: usize, lin: Lin) Allocator.Error![]const []c
 
 /// Fills every `.lin` column after S from the S block of each row: Y, Z, H;
 /// then the group delays (a forward sweep at omega (1 +- gd_step)); then the
-/// noise parameters (an adjoint sweep with one right-hand side per port of
-/// the pair). `fs` holds the port terminations, `rhs` the unit port drives
-/// and `z0` each port's reference impedance. Asserts one z0 per port.
-pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, lin: Lin) !void {
-    const np = ports.len;
-    assert(z0.len == np);
+/// noise parameters (an adjoint sweep with one right-hand side per mode of
+/// the pair, `Basis.pair`). `fs` holds the port terminations, `rhs` the
+/// unit leg drives, and the S block of each row is over `basis`'s modes.
+pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, lin: Lin) !void {
+    const np = basis.legs.len;
+    assert(basis.z0.len == np);
     const m = net.paramCount(np);
     assert(data.len == omegas.len * row_len);
     const work = try ctx.scratch_allocator.alloc(Complex, 2 * m + np * np);
@@ -103,38 +101,38 @@ pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: [
     for (0..omegas.len) |k| {
         const row = data[k * row_len ..][0..row_len];
         net.readComplex(row[2..][0 .. 2 * np * np], lo[0 .. np * np]);
-        net.params(z0, pair, lo, tmp);
+        net.params(basis.z0, basis.pair, lo, tmp);
         net.writeComplex(lo[np * np ..], row[2 + 2 * np * np ..][0 .. 2 * (m - np * np)]);
     }
     var col: usize = 1 + m;
     if (lin.group_delay) {
-        try groupDelays(ctx, fs, ports, z0, omegas, rhs, data, row_len, col, lo, hi, tmp);
+        try groupDelays(ctx, fs, basis, omegas, rhs, data, row_len, col, lo, hi, tmp);
         col += m;
     }
     if (np < 2) return;
     for (0..omegas.len) |k| {
         const row = data[k * row_len ..][0..row_len];
         net.readComplex(row[2..][0 .. 2 * np * np], lo[0 .. np * np]);
-        const ks = net.stability(net.block(lo, np, pair));
+        const ks = net.stability(net.block(lo, np, basis.pair));
         for (ks, 0..) |v, i| {
             row[2 * (col + i)] = v;
             row[2 * (col + i) + 1] = 0;
         }
     }
     col += stab_names.len;
-    if (lin.noise) try noiseColumns(ctx, fs, ports, z0, omegas, data, row_len, col, lo);
+    if (lin.noise) try noiseColumns(ctx, fs, basis, omegas, data, row_len, col, lo);
 }
 
 // ---- private ----
 
-/// The group delays -dphi/domega of every parameter, from the phase of the
-/// ratio of the two sides so a wrap cannot enter.
-fn groupDelays(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, col: usize, lo: []Complex, hi: []Complex, tmp: []Complex) !void {
+/// The group delays -dphi/domega of every parameter over the modes, from
+/// the phase of the ratio of the two sides so a wrap cannot enter.
+fn groupDelays(ctx: *const root.RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, rhs: []const f64, data: []f64, row_len: usize, col: usize, lo: []Complex, hi: []Complex, tmp: []Complex) !void {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const n: usize = ckt.n;
     const nn = 2 * n;
-    const np = ports.len;
+    const np = basis.legs.len;
     const n_points = omegas.len;
     const pm = try scratch.alloc(f64, 2 * n_points + 2 * np * np);
     defer scratch.free(pm);
@@ -149,10 +147,11 @@ fn groupDelays(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0
     defer stream.deinit(scratch);
 
     while (try stream.next(ckt)) |pt| {
-        for (0..np) |p| net.writeColumn(n, ports, pt.x[p * nn ..][0..nn], s_row, p);
+        for (0..np) |p| net.writeColumn(n, basis.legs, pt.x[p * nn ..][0..nn], s_row, p);
+        try basis.toModes(s_row);
         const side = if (pt.k % 2 == 0) lo else hi;
         net.readComplex(s_row, side[0 .. np * np]);
-        net.params(z0, pair, side, tmp);
+        net.params(basis.z0, basis.pair, side, tmp);
         if (pt.k % 2 == 0) continue;
         const row = data[(pt.k / 2) * row_len ..][0..row_len];
         const span = pm[pt.k] - pm[pt.k - 1];
@@ -164,23 +163,24 @@ fn groupDelays(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0
     }
 }
 
-/// The two-port noise columns: the port voltage noise correlation with
-/// every port terminated in its (noiseless) z0 (`sp_noise.correlate`), then
-/// `net.noiseParams`.
-fn noiseColumns(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, data: []f64, row_len: usize, col: usize, lo: []Complex) !void {
+/// The two-port noise columns: the noise correlation of the pair's mode
+/// voltages with every leg terminated in its (noiseless) z0
+/// (`sp_noise.correlate`), then `net.noiseParams`.
+fn noiseColumns(ctx: *const root.RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, data: []f64, row_len: usize, col: usize, lo: []Complex) !void {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const n: usize = ckt.n;
     const nn = 2 * n;
-    const np = ports.len;
+    const np = basis.legs.len;
+    const pq = basis.pair;
     const srcs = try ckt.collectNoiseSources(ctx.x_op, scratch);
     defer scratch.free(srcs);
 
-    // Adjoint of each pair port's voltage.
+    // Adjoint of each pair mode's voltage.
     const e = try scratch.alloc(f64, 2 * nn);
     defer scratch.free(e);
 
-    sp_noise.adjointDrive(ports, &pair, nn, e);
+    sp_noise.adjointDrive(basis, &pq, nn, e);
     var stream = try freq.Stream.init(scratch, fs, ckt, ctx.x_op, omegas, e, true);
     defer stream.deinit(scratch);
 
@@ -190,7 +190,7 @@ fn noiseColumns(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z
         const row = data[pt.k * row_len ..][0..row_len];
         sp_noise.correlate(srcs, pt.x, n, row[0], &h, &c);
         net.readComplex(row[2..][0 .. 2 * np * np], lo[0 .. np * np]);
-        const out = net.noiseParams(net.block(lo, np, pair), .{ z0[0], z0[1] }, .{ c[0].re, c[3].re }, c[1]);
+        const out = net.noiseParams(net.block(lo, np, pq), .{ basis.z0[pq[0]], basis.z0[pq[1]] }, .{ c[0].re, c[3].re }, c[1]);
         for (out, 0..) |v, i| {
             row[2 * (col + i)] = v.re;
             row[2 * (col + i) + 1] = v.im;

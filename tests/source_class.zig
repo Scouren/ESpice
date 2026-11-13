@@ -8,7 +8,7 @@
 const std = @import("std");
 const catalog = @import("fixture_catalog");
 
-/// Every source waveform ngspice draws. src/frontend/net_waves.zig checks
+/// Every source waveform ngspice draws. src/frontend/Circuit/net_waves.zig checks
 /// its `Wave` tags against the same list.
 const waveforms = [_][]const u8{ "am", "exp", "pulse", "pwl", "sffm", "sin", "trnoise", "trrandom" };
 /// Waveforms espice refuses (#72).

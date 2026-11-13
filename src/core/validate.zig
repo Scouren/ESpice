@@ -303,9 +303,13 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             try frequency(o.sweep.f_stop + @as(f64, @floatFromInt(o.n_harmonics)) * o.f_lo);
         },
         .sp => |o| {
-            for (o.ports) |p| try port(p, n, o.net);
-            const ports = @max(o.ports.len, 1);
-            _ = try elements(&.{ o.sweep.count(), ports, ports, 2 });
+            // A balanced port publishes two modes.
+            var modes: usize = @max(o.ports.len, 1);
+            for (o.ports) |p| {
+                try port(p, n, o.net);
+                modes += @intFromBool(p.balanced != null);
+            }
+            _ = try elements(&.{ o.sweep.count(), modes, modes, 2 });
         },
         .four => |o| {
             if (o.n_harmonics == 0 or o.n_harmonics > requests.Four.max_harmonics) return error.InvalidQueryOptions;
@@ -342,7 +346,11 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             _ = try elements(&.{ o.pss_n_samples, n, n });
             try frequency(o.sweep.f_stop + @as(f64, @floatFromInt(o.n_sidebands)) * o.f_fundamental);
         },
-        .hblin => |o| for (o.ports) |p| try port(p, n, false),
+        .hblin => |o| for (o.ports) |p| {
+            // `.hblin` reads each port in its band, with no mode basis.
+            if (p.balanced != null) return error.InvalidQueryOptions;
+            try port(p, n, false);
+        },
         .hb => |o| try hb(o, n),
         .qpss => |o| {
             // Runs as `.hb TONES=f1 f2 NHARMS=k1 k2`: the same box limits.
@@ -423,10 +431,13 @@ fn sweep(start: f64, stop: f64, step: f64) Error!usize {
     return @intFromFloat(count);
 }
 
-/// Refuses a port whose rows are out of range or whose z0 is not positive.
+/// Refuses a port whose rows (a balanced port's − leg's too) are out of
+/// range or whose z0 is not positive, and a balanced port under `.net`,
+/// whose ports are ideal.
 fn port(p: requests.Port, n: u32, net: bool) Error!void {
     const branch_ok = p.branch < n or (net and p.branch == requests.Port.no_branch);
     if (p.node >= n or p.neg >= n or !branch_ok or !(p.z0 > 0)) return error.InvalidQueryOptions;
+    if (p.balanced) |leg| if (net or leg.node >= n or leg.neg >= n or leg.branch >= n) return error.InvalidQueryOptions;
 }
 
 /// A driven or autonomous single-tone HB, or a driven multi-tone one whose

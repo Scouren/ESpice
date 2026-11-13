@@ -1,10 +1,12 @@
 //! A model card key or device node ESPice cannot honour fails with a coded
 //! error instead of running with it dropped. Oracle: ngspice 44.2, which
 //! takes every key and node named here (its model tables, generated into
-//! src/frontend/ngspice_model_keys.tsv, and inp2d.c / vdmos.c's thermal
+//! src/frontend/Circuit/ngspice_model_keys.tsv, and inp2d.c / vdmos.c's thermal
 //! nodes) and would answer differently with them. Each refusal ran with no
 //! error before the fix. A polarity key or flag word binds where and as
-//! ngspice 44.2 binds it, and fails where ngspice stops on it.
+//! ngspice 44.2 binds it, and fails where ngspice stops on it. A BJT's
+//! subs places and orients its substrate junction as bjtload.c does,
+//! checked against the junction's closed-form depletion capacitance.
 const std = @import("std");
 const api = @import("espice");
 const decks = @import("deck.zig");
@@ -283,4 +285,33 @@ test "TYPE on a diode card binds juncap200's polarity: the diode kind sets none"
     const p_type = try opCurrent("polarity\nvd a 0 0.5\nd1 a 0 mm\n.model mm d level=6 type=-1\n" ++ op_end);
     const n_type = try opCurrent("polarity\nvd a 0 -0.5\nd1 a 0 mm\n.model mm d level=6 type=1\n" ++ op_end);
     try t.expectApproxEqRel(-n_type, p_type, 1e-9);
+}
+
+test "subs puts a BJT's substrate junction on c' (vertical) or b' (lateral), in type*subs's sense" {
+    // Analytic oracle. bjtsetup.c:40-46 makes an npn vertical and a pnp
+    // lateral unless the card gives subs; bjtload.c:139, 185-187 runs the
+    // junction from S to c' or b' in the frame of ttype = type*subs. Each
+    // row holds S at -2*ttype V against c, b and e at 0, which reverses the
+    // junction by 2 V, and drives S at AC. With no other capacitance on the
+    // card, i(vs) = -j w cjs (1 + 2/vjs)^-mjs (bjtload.c:719-724): 0.5222
+    // pF at vjs 0.75, mjs 0.5, tnom = temp. Red before: the lateral rows ran
+    // in type's frame, forward by 2 V, at cjs (1 + 2 mjs/vjs) = 2.333 pF
+    // (regression/bjt_instance_dtemp's lateral pnp, 2.85x ngspice's).
+    const w: f64 = 2 * std.math.pi * 1e6;
+    const want = -w * 1e-12 / @sqrt(@as(f64, 1.0 + 2.0 / 0.75));
+    inline for ([_][2][]const u8{
+        .{ "npn", "-2" }, // vertical, ttype +1
+        .{ "npn subs=-1", "2" }, // lateral, ttype -1
+        .{ "pnp", "-2" }, // lateral, ttype +1
+        .{ "pnp subs=1", "2" }, // vertical, ttype -1
+    }) |row| {
+        const p = try decks.solve("substrate\n.options reltol=1e-6\nvc c 0 0\nvb b 0 0\nvs s 0 dc " ++ row[1] ++
+            " ac 1\nq1 c b 0 s qx\n.model qx " ++ row[0] ++ " cjs=1p vjs=0.75 mjs=0.5\n.ac lin 1 1meg 1meg\n.end\n");
+        defer p.deinit();
+        const got = (try decks.atComplex(try decks.resultOf(p, .ac), 0, "i(vs)"))[1];
+        t.expectApproxEqRel(want, got, 1e-9) catch |err| {
+            std.debug.print("`{s}`: Im i(vs) = {e} A, want {e} A\n", .{ row[0], got, want });
+            return err;
+        };
+    }
 }

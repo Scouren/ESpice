@@ -66,6 +66,7 @@ test {
     _ = @import("price.zig");
     _ = @import("gpu/calibrate.zig");
     _ = @import("tests/periodic.zig");
+    _ = @import("tests/shooting.zig");
     _ = @import("tests/pz.zig");
     _ = @import("tests/session.zig");
     _ = @import("tests/dc_segments.zig");

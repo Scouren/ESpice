@@ -12,7 +12,7 @@
 //! Contents:
 //! - `pub const Summary = struct { plotname: []const u8, npoints: usize, nvars: usize }`
 //! - `pub const Reason = points.Reason`
-//! - `pub fn init(gpa: Allocator, io: std.Io, options: Options) !*Problem`
+//! - `pub fn init(gpa: Allocator, io: std.Io, given: Options) !*Problem`
 //! - `pub fn deinit(self: *Problem) void`
 //! - `pub fn title(self: *const Problem) []const u8`
 //! - `pub fn device_count(self: *const Problem) u32`
@@ -211,7 +211,10 @@ pub const print_soa = soa.printSoa;
 /// `espice-measures/1` (#235): `deck`, the `results` in the printed order,
 /// each with its analysis, its `variant` (`output.writeVariantJson`) and
 /// the `from`/`to`/`at` its line prints, a failed one with a null `value`
-/// and an `error`; then the Monte Carlo `statistics`; then under `.option
+/// and an `error`; then each optimization's `optimized` parameters, one per
+/// `name = value` line of its summary, with its `optimization`, its `.step`
+/// `point` label when it has one, and the exact `value`; then the Monte
+/// Carlo `statistics`; then under `.option
 /// soa` every excursion `print_soa` counts (#238), as `instance`,
 /// `quantity`, `key`, `limit`, `peak`, its window `from` and `to` (null at
 /// an operating point, `to` null past the last point), and its result's
@@ -271,14 +274,15 @@ live: []const u32 = &.{},
 live_names: []const []const u8 = &.{},
 /// Where an HSPICE `.save` writes the operating point; null without one.
 save_path: ?[]const u8 = null,
-/// Where `.save` and `.stim` files go: beside the output file, as HSPICE
-/// writes beside its listing.
+/// Where every side file goes (`.save`, `.stim`, `.lin format=touchstone`):
+/// beside the output file, else the work directory, as HSPICE writes
+/// beside its listing.
 out_dir: []const u8 = ".",
 /// One session per `prepared.runs` entry (variants with their own
 /// topology), run after the main session by `run_all`.
 runs: []Run = &.{},
-/// The deck's file name (`Source` path or origin), which names the
-/// Touchstone files `.lin format=touchstone` writes beside it.
+/// The deck's file name (`Source` path or origin), whose stem names the
+/// Touchstone files `.lin format=touchstone` writes in `out_dir`.
 origin: []const u8 = "",
 /// Holds the netlist an HSPICE optimization or a live parameter
 /// re-evaluates (`prepared.tuner`, `prepared.tuning`); null otherwise.
@@ -335,15 +339,19 @@ const Problem = @This();
 /// A variant run's queries and its next result to publish.
 const Run = struct { session: Session, next_output: usize = 0 };
 
-/// Parses and prepares `options.source`, then queues the deck's analyses (a
+/// Parses and prepares `given.source`, then queues the deck's analyses (a
 /// lone `.op` when the deck names none). Nothing runs yet, except the
-/// nominal operating point a warm start reads.
+/// nominal operating point a warm start reads. `ESPICE_THREADS` and
+/// `ESPICE_SOLVER_THREADS`, when set, replace `given`'s thread counts and
+/// pool (`config.threadsFromEnv`), for the CLI and the library alike.
 ///
 /// Fails on a netlist error, a backend the build lacks, zero
 /// `max_parallel` (`error.InvalidConcurrency`), an unknown
 /// `point.abort_measure` (`error.UnknownMeasure`), or a query the output
 /// format cannot hold. Caller owns the result and frees it with `deinit`.
-pub fn init(gpa: Allocator, io: std.Io, options: Options) !*Problem {
+pub fn init(gpa: Allocator, io: std.Io, given: Options) !*Problem {
+    const options = config.threadsFromEnv(given);
+    config.printLevers(options.timing_in_depth);
     var lap = lapStart(io, options.timing_in_depth);
     if (options.max_parallel == 0) return error.InvalidConcurrency;
     try analysis.validateBackend(options.backend);
@@ -400,7 +408,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) !*Problem {
     errdefer self.library.deinit();
     self.library.toolchain = try config.toolchainFromEnv(arena, options.hdl_toolchain);
     self.library.vpi = options.vpi;
-    const ast = try frontend.prepare(io, scratch, options.source, options.live_params, config.parseFromEnv());
+    const ast = try frontend.prepare(io, scratch, options.source, options.live_params);
     try frontend.loadModels(io, &self.library, scratch, ast, self.origin, options.vpi_apps);
     timingLap(io, &lap, "frontend (source, parsing, HDL)");
     self.prepared = try frontend.build(&self.library, arena, scratch, ast);

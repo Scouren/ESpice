@@ -2,7 +2,10 @@
 //! with out: the execution config its sessions share, the `.hdl` toolchain,
 //! the developer knobs, and the point options and query list of the deck's
 //! own analyses. Nothing below the facade reads the environment; this file
-//! reads all of it, once per Problem.
+//! reads all of it, once per Problem or calibration run, so a C API or Zig
+//! API caller gets what the CLI gets. Two reads live elsewhere:
+//! `ESPICE_SPICERACK`, the default of the CLI's `--spicerack` (main.zig),
+//! since only the CLI runs spice2rack, and Gompute's `GOMPUTE_FAKE_DEVICES`.
 //! Cites: none.
 //!
 //! Contents:
@@ -10,13 +13,16 @@
 //! - `pub const MeasureWriters = struct { out: *std.Io.Writer, err: *std.Io.Writer }`
 //! - `pub const HdlToolchain = frontend.Library.Toolchain`
 //! - `pub const Shared = struct`
+//! - `pub fn threadsFromEnv(options: Options) Options`
+//! - `pub fn printLevers(on: bool) void`
 //! - `pub fn execution(options: Options, prepared: *const frontend.Prepared, shared: Shared) error{ EmirNeedsCpu, UnknownLever }!analysis.ExecutionConfig`
 //! - `pub fn pointOptions(options: Options, prepared: *const frontend.Prepared, save_path: ?[]const u8) requests.PointOptions`
 //! - `pub fn deckJobs(scratch: Allocator, deck: *const core.Deck, point: requests.PointOptions) Allocator.Error![]requests.Query`
 //! - `pub fn withPoint(scratch: Allocator, queries: []const requests.Query, point: requests.PointOptions) Allocator.Error![]requests.Query`
 //! - `pub fn toolchainFromEnv(arena: Allocator, given: HdlToolchain) Allocator.Error!HdlToolchain`
+//! - `pub fn tmpDir() []const u8`
 //! - `pub fn dupeAll(arena: Allocator, items: []const []const u8) Allocator.Error![]const []const u8`
-//! - `pub fn parseFromEnv() frontend.ParseOptions`
+//! - `pub fn cacheRoots(knobs: analysis.Knobs) analysis.Knobs`
 //! - `pub fn loadMachine(arena: Allocator) ?analysis.Machine`
 //! - `pub fn likelyGpu(options: Options) bool`
 //! - `pub fn raiseJitCache() void`
@@ -47,7 +53,9 @@ pub const Options = struct {
     /// Let a large query borrow extra device and refactor lanes from a
     /// per-Problem pool of half the logical CPUs, in place of the fixed
     /// `backend.device_threads` and `backend.solver_threads`. Results are
-    /// bitwise those of one thread.
+    /// bitwise those of one thread. `ESPICE_THREADS` or
+    /// `ESPICE_SOLVER_THREADS` in the environment turns it off
+    /// (`threadsFromEnv`).
     auto_threads: bool = false,
     /// Print per-phase wall times to stderr.
     timing_in_depth: bool = false,
@@ -115,6 +123,30 @@ pub const Shared = struct {
 /// mostly stays on the CPU, and a started context costs a CPU run its
 /// teardown (stress/scaling_parallel_inverters_2000, 199 KiB: 0.6 → 1.0 s).
 const likely_gpu_bytes = 1 << 20;
+
+/// Returns `options` with the environment's thread counts, read the same
+/// for every caller: `ESPICE_THREADS=N` device-stamp lanes and
+/// `ESPICE_SOLVER_THREADS=N` solver threads, at most 16, each 1 when unset,
+/// zero or not a number while the other is set. Either one set replaces
+/// `options`' counts and turns `auto_threads` off, as the environment's
+/// knobs replace the caller's; neither set returns `options` unchanged.
+pub fn threadsFromEnv(options: Options) Options {
+    if (env("ESPICE_THREADS") == null and env("ESPICE_SOLVER_THREADS") == null) return options;
+    var fixed = options;
+    fixed.backend.device_threads = envThreads("ESPICE_THREADS");
+    fixed.backend.solver_threads = @intCast(@min(envThreads("ESPICE_SOLVER_THREADS"), 16));
+    fixed.auto_threads = false;
+    assert(fixed.backend.device_threads >= 1);
+    assert(fixed.backend.solver_threads >= 1 and fixed.backend.solver_threads <= 16);
+    return fixed;
+}
+
+/// Under `on` (`Options.timing_in_depth`), prints `ESPICE_PERF` on stderr,
+/// so every timed log names the levers it ran with (`core.perf`).
+pub fn printLevers(on: bool) void {
+    if (!on) return;
+    if (env("ESPICE_PERF")) |v| std.debug.print("timing: ESPICE_PERF={s}\n", .{v});
+}
 
 /// Returns the config every session of the Problem runs with: `options`'
 /// backend with the environment's knobs, the shared state, and the GPU lane
@@ -233,7 +265,7 @@ pub fn toolchainFromEnv(arena: Allocator, given: HdlToolchain) Allocator.Error!H
     else if (nonEmptyEnv("HOME")) |d|
         try join(arena, &.{ d, ".cache", "espice", "hdl" })
     else
-        try join(arena, &.{ nonEmptyEnv("TMPDIR") orelse "/tmp", "espice-cache", "hdl" });
+        try join(arena, &.{ tmpDir(), "espice-cache", "hdl" });
     const zig = given.zig orelse env("ZIG");
     const toolchain: HdlToolchain = .{
         .zig = if (zig) |z| try arena.dupe(u8, z) else null,
@@ -245,6 +277,12 @@ pub fn toolchainFromEnv(arena: Allocator, given: HdlToolchain) Allocator.Error!H
     return toolchain;
 }
 
+/// `$TMPDIR`, else `/tmp` when it is unset or empty: the `.hdl` cache's last
+/// root (`toolchainFromEnv`) and where the CLI's SpiceRack kit goes.
+pub fn tmpDir() []const u8 {
+    return nonEmptyEnv("TMPDIR") orelse "/tmp";
+}
+
 /// Returns a copy of `items`, the list and each string, in `arena`.
 pub fn dupeAll(arena: Allocator, items: []const []const u8) Allocator.Error![]const []const u8 {
     const out = try arena.alloc([]const u8, items.len);
@@ -252,19 +290,16 @@ pub fn dupeAll(arena: Allocator, items: []const []const u8) Allocator.Error![]co
     return out;
 }
 
-/// `ESPICE_PARSE_THREADS=N`: N threads scan the device cards of every deck,
-/// however small, and 0 reads every card whole (#230); for A/B runs, which
-/// must give the same bytes. Unset or unparsable keeps the default.
-pub fn parseFromEnv() frontend.ParseOptions {
-    const v = env("ESPICE_PARSE_THREADS") orelse return .{};
-    return .{ .threads = std.fmt.parseInt(u32, v, 10) catch return .{}, .scan_min = 0 };
+/// Returns `knobs` with each null cache root filled from the environment:
+/// `xdg_cache_home` from `$XDG_CACHE_HOME`, `home` from `$HOME`. Under them
+/// live the calibration file and the GPU JIT markers (`machine.cachePath`).
+pub fn cacheRoots(knobs: analysis.Knobs) analysis.Knobs {
+    var k = knobs;
+    k.xdg_cache_home = k.xdg_cache_home orelse env("XDG_CACHE_HOME");
+    k.home = k.home orelse env("HOME");
+    return k;
 }
 
-/// Whether a run will probably take the GPU, judged before parsing: an
-/// explicit `cuda`/`hip`, or a deck of at least `likely_gpu_bytes`, the
-/// size where `auto`'s cost model starts admitting post-layout decks.
-// ponytail: the top file's size only; a small deck that includes a large
-// netlist starts the driver with its first query, as before 05 5.12.
 /// This machine's calibration (`analysis.machine`): the file under
 /// `$XDG_CACHE_HOME` (else `$HOME/.cache`), checked against the identity
 /// sysfs and procfs show, without the driver. Null in a build without
@@ -275,7 +310,7 @@ pub fn loadMachine(arena: Allocator) ?analysis.Machine {
     const m = analysis.machine;
     const v = m.vendor orelse return null;
     const live = m.identity("", v);
-    const knobs: analysis.Knobs = .{ .xdg_cache_home = env("XDG_CACHE_HOME"), .home = env("HOME") };
+    const knobs = cacheRoots(.{});
     // Lever p1: the identity keys decide, named on refusal
     // (08-placement.md step 1). A bad lever list fails in `execution`.
     if (if (core.perf.Levers.parse(env("ESPICE_PERF"))) |l| l.p1 else |_| false) return m.loadKeyed(arena, knobs, &live, v);
@@ -285,6 +320,11 @@ pub fn loadMachine(arena: Allocator) ?analysis.Machine {
     };
 }
 
+/// Whether a run will probably take the GPU, judged before parsing: an
+/// explicit `cuda`/`hip`, or a deck of at least `likely_gpu_bytes`, the
+/// size where `auto`'s cost model starts admitting post-layout decks.
+// ponytail: the top file's size only; a small deck that includes a large
+// netlist starts the driver with its first query, as before 05 5.12.
 pub fn likelyGpu(options: Options) bool {
     if (options.backend.gpu_explicit or options.backend.backend != .auto) return true;
     const path = switch (options.source) {
@@ -386,9 +426,14 @@ fn knobsFromEnv() error{UnknownLever}!analysis.Knobs {
     k.gpu_nofuse = isSet("ESPICE_GPU_NOFUSE");
     k.gpu_nographs = isSet("ESPICE_GPU_NOGRAPHS");
     k.gpu_host_step = isSet("ESPICE_GPU_HOST_STEP");
-    k.xdg_cache_home = env("XDG_CACHE_HOME");
-    k.home = env("HOME");
-    return k;
+    return cacheRoots(k);
+}
+
+/// A positive thread count from the variable `name`, 1 when unset, zero or
+/// not a number.
+fn envThreads(name: [*:0]const u8) u32 {
+    const value = env(name) orelse return 1;
+    return @max(1, std.fmt.parseInt(u32, value, 10) catch 1);
 }
 
 /// The variable `name`, borrowed from the environment block; null when

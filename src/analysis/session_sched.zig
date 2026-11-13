@@ -354,8 +354,8 @@ pub fn assemble(self: *Session, g: usize) !void {
         npoints += self.rows.items(.executor)[l].?.result().?.npoints;
     }
     const job = self.jobAt(g);
-    // Each `.dc` segment but the first leads with its overlap row.
-    if (job == .dc) npoints -= g - first - 1;
+    // Each `.dc` segment but the first leads with its overlap rows.
+    if (job == .dc) npoints -= (g - first - 1) * requests.Dc.overlap;
     const e = try execution.Executor.create(self.allocator, self.io, self.templateOf(g), self.deck, job, null, false, self.config);
     self.rows.items(.executor)[g] = e;
     var res = self.rows.items(.executor)[first].?.result().?;

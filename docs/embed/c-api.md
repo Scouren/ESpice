@@ -66,6 +66,12 @@ On failure it returns a status, leaves `*out` NULL and writes the error
 name (`ParseError`, `FileNotFound`, ...) into `diagnostic`. The source is
 copied, so your buffer can go away once the call returns.
 
+`espice_create` reads `ESPICE_THREADS` and `ESPICE_SOLVER_THREADS` from the
+process environment, as the CLI does
+([Environment variables](../using/cli.md#environment-variables)). Set, they
+fix the problem's device-evaluation and solver threads. Unset, each query
+evaluates its devices on one thread.
+
 **Queries.** Each analysis card becomes a query, and ESPice adds the
 prerequisites they need (a transient's operating point, say). Queries
 form a DAG. `espice_query_count` and `espice_get_query_info` describe each

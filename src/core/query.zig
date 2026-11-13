@@ -1,5 +1,5 @@
 //! Resolved query descriptions: the contract between the frontend, which
-//! fills them from analysis cards (keywords in frontend/netlist.zig `cards`),
+//! fills them from analysis cards (keywords in frontend/Netlist.zig `cards`),
 //! and the analysis drivers. A card in, one `Query` row out. This file owns
 //! the tag (`Kind`) and the union (`Query`); each family of options structs
 //! lives in `query/` and is re-exported here, so `core.query.X` names every

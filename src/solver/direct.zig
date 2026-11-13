@@ -73,7 +73,7 @@ pub const Params = struct {
 };
 
 /// Developer switches. The facade reads them from the environment once
-/// (`espice.zig`); the solver reads no environment.
+/// (`espice/config.zig`); the solver reads no environment.
 pub const Knobs = struct {
     /// `ZP_LU_STATS`: print the BBD census and every full factor's fill.
     /// Read only under `-Dlu-instrument` (`instrument`).

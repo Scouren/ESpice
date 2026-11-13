@@ -1,13 +1,15 @@
-//! ngspice's `.sp ... donoise=1` columns after S: the short-circuit noise
-//! current correlation Cy of every port pair and, for exactly two ports, NF,
-//! SOpt, NFmin and Rn. One adjoint right-hand side per port gives the port
-//! voltage noise correlation Cv with every port terminated in its noiseless
-//! z0; the Norton currents of those voltages are i = (Y + Y0) v, so
+//! ngspice's `.sp ... donoise=1` columns after S, Y and Z: the short-circuit
+//! noise current correlation Cy of every port pair and, for exactly two
+//! ports, NF, SOpt, NFmin and Rn. One adjoint right-hand side per port
+//! (per mode of a balanced port: its legs' voltages weighted as
+//! `sp_basis.zig` defines the mode) gives the port voltage noise
+//! correlation Cv with every leg terminated in its noiseless z0; the Norton
+//! currents of those voltages are i = (Y + Y0) v, so
 //! Cy = (Y + Y0) Cv (Y + Y0)^H, published unnormalized in A^2/Hz. The
 //! two-port figures normalize Cy by 4 k T at the circuit temperature, not
 //! 290 K. Also the correlation sum `sp_lin.zig`'s HSPICE noise columns use.
-//! In: the `.sp` rows with S filled and the terminated `FreqSolver`. Out:
-//! the same rows with the noise columns filled.
+//! In: the `.sp` rows with S, Y and Z filled and the terminated
+//! `FreqSolver`. Out: the same rows with the noise columns filled.
 //! Cites ngspice span.c:111-165 (Maas's two-port formulas), :547-567 (names);
 //! nevalsrc.c:68-90 (i = (Y + Y0) v, Cy_ds = i_d i_s*); cktspdum.c:204-237
 //! (column order).
@@ -15,8 +17,8 @@
 //! Contents:
 //! - `pub fn columns(n_ports: usize) usize`
 //! - `pub fn names(a: Allocator, n_ports: usize, out: [][]const u8) Allocator.Error!void`
-//! - `pub fn fill(ctx: *const RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, data: []f64, row_len: usize, col: usize) !void`
-//! - `pub fn adjointDrive(ports: []const Port, which: []const usize, nn: usize, e: []f64) void`
+//! - `pub fn fill(ctx: *const RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, data: []f64, row_len: usize, s_col: usize) !void`
+//! - `pub fn adjointDrive(basis: *const Basis, which: []const usize, nn: usize, e: []f64) void`
 //! - `pub fn correlate(srcs: []const NoiseSource, x: []const f64, n: usize, f: f64, h: []Complex, c: []Complex) void`
 //! - `pub fn twoPort(y: [4]Complex, c: [4]Complex, y0: f64) [4]Complex`
 
@@ -26,12 +28,12 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Complex = @import("core").numerics.Complex;
 const FreqSolver = @import("solver").freq_solve.FreqSolver;
-const Port = @import("core").query.Port;
 const root = @import("../types.zig");
 const NoiseSource = root.NoiseSource;
 const freq = @import("freq.zig");
 const noise = @import("noise.zig");
 const net = @import("sp_network.zig");
+const Basis = @import("sp_basis.zig").Basis;
 
 /// ngspice's two-port columns, in `twoPort` order (span.c:564-567).
 const two_port_names = [_][]const u8{ "v(NF)", "v(SOpt)", "v(NFmin)", "v(Rn)" };
@@ -56,18 +58,21 @@ pub fn names(a: Allocator, n_ports: usize, out: [][]const u8) Allocator.Error!vo
     if (n_ports == 2) @memcpy(out[4..], &two_port_names);
 }
 
-/// Fills the noise columns, from column `col` on, of every row of `data`,
-/// whose S block (columns 1..) is already written: Cy over every port
-/// pair, then for two ports NF and NFmin in dB, SOpt and Rn in ohms. `fs`
-/// holds the port terminations and `z0` each port's reference impedance;
-/// real figures have a zero imaginary part. Asserts one z0 per port.
-pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: []const f64, omegas: []const f64, data: []f64, row_len: usize, col: usize) !void {
+/// Fills the noise columns of every row of `data`, whose S, Y and Z blocks
+/// over `basis`'s modes (from column `s_col`) are already written and which
+/// they follow: Cy over every mode pair, then for two modes NF and NFmin
+/// in dB, SOpt and Rn in ohms.
+/// `fs` holds the port terminations; real figures have a zero imaginary
+/// part. Asserts rows that end with the noise columns.
+pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, basis: *const Basis, omegas: []const f64, data: []f64, row_len: usize, s_col: usize) !void {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const n: usize = ckt.n;
     const nn = 2 * n;
-    const np = ports.len;
+    const np = basis.legs.len;
+    const z0 = basis.z0;
     const n2 = np * np;
+    const col = s_col + 3 * n2;
     assert(z0.len == np);
     assert(data.len == omegas.len * row_len);
     assert(row_len == 2 * (col + columns(np)));
@@ -81,7 +86,7 @@ pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: [
     const e = try scratch.alloc(f64, np * nn);
     defer scratch.free(e);
 
-    adjointDrive(ports, all, nn, e);
+    adjointDrive(basis, all, nn, e);
     // S, Y, Z, H (`net.params`), then its scratch, the transfers, Cv and Y + Y0.
     const m = net.paramCount(np);
     const work = try scratch.alloc(Complex, m + 3 * n2 + np);
@@ -99,7 +104,7 @@ pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: [
     while (try stream.next(ckt)) |pt| {
         const row = data[pt.k * row_len ..][0..row_len];
         correlate(srcs, pt.x, n, row[0], h, cv);
-        net.readComplex(row[2..][0 .. 2 * n2], p[0..n2]);
+        net.readComplex(row[2 * s_col ..][0 .. 2 * n2], p[0..n2]);
         net.params(z0, .{ 0, 1 }, p, tmp);
         for (0..np) |i| for (0..np) |j| {
             g[i * np + j] = p[n2 + i * np + j];
@@ -125,16 +130,19 @@ pub fn fill(ctx: *const root.RunCtx, fs: *FreqSolver, ports: []const Port, z0: [
     }
 }
 
-/// Writes the adjoint drive of each port index in `which` into its block
-/// of `e` (`which.len` blocks of `nn`): the port voltage v(node) - v(neg).
-pub fn adjointDrive(ports: []const Port, which: []const usize, nn: usize, e: []f64) void {
+/// Writes the adjoint drive of each mode index in `which` into its block
+/// of `e` (`which.len` blocks of `nn`): the mode voltage, each leg's
+/// v(node) - v(neg) weighted by `Basis.voltageWeight` (a single-ended
+/// port's own voltage, weight 1).
+pub fn adjointDrive(basis: *const Basis, which: []const usize, nn: usize, e: []f64) void {
     assert(e.len == which.len * nn);
     @memset(e, 0);
-    for (which, 0..) |q, i| {
-        const port = ports[q];
-        if (port.node != root.GROUND) e[i * nn + port.node] += 1;
-        if (port.neg != root.GROUND) e[i * nn + port.neg] -= 1;
-    }
+    for (which, 0..) |q, i| for (basis.legs, 0..) |leg, l| {
+        const w = basis.voltageWeight(q, l);
+        if (w == 0) continue;
+        if (leg.node != root.GROUND) e[i * nn + leg.node] += w;
+        if (leg.neg != root.GROUND) e[i * nn + leg.neg] -= w;
+    };
 }
 
 /// Writes into `c` (m x m row-major, m = `h.len`) the one-sided port voltage

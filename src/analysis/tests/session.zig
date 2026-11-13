@@ -391,6 +391,59 @@ test "schemaOf predicts the columns envelope and noise publish (#83)" {
     }
 }
 
+test "schemaOf predicts the .sens, .dcmatch, .dcsens and .acmatch columns without an internal add's rows" {
+    // Oracle: the columns each run publishes, and the same query with no
+    // card names, which counts every resistor's. Red before: `.sens`
+    // published fewer columns than its schema counted.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const vin = try b.addNode();
+    const out = try b.addNode();
+    try b.addDevice(models.vsource, "v1", &.{ .dc = 1 }, &.{}, .{ vin, GROUND });
+    // A portnum V's z0, which no card names.
+    try b.addDevice(models.resistor, "", &.{ .r = 50 }, &.{}, .{ vin, out });
+    try b.addDevice(models.resistor, "r1", &.{ .r = 1000 }, &.{}, .{ out, GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const names = try requests.CardNames.init(arena.allocator(), &.{
+        .{ .type = builtin("vsource"), .index = 0, .name = "v1" },
+        .{ .type = builtin("resistor"), .index = 1, .name = "r1" },
+    });
+    var deck = bareDeck(&.{ vin, out }, &.{ "v(vin)", "v(out)" });
+    // A unit AC current into `out`, so `.acmatch`'s output is not zero.
+    const drive = try arena.allocator().alloc(f64, 2 * @as(usize, prepared.n));
+    @memset(drive, 0);
+    drive[out] = 1;
+    deck.ac_drive = drive;
+    const sweep: requests.FreqSweep = .{ .f_start = 1, .f_stop = 1e3 };
+    const queries = [_]requests.Query{
+        .{ .sens = .{ .output_node = out, .card_names = names } },
+        .{ .dcmatch = .{ .output_node = out, .card_names = names } },
+        .{ .dcsens = .{ .output_node = out, .card_names = names } },
+        .{ .acmatch = .{ .sweep = sweep, .output_node = out, .card_names = names } },
+    };
+    const schemaOf = @import("../session.zig").schemaOf;
+    for (queries) |q| {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [1]requests.QueryId = undefined;
+        _ = try s.append(&.{q}, &ids);
+        while (!(try s.info(ids[0])).status.terminal()) _ = try s.advance(ids[0]);
+        const res = try s.result(ids[0]);
+        try t.expectEqual(res.varnames.len, (try schemaOf(t.allocator, &prepared, &deck, q)).columns);
+        for (res.varnames) |name| try t.expect(!std.mem.startsWith(u8, name, "resistor#0"));
+        var all = q;
+        switch (all) {
+            inline .sens, .dcmatch, .dcsens, .acmatch => |*o| o.card_names = .empty,
+            else => unreachable, // else: `queries` holds only these four
+        }
+        try t.expect((try schemaOf(t.allocator, &prepared, &deck, all)).columns > res.varnames.len);
+    }
+}
+
 /// Runs every query in `jobs` to completion over `prepared`, `device_threads`
 /// stamp lanes. With a seed, each round's ready set runs at once in an order
 /// shuffled by it; without one, one at a time in row order. Returns each

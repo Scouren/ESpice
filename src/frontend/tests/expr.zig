@@ -7,9 +7,9 @@
 //! errors), allocation failure through `compileAll` and `fold`, and the
 //! generator's function names against expr_ops.zig `fns`.
 const std = @import("std");
-const expr = @import("../expr.zig");
-const expr_ops = @import("../expr_ops.zig");
-const lines = @import("../lines.zig");
+const expr = @import("../Parse/expr.zig");
+const expr_ops = @import("../Parse/expr_ops.zig");
+const spice_number = @import("../Parse/spice_number.zig");
 const Smith = std.testing.Smith;
 const Seeded = @import("seeded.zig").Seeded;
 
@@ -254,7 +254,7 @@ fn checkOne(src: anytype) !void {
     defer arena.deinit();
     const a = arena.allocator();
     var s: expr.Scratch = .{};
-    expr.compileAll(lines.ngspice, a, &s, text) catch |err| {
+    expr.compileAll(a, &s, text) catch |err| {
         std.debug.print("{s} for `{s}`\n", .{ @errorName(err), text });
         return err;
     };
@@ -282,7 +282,7 @@ fn rawCheck(gpa: std.mem.Allocator, text: []const u8) !void {
     defer arena.deinit();
     const a = arena.allocator();
     var s: expr.Scratch = .{};
-    expr.compileAll(lines.ngspice, a, &s, text) catch |err| switch (err) {
+    expr.compileAll(a, &s, text) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ParseError => return,
     };
@@ -305,7 +305,7 @@ fn compileFold(gpa: std.mem.Allocator, text: []const u8) !void {
         s.consts.deinit(gpa);
         s.names.deinit(gpa);
     }
-    try expr.compileAll(lines.ngspice, gpa, &s, text);
+    try expr.compileAll(gpa, &s, text);
     var stack: std.ArrayList(expr.Val) = .empty;
     defer stack.deinit(gpa);
     _ = try expr.fold(gpa, &stack, s.ops.items, s.consts.items, false, &.{});
@@ -356,14 +356,14 @@ test "expr: a NaN condition takes the true branch, as ngspice-44.2 reads it" {
     const texts = [_][]const u8{ "acosh(0) ? .25 : .5", "ternary_fcn(acosh(0), .25, .5)", try std.mem.replaceOwned(u8, a, seeded, "TERNARY", "ternary_fcn") };
     for (texts) |text| {
         var s: expr.Scratch = .{};
-        try expr.compileAll(lines.ngspice, a, &s, text);
+        try expr.compileAll(a, &s, text);
         const folded = try expr.fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
         try std.testing.expect(folded.known);
         try std.testing.expectEqual(0.25, folded.num);
         try std.testing.expectEqual(0.25, try expr.eval(a, &stack, s.ops.items, s.consts.items, &.{}, null));
     }
     var bare: expr.Scratch = .{};
-    try expr.compileAll(lines.ngspice, a, &bare, try std.mem.replaceOwned(u8, a, seeded, "TERNARY", "ternary"));
+    try expr.compileAll(a, &bare, try std.mem.replaceOwned(u8, a, seeded, "TERNARY", "ternary"));
     try std.testing.expect(!(try expr.fold(a, &stack, bare.ops.items, bare.consts.items, false, &.{})).known);
 }
 
@@ -378,7 +378,7 @@ test "expr: the precedence the printer assumes, by hand" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var s: expr.Scratch = .{};
-        try expr.compileAll(lines.ngspice, arena.allocator(), &s, case[0]);
+        try expr.compileAll(arena.allocator(), &s, case[0]);
         var stack: std.ArrayList(expr.Val) = .empty;
         try std.testing.expectEqual(case[1], (try expr.fold(arena.allocator(), &stack, s.ops.items, s.consts.items, false, &.{})).num);
     }
@@ -387,7 +387,7 @@ test "expr: the precedence the printer assumes, by hand" {
 test "expr: literals read as std.fmt.parseFloat reads them" {
     for (literals) |text| {
         const want = try std.fmt.parseFloat(f64, text);
-        try std.testing.expectEqual(want, lines.ngspice.parseNum(text).?);
+        try std.testing.expectEqual(want, spice_number.spiceNumber(text).?);
     }
 }
 

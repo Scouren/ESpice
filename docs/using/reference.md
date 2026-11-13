@@ -117,7 +117,9 @@ port for `.sp`, `.lin` and `.hblin`. As in ngspice, the port's z0 (default
 50 ohm) sits in series with the source in every analysis, and adds no
 noise: `V1 a 0 dc 1 portnum 1 z0 50` into 50 ohm gives v(a) = 0.5 V. The
 node between z0 and the ideal source publishes as `v(v1#res)`, as in
-ngspice, and z0 has no `.noise` or `.sens` row of its own.
+ngspice, and z0 has no `.noise` or `.sens` row of its own. Two cards on
+one port number make one balanced port for `.sp` and `.lin`, which ngspice
+refuses ([balanced ports](analyses.md#sp)).
 
 ### Controlled sources
 
@@ -281,13 +283,13 @@ teaches them.
 | `ERR`, `ERR1`, `ERR2`, `ERR3` | HSPICE error between two signals |
 | `THD`, `SNR`, `SNDR`, `ENOB`, `SFDR` | on an `.fft` plot, with `NBHARM= MINFREQ= MAXFREQ= BINSIZ=` |
 | `EM_AVG` | electromigration average current |
-| `JITTER` | time interval error of a clock's edges (RMS, peak-to-peak, period): `.jitter tran TRIG v(clk) VAL= [TD=] [RISE\|FALL\|CROSS=]` |
+| `JITTER` | time interval error of a clock's edges (RMS, peak-to-peak, period): `.meas tran name JITTER TRIG v(clk) VAL= [TD=] [RISE\|FALL\|CROSS=]` |
 
 Common keywords: `RISE=`, `FALL=`, `CROSS=` (a count, or `LAST`), `TD=`,
 `FROM=`, `TO=`, `AT=`, `VAL=`, `GOAL=`, `WEIGHT=`, `MINVAL=`. Signals:
 `v(n)`, `v(a,b)`, `i(Vsource)`, `par('expr')`, and in AC `vdb`, `vm`, `vp`,
-`vr`, `vi`. HSPICE's `.check`, `.dout`, `.biaschk`, `.power` and `.jitter`
-are read as measurements too:
+`vr`, `vi`. HSPICE's `.check`, `.dout` and `.biaschk` are read as
+measurements too:
 
 | Card | Reports |
 |---|---|
@@ -298,7 +300,10 @@ are read as measurements too:
 | `.check global_level (hi lo hi_th lo_th)` | the default logic thresholds |
 | `.dout nd [VTH \| VLO VHI] (t s ...)` | states a node fails to hold |
 | `.biaschk 'expr' [max= min= tstart= tstop=]` | stretches of an expression outside its limits |
-| `.power signal [FROM= TO=]` | average, RMS, max and min power |
+
+SpiceRack writes HSPICE's `.power Vx` as four `.meas tran` cards, `AVG`,
+`RMS`, `MAX` and `MIN` of `par('(v(n+)-v(n-))*i(Vx)')`, and `.jitter` as
+`.meas ... JITTER`.
 
 ### Sweeps and statistics { #statistics }
 
@@ -311,8 +316,10 @@ are read as measurements too:
 
 On any analysis card, HSPICE's `SWEEP` tail runs the card once per point:
 `SWEEP DATA=name`, `SWEEP MONTE=n [FIRSTRUN=k]`, `SWEEP MONTE=list(10 20:30)`,
-`SWEEP OPTIMIZE=name RESULTS=m1,m2 MODEL=optmod`. On `.dc`, `DATA=` and
-`MONTE=` work without the word `SWEEP`. ESPice adds
+`SWEEP OPTIMIZE=name RESULTS=m1,m2 MODEL=optmod`. A `.dc` that sweeps no
+source takes `DATA=` or `MONTE=` without the word `SWEEP` (`.dc MONTE=5`);
+after a swept source it needs it (`.dc v1 0 1 0.1 SWEEP MONTE=5`), and the
+card without it is refused. ESPice adds
 `SWEEP MONTE=n SIGMA_SCALE=s1,s2,... FAIL='expr'` on `.tran`, `.ac` and a
 `.dc` with a sweep: scaled-sigma sampling of a rare failure, see
 [analyses](analyses.md#scaled-sigma). `.wcd m1 '>= L1' m2 '<= L2' ...
@@ -365,9 +372,8 @@ is still an error.
 Each has a section in [Analyses](analyses.md):
 
 `.op` `.dc` `.ac` `.tran` `.noise` `.tf` `.sens` `.pz` `.disto` `.four`
-`.fft` `.sp` (`.lin`, `.net`) `.stb` `.lstb` `.pss` (`.sn`, `.snosc`)
-`.pac` (`.snac`) `.pnoise` (`.snnoise`, `.ptdnoise`) `.pxf` (`.snxf`) `.hb`
-(`.hbosc`) `.hbac` `.hbxf` `.hbnoise` `.hblin` `.phasenoise` `.qpss`
-`.envelope` `.matex` `.trannoise` `.mc`
+`.fft` `.sp` (`.lin`, `.net`) `.stb` `.lstb` `.pss` `.pac` `.pnoise`
+(`.ptdnoise`) `.pxf` `.hb` `.hbac` `.hbxf` `.hbnoise` `.hblin`
+`.phasenoise` `.qpss` `.envelope` `.matex` `.trannoise` `.mc`
 `.dcmatch` `.acmatch` `.dcsens` `.dcxf` `.acxf`
-`.dcinc` `.acphasenoise`
+`.dcinc`

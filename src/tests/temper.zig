@@ -62,13 +62,17 @@ fn refusal(source: []const u8) ?anyerror {
     return null;
 }
 
-/// The requested results of `p` in deck order; the slice lives in `a`.
+/// The requested results of `p` in deck order, then those of the runs with
+/// a circuit of their own (`run_results`): the planner rebuilds an `.alter`
+/// or a `.step` point whose values read `temper` (variant_planner.zig
+/// `addAlter`, `load`). The slice lives in `a`.
 fn results(a: std.mem.Allocator, p: *const api.Problem) ![]const api.Result {
     var out: std.ArrayList(api.Result) = .empty;
     for (0..p.query_count()) |i| {
         const id: api.QueryId = @fromBackingInt(@intCast(i));
         if ((try p.query_info(id)).requested) try out.append(a, try p.result(id));
     }
+    try out.appendSlice(a, try p.run_results(a));
     return out.items;
 }
 
@@ -105,11 +109,17 @@ test "temper-2: i(v_test)/i(v_fix) is the temperature at every .dc temp point" {
     defer arena.deinit();
     const r = (try results(arena.allocator(), p))[0];
     try t.expectEqual(@as(usize, 10), r.npoints);
+    // ngspice's default gmin, which each diode stamps across its junction.
+    const gmin = 1e-12;
     for (0..r.npoints) |k| {
         const temp: f64 = @floatFromInt(10 + 10 * k);
-        // The gmin beside each junction moves the ratio by ~6e-10, as in
-        // ngspice 44.2's run of the deck.
-        try t.expectApproxEqRel(temp, try value(r, "i(v_test)", k) / try value(r, "i(v_fix)", k), 1e-8);
+        // Both junctions sit at v(2), so less each one's gmin current the
+        // two currents are T is (e - 1) and is (e - 1): the ratio is T to
+        // rounding, at the solved v(2) and at every Newton iterate alike.
+        // The raw ratio misses T by that gmin term, -5.6e-9 at 10 degC to
+        // -2.4e-8 at 90, in ngspice 44.2's run of this deck as in ESPice's.
+        const g = gmin * try value(r, "v(2)", k);
+        try t.expectApproxEqRel(temp, (try value(r, "i(v_test)", k) - g) / (try value(r, "i(v_fix)", k) - g), 1e-12);
     }
 }
 
@@ -152,19 +162,22 @@ test ".dc temp equals one .op per .temp at each of its points" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const sweep = try deck.solve(temper2 ++ ".dc temp 10 100 30\n.end\n");
+    // Two Newton paths (the sweep warm, the .op cold) to one point, each
+    // stopping within its own update tolerance: at the default reltol
+    // 1e-3 they part by 6e-6 in v(2) at 70 degC (ngspice 44.2's own .dc
+    // temp misses its .op there by 1e-3). Tightened, they agree to 2e-10.
+    const tight = ".options reltol=1e-9 vntol=1e-12 abstol=1e-18\n";
+    const sweep = try deck.solve(temper2 ++ tight ++ ".dc temp 10 100 30\n.end\n");
     defer sweep.deinit();
     const r = (try results(a, sweep))[0];
     try t.expectEqual(@as(usize, 4), r.npoints);
     for (0..r.npoints) |k| {
         const temp = 10 + 30 * k;
-        const op = try deck.solve(try a.print("{s}.temp {d}\n.op\n.end\n", .{ temper2, temp }));
+        const op = try deck.solve(try a.print("{s}{s}.temp {d}\n.op\n.end\n", .{ temper2, tight, temp }));
         defer op.deinit();
         const want = (try results(a, op))[0];
-        // Two Newton paths (the sweep warm, the .op cold) to one point,
-        // each stopping within its own update tolerance.
         for ([_][]const u8{ "v(2)", "i(v_test)", "i(v_fix)" }) |name|
-            try t.expectApproxEqRel(try value(want, name, 0), try value(r, name, k), 1e-6);
+            try t.expectApproxEqRel(try value(want, name, 0), try value(r, name, k), 1e-8);
     }
 }
 

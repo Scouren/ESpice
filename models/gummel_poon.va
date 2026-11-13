@@ -9,7 +9,8 @@
 //
 // Topology: C-RC-ci, B-Rbb'-bi, E-RE-ei, substrate S. Junction voltages live
 // on the primed nodes; the extrinsic BC cap sits outside RB. Currents and
-// voltages are in the npn frame, so PNP is type = -1.
+// voltages are in the npn frame, so PNP is type = -1, except the substrate
+// junction's, which are in type*subs's (S to c' vertical, S to b' lateral).
 //
 // Conductances are not written out: each is the derivative of a contributed
 // current, so the AD Jacobian is the stamp. pnjlim is applied through $limit
@@ -209,7 +210,7 @@ module gummel_poon(c, b, e, s);
     real ise_x, isc_x, is_t, ise_t, isc_t, iss_t, bf_t, br_t;
     real nf_t, nr_t, ne_t, nc_t, ns_t, tf_t, tr_t, itf_t, mje_t, mjc_t, mjs_t;
     real pbo, gold, gnew, pe_t, cje_t, pc_t, cjc_t, ps_t, cjs_t;
-    real ai, abc, asb, vert, areab_x, areac_x, inv_vaf, inv_var, inv_ikf, inv_ikr;
+    real ai, abc, asb, vert, stype, areab_x, areac_x, inv_vaf, inv_var, inv_ikf, inv_ikr;
     real rbtot, rbpr, rbpi, rbb, zc, tanz, xjrb, rc_t, re_t, rbm_x;
     real vbx, vsub, vcrit, cbe, cben, cbc, cbcn, cdsub;
     real q1, q2, qb, td, icc, icn, ibn, argtf, tmp;
@@ -339,6 +340,10 @@ module gummel_poon(c, b, e, s);
         if ($param_given(subs)) begin
             if (subs > 0) vert = 1.0;
         end else if (type > 0) vert = 1.0;
+        // The substrate junction runs in ttype = type*subs's frame
+        // (bjtload.c:139, 185-187): S to c' vertical, S to b' lateral, so a
+        // lateral pnp's p substrate on its n base is forward for V(S) > V(b').
+        stype = type * (2.0 * vert - 1.0);
         areab_x = area;
         areac_x = area;
         if ($param_given(areab)) areab_x = areab;
@@ -382,7 +387,7 @@ module gummel_poon(c, b, e, s);
         vbc = type * $limit(V(bi, ci), "pnjlim", vt, vcrit, type);
         // vbx/vsub stay raw, as in bjtload.c; both feed clamped laws only.
         vbx  = type * V(b, ci);
-        vsub = type * (vert * V(s, ci) + (1.0 - vert) * V(s, bi));
+        vsub = stype * (vert * V(s, ci) + (1.0 - vert) * V(s, bi));
 
         // ---- junction currents; GMIN on the leakage/substrate parts --------
         // Each law runs on its tempered emission coefficient (bjtload.c:
@@ -455,10 +460,10 @@ module gummel_poon(c, b, e, s);
         // bjttrunc.c truncates qbe, qbc and qsub, not qbx (nor the excess
         // phase network above).
         (* vera_lte = 0 *) I(b, ci)  <+ type * ddt(qbx);
-        I(s, ci)  <+ vert * type * cdsub;
-        I(s, ci)  <+ vert * type * ddt(qsub);
-        I(s, bi)  <+ (1.0 - vert) * type * cdsub;
-        I(s, bi)  <+ (1.0 - vert) * type * ddt(qsub);
+        I(s, ci)  <+ vert * stype * cdsub;
+        I(s, ci)  <+ vert * stype * ddt(qsub);
+        I(s, bi)  <+ (1.0 - vert) * stype * cdsub;
+        I(s, bi)  <+ (1.0 - vert) * stype * ddt(qsub);
 
         // ---- noise (bjtnoise.c) ---------------------------------------------
         // Currents/conductances here already carry area*m, and ngspice's table
@@ -520,7 +525,7 @@ module gummel_poon(c, b, e, s);
         cpi = -type * ddx(qbe, V(ei));
         cmu = type * ddx(qbc, V(bi));
         cbx = type * ddx(qbx, V(b));
-        capsub = type * ddx(qsub, V(s));
+        capsub = stype * ddx(qsub, V(s));
         ft  = 0.0;
         if (cpi + cmu > 0.0) ft = gm / (2.0 * `M_PI * (cpi + cmu));
         // Unused filter nodes short onto the substrate port so setup can drop

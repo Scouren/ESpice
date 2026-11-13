@@ -102,7 +102,10 @@ those four are HSPICE's numbers.
 `pchan` on the card, makes it P-channel. Where ngspice releases disagree,
 VDMOS follows ngspice 45. THETA degrades the mobility by THETA·(vgs − von),
 as 45 does; 44.2 uses THETA·vgs, which sinks 15% less current at THETA =
-0.1, VTO = 2 V and vgs = 3 V (`noise/ngspice_vdmos_theta.sp`). With RQ and
+0.1, VTO = 2 V and vgs = 3 V (`noise/ngspice_vdmos_theta.sp`). LAMBDA scales the current by 1 + LAMBDA·vds
+on the signed vds, so a reversed channel carries less current, as in ngspice;
+ngspice's gds keeps +LAMBDA's slope there, so its reverse-mode AC and noise
+differ from ESPice's exact slope by twice that term. With RQ and
 VQ given, the drain resistance grows with vds as in ngspice; ngspice reads
 that resistance off the previous iteration, so its AC and noise leave out
 its vds slope, which ESPice keeps. Where a released ngspice has a bug that
@@ -126,6 +129,13 @@ each:
   master take IBV unscaled (45's vdmostemp.c:136), which moves x_bv by
   about NBV·Vt·ln(m), 18 mV at m = 2, and halves the m = 2 breakdown
   current of `op/vdmos_breakdown_m.sp`.
+
+The body diode's breakdown knee x_bv is solved to 1e-9 of IBV, where
+ngspice's vdmostemp.c stops once it is within reltol·IBV (one pass at the
+default reltol) and the junction diode stops where diotemp.c does, so with
+IBV near IS·BV/Vt (IS = 1 nA, BV = 20 V, IBV = 1.5 µA in
+`src/tests/breakdown.zig`) ESPice's VDMOS breakdown current at −BV is 0.1%
+below ngspice's.
 
 The gate-drain charge is the exact integral of ngspice's atan/tanh Cgd law
 (devsup.c:654-665). ngspice instead accumulates q += Δv·(C_n + C_(n−1))/2
@@ -162,6 +172,25 @@ and the card. So is a card whose model is another element's type (a `D`
 card on an `NPN` model), as ngspice's "incorrect model type". ESPice never
 substitutes a different model. P-type MESA (`PMF` at levels 2 to 4) is
 refused too: the model has no polarity parameter.
+
+**Polarity** follows ngspice 44.2. The card's type sets it first: `NMOS`,
+`NPN`, `NJF`, `NMF` and `NHFET` are N; `PMOS`, `PNP`, `PJF`, `PMF`,
+`PHFET`, `VDMOS PCHAN` and `VDMOSP` are P. Each of those type words written
+again on the card is a flag that sets it anew, in card order, and the last
+one wins: `.model m nmos level=1 pmos` is P. A flag counts only where
+ngspice's parameter table for that model holds it. Elsewhere
+(`nmos level=1 npn`, `vdmos pmos`) it warns
+`unrecognized parameter (npn) - ignored` and changes nothing. A `type=` key
+never sets the polarity on these cards. On MOS levels 1, 2, 3, 6 and 9,
+VDMOS, and every BJT, JFET,
+MESFET, MESA and HFET level ngspice has, ngspice drops the model, so the
+card is refused with `UnsupportedCard`. On the other levels it warns and is
+ignored, as is a model's own polarity key that ngspice's table lacks
+(`jtype`, `ztype`, `type_nfet`, `ty`). A polarity key on the instance card
+(`m1 d g s b nm type=-1`) is refused with `UnknownParameter`, as ngspice
+stops on it. A JUNCAP2 diode card's `type=` and a Verilog-A module card's
+(`.model p psp103va type=-1`) are the model's own parameter and set it.
+`.mosra` and a MOSFET's op-vars read the polarity the card bound.
 
 ## Diode self-heating
 
@@ -215,7 +244,8 @@ Divider with a Verilog-A resistor: 3 devices
 `v(out)` is 0.75 V: the 3k Verilog-A resistor under the 1k R1.
 
 `.include` of a file ending in `.va`, `.vams` or `.veriloga` loads it the
-same way, and a Verilog-1364 design (`.v`, `.sv`, or the `.verilog` card)
+same way, from where ngspice finds an include: the working directory first,
+then beside the file that names it. `.hdl` reads beside the deck. A Verilog-1364 design (`.v`, `.sv`, or the `.verilog` card)
 works too. A `.model` card can name the module as its type
 (`.model myres vres r=3k`), and an instance then names the model.
 

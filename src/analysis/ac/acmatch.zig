@@ -62,7 +62,7 @@ const spread_names = [_][]const u8{ "acm_mag", "acm_phase", "acm_re", "acm_im" }
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
-    const sel = try dcmatch.Refs.init(scratch, ckt, opts.variations);
+    const sel = try dcmatch.Refs.init(scratch, ckt, opts.variations, opts.card_names);
     defer sel.deinit(scratch);
 
     const groups = try dcmatch.Groups.init(scratch, sel.refs, sel.vars);

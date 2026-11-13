@@ -20,8 +20,8 @@ Sources, and how they are cited:
 - **VerA 0.23.0**: `zig-pkg/vera-0.23.0-fzAu7BznSAHTovhsbqKB1WQBFu66b65RDnBfVhQi4EF9/`,
   cited as `vera:docs/using/limit.md`.
 - ESPice line numbers are of the working tree on 2026-11-11. Other agents
-  were editing `src/frontend/net_devices.zig`, `src/tests/card_keys.zig` and
-  `src/frontend/ngspice_model_keys.tsv` during this research, so find by
+  were editing `src/frontend/Circuit/net_devices.zig`, `src/tests/card_keys.zig` and
+  `src/frontend/Circuit/ngspice_model_keys.tsv` during this research, so find by
   function name when a line has moved.
 
 ## Summary: what to build, in order
@@ -189,7 +189,7 @@ hack for exactly that.
 
 **Verdict: no usable oracle today.** An implementation matching 44.2 would
 encode two bugs; one matching master has no binary to check against. Keep
-the refusal (`refuseSelfHeating` in `src/frontend/net_devices.zig`, added
+the refusal (`refuseSelfHeating` in `src/frontend/Circuit/net_devices.zig`, added
 this week, already refuses on ngspice's condition). Revisit when an ngspice
 release contains commit `b3594401c` ("VDMOS: fix device polarity,
 self-heating and soft recovery", 2026-08-24); then the design is the
@@ -214,7 +214,7 @@ their own thermal network.
 
 | Model | File | Thermal node | How the card reaches it |
 |---|---|---|---|
-| Mextram 505.6 SH | `models/bjt505t.va` | **port** `dt`, `thermal dt;` (`:139-145`) | 5th node of an `N`/`Q` card whose model kind is `bjt505t` (`src/frontend/spice.zig:163-164`) |
+| Mextram 505.6 SH | `models/bjt505t.va` | **port** `dt`, `thermal dt;` (`:139-145`) | 5th node of an `N`/`Q` card whose model kind is `bjt505t` (`src/frontend/Circuit/spice.zig:163-164`) |
 | PSP 103/104 SH | `models/psp103t.va`, `psp104t.va` | port `dt` (`psp104t.va:2812`, `:2855`) | 5th node, model kind `psp103tva` / `psp104tva` (`spice.zig:151-154`) |
 | VBIC | `models/vbic13_4t.va` | **internal** `dt` (`:790-792`) | none; `sw_et` is forced 0 for a 4-node card (`addSingleDevice`, `net_devices.zig:155-161`) |
 | HICUM/L2, BSIM-BULK, HiSIM-SOTB | `hicumL2_v320.va:1533-1542` etc. | port or internal | model kind |
@@ -408,14 +408,14 @@ One row in `model_variants` (`build.zig:750`):
 
 | File, function | Change |
 |---|---|
-| `src/frontend/spice.zig`, `DeviceId` | Add `diode_t` with a doc comment like `psp103_nqs`'s (`spice.zig:68-70`): the builder swaps it in. No letter, level or kind entry. |
-| `src/frontend/net_devices.zig`, `resolveDeviceId` (`:68-79`) | After the `psp103` block: `if (id == .diode and heatsDiode(dev)) return .diode_t;`. `heatsDiode`: `dev.pins.len == 3`, and the `thermal` word is in `dev.positional[1..]` or `kvNumber(m.kv, "thermal")` is non-zero, and `kvNumber(m.kv, "rth0")` is given and non-zero (`diodefs.h:31-33`; table in section 1). The positional scan already exists in `refuseDroppedTerminals`; factor it out. |
+| `src/frontend/Circuit/spice.zig`, `DeviceId` | Add `diode_t` with a doc comment like `psp103_nqs`'s (`spice.zig:68-70`): the builder swaps it in. No letter, level or kind entry. |
+| `src/frontend/Circuit/net_devices.zig`, `resolveDeviceId` (`:68-79`) | After the `psp103` block: `if (id == .diode and heatsDiode(dev)) return .diode_t;`. `heatsDiode`: `dev.pins.len == 3`, and the `thermal` word is in `dev.positional[1..]` or `kvNumber(m.kv, "thermal")` is non-zero, and `kvNumber(m.kv, "rth0")` is given and non-zero (`diodefs.h:31-33`; table in section 1). The positional scan already exists in `refuseDroppedTerminals`; factor it out. |
 | `net_devices.zig`, `refuseDroppedTerminals` (`:348-360`) | Stop refusing the diode: a plain `diode` with a third pin, or with the flag, runs isothermal as ngspice does (measured). Keep `WrongNodeCount` past three pins and keep the VDMOS arm. `diode_t` has three ports, so it passes on its own. |
 | `net_devices.zig`, `addSingleDevice`, `shape_m` (`:182-183`) | Add `DeviceId.Type(.diode_t)`. Without it a card's `m=2` sets the grading coefficient instead of `$mfactor`. |
-| `src/frontend/opvar_ngspice.zig:193` | `dio` list: add `"diode_t"`, so `@d1[id]` and friends resolve (the SOA decks save `@dth1[id]`). |
-| `tools/ngspice_model_keys.py`, `MAP` and `REVIEWED` | Add `"diode_t": ["dio"]` and copy the two `jtun`/`jtunsw` verdicts; regenerate `src/frontend/ngspice_model_keys.tsv`. Without rows for `diode_t`, a key ESPice does not model (`jtun=1e-5`) would only warn on a self-heated card where it is refused on a plain one. `rth0`/`cth0` need no row for `diode_t` (they are Model fields); `thermal` keeps `*`. |
-| `src/frontend/reader_devices.zig:160-162` | None. `splitTerminals` already puts `tj` in `pins` and `thermal` in `positional`. |
-| `src/frontend/net_lines.zig:242`, `src/espice/calibrate.zig:112`, `src/frontend/spectre_state.zig:58` | None; they build plain diodes. |
+| `src/frontend/Jobs/opvar_ngspice.zig:193` | `dio` list: add `"diode_t"`, so `@d1[id]` and friends resolve (the SOA decks save `@dth1[id]`). |
+| `tools/ngspice_model_keys.py`, `MAP` and `REVIEWED` | Add `"diode_t": ["dio"]` and copy the two `jtun`/`jtunsw` verdicts; regenerate `src/frontend/Circuit/ngspice_model_keys.tsv`. Without rows for `diode_t`, a key ESPice does not model (`jtun=1e-5`) would only warn on a self-heated card where it is refused on a plain one. `rth0`/`cth0` need no row for `diode_t` (they are Model fields); `thermal` keeps `*`. |
+| `src/frontend/Netlist/reader_devices.zig:160-162` | None. `splitTerminals` already puts `tj` in `pins` and `thermal` in `positional`. |
+| `src/frontend/Circuit/net_lines.zig:242`, `src/espice/calibrate.zig:112`, `src/frontend/spectre_state.zig:58` | None; they build plain diodes. |
 | `src/device/traits.zig`, `bypass_models` | None for now (section 3). |
 
 Edge left as is: a third node that nothing else names, on a card that does

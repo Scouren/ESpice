@@ -66,6 +66,14 @@ the first column is then the parameter's name (`.dc wn 1u 4u 1u` writes
 .dc VIN 0 1.8 0.01 VDD 1.6 2.0 0.2
 ```
 
+A single-axis sweep of 32 points or more runs as segments, up to 64, in
+parallel, each from its own cold start two points before its own. The
+values sit within twice the Newton tolerance of the sweep run point to
+point, and are identical at every `--jobs` and lane count. Where a
+segment's cold start finds another solution than the sweep continued to
+(a circuit with hysteresis), the whole sweep reruns point to point, and
+stderr says so (`note: .dc ... reruns whole: at seam ...`).
+
 ### `.tf` { #tf }
 
 ```text
@@ -209,18 +217,19 @@ pattern.
 
 ```text
 .noise v(out[,ref]) [src] dec|oct|lin N fstart fstop [pts]
-.acphasenoise v(out) vin [interval] carrier=f [LIST...=]   over the .ac sweep
 ```
 
 Output noise and input-referred noise over frequency. `src` is a V or I
 source, the input reference. A nonzero `pts` adds each device's
-contribution as a column. Two plots: `Noise Spectral Density
+contribution as a column; a resistor with `noisy=0` (or `noise=0`) is
+quiet and gets none, as in ngspice. Two plots: `Noise Spectral Density
 Curves` (`onoise_spectrum`, `inoise_spectrum` in V/√Hz, and
 `onoise_<inst>_<generator>`, `onoise_<inst>` with contributions) and
 `Integrated Noise` (`v(onoise_total)`, `v(inoise_total)` in V rms; with an
 I source as the input, `i(inoise_total)` in A rms, as ngspice names it).
-`.acphasenoise` is the same solve read as phase noise (`AC Phase Noise
-Analysis`, `phnoise`). `.sample` folds the spectrum for sampled systems.
+`.sample` folds the spectrum for sampled systems. A phase-domain circuit's
+phase noise in dBc/Hz is 10·log10(onoise²/2); SpiceRack writes HSPICE's
+`.acphasenoise` as this `.noise`.
 
 ```text
 .noise v(out) VIN dec 10 10 10meg 1
@@ -275,17 +284,55 @@ and `DISTORTION - 3rd harmonic`, or with two tones `DISTORTION - IM: f1+f2`,
 ### `.sp`, `.lin`, `.net` { #sp }
 
 ```text
-.sp dec|oct|lin N fstart fstop
-.lin [SPARCALC=1] [NOISECALC=] [GDCALC=] [FORMAT=touchstone] [FILENAME=] [MIXEDMODE2PORT=ss]
+.sp dec|oct|lin N fstart fstop [donoise]
+.lin [SPARCALC=1] [NOISECALC=] [GDCALC=] [FORMAT=touchstone] [FILENAME=] [MIXEDMODE2PORT=xy]
 .net v(out) src [RIN= ROUT=]     .net src [rin]
 ```
 
 S-parameters between the deck's ports. A port is a V card with
-`portnum n z0 Z`, its z0 in series in the circuit as in ngspice; every
-port is single-ended. Plot `SP Analysis`
-with complex `v(S_i_j)` columns. `.lin` and `.net` (HSPICE) run over the
-`.ac` sweep; `.lin` publishes `S(i,j)`, `Y(i,j)` and more. Write
-Touchstone or CITIfile with `--format`.
+`portnum n z0 Z`, its z0 in series in the circuit as in ngspice. The z0
+is inside the card: no `.noise`, `.sens`, `.dcmatch`, `.dcsens` or
+`.acmatch` row and no `--emir` entry of its own. Plot
+`SP Analysis`, in ngspice's block order: `frequency`, the probes of the
+last port's unit drive (the branch currents, then the node voltages with
+each port's `v(<card>#res)`, as in every ESPice plot), then complex
+`v(S_i_j)`, `v(Y_i_j)` and `v(Z_i_j)` columns. `donoise` = 1 adds the
+port noise current correlation `v(Cy_i_j)` (A²/Hz) and, with two ports,
+`v(NF)`, `v(SOpt)`, `v(NFmin)` and `v(Rn)`. Y does not exist for a
+shorted port, nor Z for an open one: those entries are not finite, or
+are the size of rounding, and the run goes on, as in ngspice 44.2
+(measured: two ports on one 100 Ω shunt give Y = nan, two ports across a
+lone series 100 Ω give Z = −4.5e17). `.lin` and `.net` (HSPICE)
+run over the `.ac` sweep; `.lin` publishes `S(i,j)`, `Y(i,j)` and more.
+Write Touchstone or CITIfile with `--format`. `.lin FORMAT=touchstone`
+also writes `<FILENAME or deck name>.s<N>p` where `.save` and `.stim`
+write: beside the `-r` file, else in the working directory.
+
+Two V cards on one port number make one balanced port, ESPice's spelling
+of HSPICE's mixed-mode P element; ngspice 44.2 refuses the deck
+(`Fatal error: vp1_p: duplicate port Index`). The first card in deck order
+is the + leg, and each leg runs against its own n−. The two cards must
+have the same z0 and the same n− (`UnbalancedPort`), and a third card on
+the number is `DuplicatePortNumber`. A balanced port publishes two modes:
+differential, v+ − v− against 2·z0, and common, (v+ + v−)/2 against z0/2.
+They are ordered as HSPICE writes Touchstone: each port's first mode
+(single-ended or differential) in port order, then the balanced ports'
+common modes. The probes come from the last port's drive, its + leg's
+when it is balanced. `MIXEDMODE2PORT=xy` picks port 1's and port 2's mode
+for `.lin`'s H, stability factors and noise: `s` for a single-ended port,
+`d` or `c` for a balanced one. `.hblin` refuses a balanced port.
+
+```spice
+* port 1 balanced across a and b, port 2 single-ended at c: modes d1, s2, c1
+Vp1_p a 0 dc 0 portnum 1 z0 50
+Vp1_n b 0 dc 0 portnum 1 z0 50
+Vp2 c 0 dc 0 portnum 2 z0 50
+Ra a c 50
+Rb b c 50
+Rab a b 100
+.sp dec 10 1meg 1g
+.end
+```
 
 ```spice
 --8<-- "examples/two_port.sp"
@@ -466,8 +513,6 @@ Analysis`.
 .pss f0 [points]
 .pss v(osc) f0guess [points [settle]]      autonomous oscillator
 .pss gfreq tstab oscnob points harms sciter steadycoeff [uic]     ngspice
-.sn TRES=t PERIOD=T  |  .sn TONE=f [NHARMS=n]     HSPICE shooting Newton
-.snosc v(osc) f0guess [points]
 ```
 
 Periodic steady state by shooting Newton at fundamental `f0` (default 256
@@ -494,17 +539,18 @@ fails (`NoPeriodicSteadyState`); ngspice instead publishes its best cycle.
 
 ```text
 .pac f0 dec|oct|lin N fstart fstop
-.pxf f0 dec|oct|lin N fstart fstop
-.snac dec|oct|lin N f1 f2          .snxf v(out) dec|oct|lin N f1 f2
+.pac f0 POI N f1 ... fN
+.pxf [v(out)] f0 dec|oct|lin N fstart fstop
+.pxf [v(out)] f0 POI N f1 ... fN
 ```
 
 Periodic AC: the small-signal response around the PSS orbit, driven by the
 sources' `AC` values. Plot `Periodic AC Analysis`, complex columns
 `tf_h-3` ... `tf_h3`: the transfer to each sideband f + k·f0. `.pxf` is
 the periodic transfer function from every source (`Periodic Transfer
-Function Analysis`, `pxf_h<k>(out)`). Neither card names an output: they
-use the last node the deck names. The HSPICE `.snac`/`.snxf` run at the
-`.sn` card's tone.
+Function Analysis`, `pxf_h<k>(out)`). `.pac` names no output: it uses the
+last node the deck names, and so does `.pxf` without `v(out)`. Both read
+the grid as `.ac` does, `POI` included.
 
 ```text
 .pac 1k dec 4 10 10k
@@ -514,14 +560,17 @@ use the last node the deck names. The HSPICE `.snac`/`.snxf` run at the
 
 ```text
 .pnoise v(out[,ref]) src dec|oct|lin N fstart fstop f0 [sidebands]
-.snnoise v(out) src dec|oct|lin N f1 f2
+.pnoise v(out[,ref]) src POI N f1 ... fN f0 [sidebands]
 .ptdnoise v(out) TIME=t|sweep [TDELTA=] dec|oct|lin N f1 f2
 ```
 
 Noise of a periodically driven circuit, folded from up to `sidebands`
-(default 7) sidebands. Plot `Periodic Noise Analysis`, `pnoise_density`.
-`.ptdnoise` is the time-dependent noise at strobe times (`Periodic
-Time-Dependent Noise Analysis (time=t)`, `ptdnoise_density`).
+(default 7) sidebands. The grid reads as `.ac` does, `POI` included. Plot
+`Periodic Noise Analysis`, `pnoise_density`. `.ptdnoise` is the
+time-dependent noise at strobe times (`Periodic Time-Dependent Noise
+Analysis (time=t)`, `ptdnoise_density`), at the fundamental of the deck's
+first driven `.pss` (`MissingAnalysisCard` without one), as `.hbac` takes
+the `.hb` tone.
 
 ```text
 .pnoise v(out) Vin dec 3 10 10k 1k 3
@@ -531,7 +580,7 @@ Time-Dependent Noise Analysis (time=t)`, `ptdnoise_density`).
 
 ```text
 .hb f0 [harmonics]
-.hb v(osc) f0guess [harmonics]                 autonomous (also .hbosc)
+.hb v(osc) f0guess [harmonics]                 autonomous
 .hb TONES=f1 f2 ... NHARMS=n1 n2 ... [INTMODMAX=m] [SUBHARMS=k] [SS_TONE=i]
 ```
 
@@ -573,7 +622,8 @@ S-parameters of the deck's ports around the `.hb` solution. Plot
 ```
 
 Oscillator phase noise about the autonomous HB solution of the deck's
-`.hbosc` (or the tone given here). Plot `Phase Noise Analysis`, `phnoise`.
+`.hb v(osc) f0guess` (or the tone given here). Plot `Phase Noise Analysis`,
+`phnoise`.
 
 ```text
 .phasenoise v(t) dec 2 1k 1meg

@@ -18,10 +18,14 @@ const expectRefused = deck.expectRefused;
 
 /// KCL's tolerance, × an ammeter's peak, where the device is nonlinear:
 /// the ammeter reads the last Newton linearization and the variable the
-/// device at the accepted solution, which reltol = 1e-3 lets part. A
-/// Python replay of this integrator over ESPice's rows of the RS = 0
-/// diode deck below (before the replay existed) put them 1.4e-5 of the
-/// peak apart.
+/// device at the accepted solution, as ngspice's do. The KCL decks run at
+/// reltol = 1e-6, because 1e-3 parts them past any fixed share of the
+/// peak. ngspice 44.2 on these decks at 1e-3: the diode's cathode 1.24e-2
+/// of the peak from its id with RS = 10 (the internal node's last update
+/// through gd + ag0·cd), a VDMOS's ig 8.5e-4, the Gummel-Poon's ib 2.1e-4
+/// (88% of the branch row's own Newton gate, reltol·|i| + abstol). At
+/// 1e-6: 2.3e-5, 4e-12 and 7.8e-8, the VBIC's ib 4.9e-7, the RS = 0
+/// diode 1.7e-9.
 const newton_tol = 1e-4;
 
 /// KCL's tolerance, × an ammeter's peak, in a linear circuit: the ammeter
@@ -32,7 +36,7 @@ const linear_tol = 1e-9;
 /// 0.2 V so that `@d1[p]` reads its current too. Placeholders: the source
 /// and RS.
 const diode_kcl = "diode tran\nv1 a 0 {s}\nvma a k 0\nd1 k m dm\nvmk m n 0\nvn n 0 dc 0.2\n" ++
-    ".model dm d is=1e-14 rs={s} cjo=10p tt=10n\n.save i(vma) i(vmk) v(k) v(m) @d1[id] @d1[c] @d1[p]\n.tran 0.5n 200n 0 0.5n\n.end\n";
+    ".model dm d is=1e-14 rs={s} cjo=10p tt=10n\n.save i(vma) i(vmk) v(k) v(m) @d1[id] @d1[c] @d1[p]\n.options reltol=1e-6\n.tran 0.5n 200n 0 0.5n\n.end\n";
 
 /// A deck whose device has a 0 V ammeter on every terminal, the variables
 /// that read their currents, and the signs that make each ammeter's
@@ -49,24 +53,35 @@ const Terminal = struct { amm: []const u8, sign: f64 = 1, v: []const u8 };
 const terminal_decks = [_]Kcl{
     .{
         .text = "gummel-poon tran\nvcc vc 0 dc 3\nvmc vc c 0\nvb bb 0 sin(0.7 0.1 10meg)\nvmb bb b 0\nq1 c b e qn\nvme e 0 0\n" ++
-            ".model qn npn is=1e-15 bf=100 br=2 vaf=50 cje=1p cjc=0.5p tf=0.1n tr=5n\n.save i(vmc) i(vmb) i(vme) @q1[ic] @q1[ib] @q1[ie]\n.tran 0.5n 200n 0 0.5n\n.end\n",
+            ".model qn npn is=1e-15 bf=100 br=2 vaf=50 cje=1p cjc=0.5p tf=0.1n tr=5n\n.save i(vmc) i(vmb) i(vme) @q1[ic] @q1[ib] @q1[ie]\n.options reltol=1e-6\n.tran 0.5n 200n 0 0.5n\n.end\n",
         .names = &.{ "@q1[ic]", "@q1[ib]", "@q1[ie]" },
         .ammeters = &.{ "i(vmc)", "i(vmb)", "i(vme)" },
         .signs = &.{ 1, 1, -1 },
     },
     .{
         .text = "vbic tran\nvcc vc 0 dc 3\nvmc vc c 0\nvb bb 0 sin(0.75 0.05 10meg)\nvmb bb b 0\nq1 c b e 0 qv\nvme e 0 0\n" ++
-            ".model qv npn level=4 is=1e-16 cje=1p cjc=0.5p tf=0.1n tr=5n\n.save i(vmc) i(vmb) i(vme) @q1[ic] @q1[ib] @q1[ie]\n.tran 0.5n 200n 0 0.5n\n.end\n",
+            ".model qv npn level=4 is=1e-16 cje=1p cjc=0.5p tf=0.1n tr=5n\n.save i(vmc) i(vmb) i(vme) @q1[ic] @q1[ib] @q1[ie]\n.options reltol=1e-6\n.tran 0.5n 200n 0 0.5n\n.end\n",
         .names = &.{ "@q1[ic]", "@q1[ib]", "@q1[ie]" },
         .ammeters = &.{ "i(vmc)", "i(vmb)", "i(vme)" },
         .signs = &.{ 1, 1, -1 },
     },
     .{
         .text = "vdmos tran\nvd dd 0 dc 2\nvmd dd d 0\nvg gg 0 sin(3 1 10meg)\nvmg gg g 0\nm1 d g s vm1\nvms s 0 0\n" ++
-            ".model vm1 vdmos(kp=0.5 vto=2 lambda=0.01 is=1e-14 cjo=1n cgdmax=1n cgdmin=0.1n cgs=2n)\n.save i(vmg) @m1[ig]\n.tran 0.5n 200n 0 0.5n\n.end\n",
+            ".model vm1 vdmos(kp=0.5 vto=2 lambda=0.01 is=1e-14 cjo=1n cgdmax=1n cgdmin=0.1n cgs=2n)\n.save i(vmg) @m1[ig]\n.options reltol=1e-6\n.tran 0.5n 200n 0 0.5n\n.end\n",
         .names = &.{"@m1[ig]"},
         .ammeters = &.{"i(vmg)"},
         .signs = &.{1},
+    },
+    // P-channel: ngspice's frame is type × the gate's current, so ig is
+    // minus its ammeter (ngspice 44.2 on this deck: |i(vmg) + @m1[ig]| <=
+    // 1.55e-4 A at every point, peak 0.183 A). Red before the bound
+    // polarity labelled it: the card's kind, `vdmos`, read as N.
+    .{
+        .text = "vdmos pchan tran\nvd dd 0 dc -2\nvmd dd d 0\nvg gg 0 sin(-3 1 10meg)\nvmg gg g 0\nm1 d g s vm1\nvms s 0 0\n" ++
+            ".model vm1 vdmos pchan kp=0.5 vto=-2 lambda=0.01 is=1e-14 cjo=1n cgdmax=1n cgdmin=0.1n cgs=2n\n.save i(vmg) @m1[ig]\n.options reltol=1e-6\n.tran 0.5n 200n 0 0.5n\n.end\n",
+        .names = &.{"@m1[ig]"},
+        .ammeters = &.{"i(vmg)"},
+        .signs = &.{-1},
     },
 };
 
@@ -366,7 +381,7 @@ test "in a .tran a capacitor's i and p are its ammeters' at every point under tr
     }
 }
 
-test "in a .tran a BJT's and a VBIC's ic, ib and ie, and a VDMOS's ig, are their ammeters' at every point (#236)" {
+test "in a .tran a BJT's and a VBIC's ic, ib and ie, and an N or P VDMOS's ig, are their ammeters' at every point (#236)" {
     // Oracle: KCL at each terminal at every accepted point, each against
     // its own ammeter's peak. Red before the replay: `@q1[ic]` in a .tran,
     // UnsupportedCard.

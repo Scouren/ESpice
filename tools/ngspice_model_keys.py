@@ -1,4 +1,4 @@
-"""Write src/frontend/ngspice_model_keys.tsv: per ESPice model, every key an
+"""Write src/frontend/Circuit/ngspice_model_keys.tsv: per ESPice model, every key an
 ngspice `.model` card of that device sets, with the value at which ngspice
 computes what it computes with the key absent, whether only noise reads it,
 and ngspice's description of it.

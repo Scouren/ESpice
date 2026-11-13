@@ -261,7 +261,6 @@ pub fn build(b: *Build) void {
     const error_tests_mod = M.make(b.path("src/device/tests/device_errors.zig"), &.{.{ .name = "device_abi", .module = g.abi }});
     error_tests_mod.addObject(b.addObject(.{ .name = "device_errors", .root_module = error_object_mod, .use_llvm = use_llvm }));
 
-    const wfit_mod = M.make(b.path("src/frontend/wfit.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } });
     // src/device/tests/catalog.zig reads models/*.va for their aliases.
     const run_device_tests = t.run(g.tests.device, &.{}, true);
     for (treeFiles(b, &.{"models"})) |f| run_device_tests.addFileInput(f);
@@ -275,9 +274,9 @@ pub fn build(b: *Build) void {
         run_c_api_unit_tests,
         run_exe_tests,
         t.run(g.netlist, &.{}, false),
-        t.run(wfit_mod, &.{}, false),
+        t.run(g.wfit, &.{}, false),
         t.run(g.tests.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
-        // spice.zig and builder.zig's own tests live only in the builder module.
+        // spice.zig and Circuit.zig's own tests live only in the builder module.
         t.run(g.tests.builder, &.{}, true),
         t.run(g.tests.analysis, &.{
             .{ .name = "builder", .module = g.tests.builder },
@@ -370,6 +369,11 @@ pub fn build(b: *Build) void {
     bench.setEnvironmentVariable("ZIG", b.graph.zig_exe); // it always reruns (inherited stdio), so the cloned environment costs no hit
     b.step("bench", "Time and compare ESPice against ngspice, VACASK and Xyce (nix develop .#benchmarking)").dependOn(&bench.step);
 
+    // The reader's golden (compiler-construction rule 9): `nldump --out FILE (--list FILE | DECK...)`
+    // hashes the reader's output per deck; `--reps N` times the parse.
+    const nldump = b.addExecutable(.{ .name = "nldump", .root_module = M.make(b.path("tools/nldump.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } }), .use_llvm = use_llvm });
+    b.step("nldump", "Install nldump, the reader's golden: one hash of the parsed netlist per deck").dependOn(&b.addInstallArtifact(nldump, .{}).step);
+
     checkModuleGraph(b, exe.root_module);
     checkModuleGraph(b, c_api_mod);
 }
@@ -410,6 +414,7 @@ const Graph = struct {
     objs: []*Compile,
     solver: *Module,
     netlist: *Module,
+    wfit: *Module,
     output: *Module,
     measure: *Module,
     /// What ships: the `.hdl` roots by absolute path.
@@ -513,7 +518,9 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options });
     // `.meas` evaluation: output prints it, a transient watches its cards resolve.
     const measure: Import = .{ .name = "measure", .module = c.make(b.path("src/output/measure/root.zig"), &.{core}) };
-    const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/netlist.zig"), &.{core}) };
+    const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/Netlist.zig"), &.{core}) };
+    // The S- and W-element fits: numerics over a data file, no card grammar.
+    const wfit: Import = .{ .name = "wfit", .module = c.make(b.path("src/frontend/fit/wfit.zig"), &.{ core, netlist }) };
     const output = c.make(b.path("src/output/root.zig"), &.{ core, measure });
     var uppers: [2]Upper = undefined;
     for (&uppers, [_]*Module{ hdl_paths.ship, hdl_paths.tests }) |*upper, paths| {
@@ -530,8 +537,8 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
         device.module.link_libc = libc;
         const analysis = c.make(b.path("src/analysis/root.zig"), &.{ .{ .name = "solver", .module = solver }, core, device, gomp, build_options, measure });
         analysis.link_libc = libc;
-        const builder: Import = .{ .name = "builder", .module = c.make(b.path("src/frontend/builder.zig"), &.{ core, device, netlist }) };
-        const frontend = c.make(b.path("src/frontend/prepare.zig"), &.{ core, device, netlist, builder });
+        const builder: Import = .{ .name = "builder", .module = c.make(b.path("src/frontend/Circuit.zig"), &.{ core, device, netlist, wfit }) };
+        const frontend = c.make(b.path("src/frontend/Jobs.zig"), &.{ core, device, netlist, builder });
         upper.* = .{
             .device = device.module,
             .analysis = analysis,
@@ -556,6 +563,7 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
         .objs = objs,
         .solver = solver,
         .netlist = netlist.module,
+        .wfit = wfit.module,
         .output = output,
         .measure = measure.module,
         .ship = uppers[0],
@@ -657,6 +665,7 @@ const restricted_imports = [_]struct { name: []const u8, allowed: []const []cons
     .{ .name = "output", .allowed = &.{"src/espice.zig"} },
     .{ .name = "netlist", .allowed = &.{"src/frontend/"} },
     .{ .name = "builder", .allowed = &.{"src/frontend/"} },
+    .{ .name = "wfit", .allowed = &.{"src/frontend/"} },
     .{ .name = "espice", .allowed = &.{ "src/main.zig", "src/c_api.zig" } },
 };
 
@@ -695,7 +704,9 @@ const HostTest = struct {
         mod.link_objects.appendSlice(self.b.allocator, m.link_objects.items) catch @panic("OOM");
         mod.include_dirs.appendSlice(self.b.allocator, m.include_dirs.items) catch @panic("OOM");
         if (devices) for (self.objs) |o| mod.addObject(o);
-        return b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = self.filters, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
+        const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = self.filters, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
+        b.step(b.fmt("test-{s}", .{checkName(b, root)}), b.fmt("Run {s}'s unit tests alone", .{root})).dependOn(&run_tests.step);
+        return run_tests;
     }
 
     fn copy(self: HostTest, m: *Module, extra: []const Import) *Module {

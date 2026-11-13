@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const analysis = @import("analysis");
 const core = @import("core");
 const output = @import("output");
@@ -207,10 +208,10 @@ fn deliverOne(self: *Problem, session: *const Session, id: QueryId) DeliveryErro
         var lap = Problem.lapStart(self.io, self.session.config.timing_in_depth);
         defer Problem.timingLap(self.io, &lap, "output delivery");
         const job = try session.query(id);
-        // An `.sp` carries its ports' z0, which a Touchstone output records (#60).
+        // An `.sp` carries its modes' z0, which a Touchstone output records (#60).
         var z0: std.ArrayList(f64) = .empty;
         defer z0.deinit(self.gpa);
-        if (job == .sp) for (job.sp.ports) |p| try z0.append(self.gpa, p.z0);
+        if (job == .sp) try modeZ0(self.gpa, job.sp.ports, &z0);
         const plot: output.Plot = .{ .title = session.deck.title, .result = res, .z0 = z0.items };
         try self.delivery.publish(self.io, plot);
         if (job == .sp) if (job.sp.lin) |lin| if (lin.touchstone) try writeTouchstone(self, lin.file, plot);
@@ -219,14 +220,26 @@ fn deliverOne(self: *Problem, session: *const Session, id: QueryId) DeliveryErro
     return true;
 }
 
-/// Writes a `.lin format=touchstone` result as `<file>.s<N>p` beside the
-/// deck, `file` defaulting to the deck's name without its extension (HSPICE
-/// names it after the netlist), against the ports' own z0.
+/// Appends the reference impedance of each of `ports`' modes to `z0`, in
+/// sp_basis.zig's order: each port's first mode (a balanced one's
+/// differential, 2·z0), then the balanced ports' common modes (z0/2).
+fn modeZ0(gpa: Allocator, ports: []const requests.Port, z0: *std.ArrayList(f64)) Allocator.Error!void {
+    const before = z0.items.len;
+    for (ports) |p| try z0.append(gpa, if (p.balanced != null) 2 * p.z0 else p.z0);
+    for (ports) |p| if (p.balanced != null) try z0.append(gpa, p.z0 / 2);
+    assert(z0.items.len - before >= ports.len);
+}
+
+/// Writes a `.lin format=touchstone` result as `<file>.s<N>p` in
+/// `Problem.out_dir`, beside the output file as `.save` and `.stim` write
+/// theirs (deck_files.zig), never beside the deck, which under SpiceRack is
+/// the kit the CLI deletes. `file` defaults to the deck's name without its
+/// extension (HSPICE names it after the netlist). Against the ports' own z0.
 fn writeTouchstone(self: *Problem, file: []const u8, plot: output.Plot) !void {
     const stem = if (file.len > 0) file else std.fs.path.stem(self.origin);
     const name = try std.fmt.allocPrint(self.gpa, "{s}.s{d}p", .{ stem, @max(plot.z0.len, 1) });
     defer self.gpa.free(name);
-    const path = try std.fs.path.join(self.gpa, &.{ std.fs.path.dirname(self.origin) orelse ".", name });
+    const path = try std.fs.path.resolve(self.gpa, &.{ self.out_dir, name });
     defer self.gpa.free(path);
     try output.write(self.io, path, .touchstone, plot);
 }

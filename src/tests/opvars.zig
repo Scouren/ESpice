@@ -8,6 +8,18 @@
 //! ngspice's regression/misc/bugs-2.sp), and ngspice-45 goldens for the
 //! examples/various *_ac_par.sp decks. Each refusal is a name ngspice
 //! answers with a number ESPice cannot produce, or no name at all.
+//!
+//! The `.dc` KCL decks run at reltol = 1e-6, because at 1e-3 a sweep's
+//! ammeter is no 1e-6 oracle at its second point. ngspice predicts that
+//! point from the first alone (dctrcurv.c:457-462 copies state0 into
+//! state1). It then accepts the confirming iteration and returns the
+//! iterate it linearized at (niiter.c), whose branch currents the solve
+//! before wrote: the first point's tangent, (0.2 mV / vt)^2 / 2 = 3e-5
+//! under the diode's exponential. ngspice 44.2 prints the diode deck's
+//! i(vm) 8.127539373902e-05 against @d1[id] 8.127781110136e-05 there,
+//! which are ESPice's two numbers to every printed digit. At reltol = 1e-6
+//! the confirming iteration converges the branch row too, and ngspice's
+//! gap is 0 at all 101 points.
 const std = @import("std");
 const api = @import("espice");
 const deck = @import("deck.zig");
@@ -174,6 +186,7 @@ test "a diode's @d1[id] is the ammeter's current, gd and cd the central differen
         \\d1 k 0 dm
         \\.model dm d is=1e-14 n=1 cjo=1p tt=1n
         \\.save i(vm) @d1[id] @d1[c] @d1[gd] @d1[cd] @d1[qd] @d1[charge] @d1[vd]
+        \\.options reltol=1e-6
         \\.dc v1 0.59 0.61 0.0002
         \\.end
         \\
@@ -202,7 +215,7 @@ test "a Gummel-Poon BJT's ic, ib and ie are its ammeters' currents, gm, gpi and 
     // them. ie is -(ic + ib) less the gmin-sized substrate current.
     // Red before #236: `q1 has no variable 'ic'`, UnsupportedCard.
     const body = "bjt opvars\nvc c 0 dc 3\nvb b 0 dc 0.7\nq1 c b 0 qn\n.model qn npn is=1e-15 bf=100 br=2 vaf=50\n" ++
-        ".save i(vc) i(vb) @q1[ic] @q1[ib] @q1[ie] @q1[gm] @q1[gpi] @q1[go] @q1[vbe] @q1[vbc]\n{s}\n.end\n";
+        ".save i(vc) i(vb) @q1[ic] @q1[ib] @q1[ie] @q1[gm] @q1[gpi] @q1[go] @q1[vbe] @q1[vbc]\n.options reltol=1e-6\n{s}\n.end\n";
     var buf: [512]u8 = undefined;
     for ([_][]const u8{ ".dc vb 0.69 0.71 0.0002", ".dc vc 2.9 3.1 0.01" }, 0..) |sweep, by_vc| {
         const p = try deck.solve(try std.fmt.bufPrint(&buf, body, .{sweep}));
@@ -302,7 +315,7 @@ test "a VDMOS's @m1[id] is its channel's: the drain ammeter is id - idio; gm, gd
     // a 10 mV difference; cds = dqdio/dvd of the body diode, whose voltage
     // is -V_DS. Red before #236: `m1 has no variable 'idio'`, UnsupportedCard.
     const body = "vdmos opvars\nvd dd 0 dc 2\nvm dd d 0\nvg g 0 dc {d}\nm1 d g 0 vm1\n.model vm1 vdmos(kp=0.5 vto=2 lambda=0.01 is=1e-14 cjo=1n)\n" ++
-        ".save i(vm) @m1[id] @m1[idio] @m1[gm] @m1[gds] @m1[vgs] @m1[vds] @m1[cds] @m1[qdio]\n{s}\n.end\n";
+        ".save i(vm) @m1[id] @m1[idio] @m1[gm] @m1[gds] @m1[vgs] @m1[vds] @m1[cds] @m1[qdio]\n.options reltol=1e-6\n{s}\n.end\n";
     const Case = struct { vg: f64, sweep: []const u8, by: enum { vg, vd, diode } };
     const cases = [_]Case{
         .{ .vg = 3, .sweep = ".dc vg 2.9 3.1 0.01", .by = .vg },
@@ -341,8 +354,13 @@ test "a VBIC's ic, ib and ie are its ammeters' currents, gm and gpi dIc and dIb 
     // differences of the terminal currents with V_BC held by a source from
     // c to b and no series resistance, no avalanche and no parasitic
     // transistor, so every collector and base current but the transport
-    // and B-E ones is fixed (vbicask.c:117-128). Red before #236: `q1 has
-    // no variable 'ic'`, UnsupportedCard.
+    // and B-E ones is fixed (vbicask.c:117-128). vbe and vbc are the
+    // junctions' own, V(bi,ei) and V(bi,ci), as ngspice's are (ngspice
+    // 44.2 prints 0.6899999615 at the first point): the VA keeps each
+    // zero resistance a 1 mOhm floor (vbic13_4t.va:1343-1349), at most
+    // two on a terminal's path, so they sit within 2 mOhm x the terminal
+    // currents of the sources' values, never on them. Red before #236:
+    // `q1 has no variable 'ic'`, UnsupportedCard.
     const p = try deck.solve(
         \\vbic opvars
         \\vb b 0 dc 0.7
@@ -351,6 +369,7 @@ test "a VBIC's ic, ib and ie are its ammeters' currents, gm and gpi dIc and dIb 
         \\q1 c b e 0 qv
         \\.model qv npn level=4 is=1e-16
         \\.save i(vb) i(vbc) i(ve) @q1[ic] @q1[ib] @q1[ie] @q1[gm] @q1[gpi] @q1[vbe] @q1[vbc]
+        \\.options reltol=1e-6
         \\.dc vb 0.69 0.71 0.0002
         \\.end
         \\
@@ -360,11 +379,15 @@ test "a VBIC's ic, ib and ie are its ammeters' currents, gm and gpi dIc and dIb 
     try t.expect(r.npoints >= 3);
     for (0..r.npoints) |k| {
         // KCL: Ic = -i(vbc), Ib = i(vbc) - i(vb), Ie = -i(ve).
-        try t.expectApproxEqRel(-(try at(r, k, "i(vbc)")), try at(r, k, "@q1[ic]"), 1e-6);
-        try t.expectApproxEqRel(try at(r, k, "i(vbc)") - try at(r, k, "i(vb)"), try at(r, k, "@q1[ib]"), 1e-6);
-        try t.expectApproxEqRel(-(try at(r, k, "i(ve)")), try at(r, k, "@q1[ie]"), 1e-6);
-        try t.expectApproxEqRel(r.data[k * r.varnames.len], try at(r, k, "@q1[vbe]"), 1e-12);
-        try t.expectApproxEqRel(@as(f64, -2), try at(r, k, "@q1[vbc]"), 1e-12);
+        const ic = -(try at(r, k, "i(vbc)"));
+        const ib = try at(r, k, "i(vbc)") - try at(r, k, "i(vb)");
+        const ie = -(try at(r, k, "i(ve)"));
+        try t.expectApproxEqRel(ic, try at(r, k, "@q1[ic]"), 1e-6);
+        try t.expectApproxEqRel(ib, try at(r, k, "@q1[ib]"), 1e-6);
+        try t.expectApproxEqRel(ie, try at(r, k, "@q1[ie]"), 1e-6);
+        const floors = 2e-3 * (@abs(ic) + @abs(ib) + @abs(ie));
+        try t.expectApproxEqAbs(r.data[k * r.varnames.len], try at(r, k, "@q1[vbe]"), floors);
+        try t.expectApproxEqAbs(@as(f64, -2), try at(r, k, "@q1[vbc]"), floors);
         if (k == 0 or k + 1 == r.npoints) continue;
         try t.expectApproxEqRel(-(try slope(r, k, "i(vbc)")), try at(r, k, "@q1[gm]"), 1e-4);
         try t.expectApproxEqRel(try slope(r, k, "i(vbc)") - try slope(r, k, "i(vb)"), try at(r, k, "@q1[gpi]"), 1e-4);

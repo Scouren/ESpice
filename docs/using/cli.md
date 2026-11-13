@@ -95,23 +95,25 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
   apart from ESPice's. The single-dash spelling `-tokenizer=hspice` works
   too. Without it, ESPice reads the deck's own file (not its includes)
   and picks Spectre for a `simulator lang=` line or a `name (nodes)
-  master` instance, HSPICE for a card or keyword ngspice lacks (`.data`,
-  `.alter`, `.variation`, `.lin`, `.net`, `.fft`, `.stim`, `.check`,
-  `.connect`, `.load`, `.sn`, `.ptdnoise`, `SWEEP DATA=`/`MONTE=`/`OPTIMIZE=`,
-  `.lib 'file' section`, a `PORT=` element, a W element's `RLGCMODEL=`, ...),
-  and ngspice otherwise, with a note on stderr when it is not ngspice. It
-  never picks LTspice, Xyce or VACASK. An HSPICE deck written only in
-  ngspice syntax still reads as ngspice, whose defaults differ (TNOM 27
-  instead of 25): name `--tokenizer=hspice` for it, and
-  `--tokenizer=ngspice` to read a deck with HSPICE cards as written. See
-  [Dialects](dialects.md).
+  master` instance, HSPICE for a spelling both ESPice and ngspice 44.2
+  refuse (`.dcvolt`, `.temperature`, `.sn`, `.snac`, `.snnoise`, `.snxf`,
+  `.snosc`, `.hbosc`, `.acphasenoise`, `.power`, `.stimuli`, `.jitter`,
+  `.dc ... START=`, a `P` card's `PORT=`, an `E` or `G` card's `SCALE=`,
+  `MAX=`, `MIN=` or `ABS=`), and ngspice otherwise, with a
+  note on stderr when it is not ngspice. It never picks LTspice, Xyce or
+  VACASK. An HSPICE deck that runs as written, ESPice's own HSPICE cards
+  (`.data`, `.alter`, `.lin`, ...) included, reads as ngspice, whose
+  defaults differ (TNOM 27 instead of 25): name `--tokenizer=hspice` for
+  it, and `--tokenizer=ngspice` to read a deck with HSPICE cards as
+  written. See [Dialects](dialects.md).
 
 `--spicerack=PATH`
 : The `spice2rack` binary that translates a deck in another dialect;
   default `$ESPICE_SPICERACK`, else `spice2rack` on `PATH`. It runs as
   `spice2rack --dialect D --to espice --kit -o DIR DECK` into a fresh
   directory under `$TMPDIR`, deleted when the deck ends. A missing binary
-  is `SpiceRackNotFound`, a refused deck `SpiceRackFailed`; the deck is
+  is `SpiceRackNotFound`, a refused deck `SpiceRackRefused`, a crash or
+  any other failure `SpiceRackFailed`; the deck is
   never read as ngspice instead. Two lines on stderr time it:
   `espice: spicerack translated DECK (D -> ngspice, N files) in S s`, then
   `espice: finished DECK in S s, plus S s in spicerack`.
@@ -119,6 +121,8 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
 `--vpi=APP`
 : Load the VPI application `APP`, a shared library exporting
   `vlog_startup_routines` (LRM 12.33.2), before the deck's `.hdl` models.
+  `APP` is a file path, from the working directory when relative
+  (`--vpi app.so` is `./app.so`), never a library-path search.
   Its analog system functions answer the models' `$name` calls. Repeat it
   for several applications; a deck adds its own with `.options vpi=`. See
   [VPI applications](devices.md#vpi-applications).
@@ -292,7 +296,7 @@ failed points' values as NaN, then the error.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ESPICE_THREADS` | 1 | worker threads for device evaluation; results are byte-identical at any count |
+| `ESPICE_THREADS` | 1 | worker threads for device evaluation, at most: a circuit too small to keep them busy uses fewer. Results are byte-identical at any count |
 | `ESPICE_SOLVER_THREADS` | 1 | threads for the bordered-block-diagonal matrix factorization, at most 16 |
 | `ZIG` | `zig` on `PATH` | the Zig compiler `.hdl` uses to build Verilog-A models at run time |
 | `ESPICE_CACHE` | see below | cache directory for compiled `.hdl` models (`$ESPICE_CACHE/hdl`) |

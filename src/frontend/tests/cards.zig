@@ -2,7 +2,7 @@
 //! test, each expected value worked by hand from the card's manual
 //! semantics (cited per test), with the boundary and refusal of each form.
 const std = @import("std");
-const netlist = @import("../netlist.zig");
+const netlist = @import("../Netlist.zig");
 const Netlist = netlist.Netlist;
 
 fn device(nl: Netlist, name: []const u8) !Netlist.View {
@@ -124,6 +124,24 @@ test "HSPICE sweep tails: lin by count, poi by list, .dc over a bare .param (#94
         "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p bogus 3 1 2\n",
         "t\nr1 a 0 1\n.tran 1n 10n sweep data=d extra\n",
         "t\nr1 a 0 1\n.tran 1n 10n sweep\n",
+    });
+}
+
+test "HSPICE .dc: a bare MONTE= or DATA= is the whole sweep; after a swept source it needs SWEEP [CR .DC]" {
+    // The manual's forms: `.DC MONTE=val`, `.DC DATA=name` and
+    // `.DC var start stop incr SWEEP MONTE=val`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var nl = try netlist.parse(a, "t\nv1 a 0 1\nr1 a 0 1\n.dc monte=5\n");
+    try std.testing.expectEqual(@as(usize, 0), nl.deck.analyses[0].args.len);
+    try std.testing.expectEqual(@as(u32, 5), nl.deck.analyses[0].sweep.monte.n);
+    nl = try netlist.parse(a, "t\nv1 a 0 1\nr1 a 0 1\n.dc v1 1 1 1 sweep monte=5\n");
+    try std.testing.expectEqual(@as(usize, 4), nl.deck.analyses[0].args.len);
+    try std.testing.expectEqual(@as(u32, 5), nl.deck.analyses[0].sweep.monte.n);
+    try expectRefused(error.UnsupportedCard, &.{
+        "t\nv1 a 0 1\nr1 a 0 1\n.dc v1 1 1 1 monte=5\n",
+        "t\nv1 a 0 1\nr1 a 0 1\n.data d\nx\n1\n.enddata\n.dc v1 0 1 0.1 data=d\n",
     });
 }
 
@@ -287,7 +305,26 @@ test ".meas PARAM= folds each part that reads no result; an unreadable card refu
     });
     try expectRefused(error.ParseError, &.{
         "t\nv1 p 0 1\nr1 p 0 1\n.tran 1u 1m\n.meas tran a frob v(p)\n.end\n",
-        "t\nv1 p 0 1\nr1 p 0 1\n.tran 1u 1m\n.power\n.end\n",
+    });
+}
+
+// Oracle: the keyword rule (one spelling per capability) and ngspice 44.2,
+// which stops on each card ("unimplemented dot command", measured). Each
+// only renamed a card ESPice reads: `.pss`, `.pac`, `.pnoise`, `.pxf`,
+// `.pss v(osc)`, `.hb v(osc)`, `.noise`, `.meas`, `.stim`, `.meas jitter`.
+test "HSPICE spellings of ngspice and ESPice cards are unknown cards" {
+    const base = "t\nv1 a 0 sin(0 1 1meg) ac 1\nr1 a 0 1k\n";
+    try expectRefused(error.UnsupportedCard, &.{
+        base ++ ".sn tres=10n period=1u\n.end\n",
+        base ++ ".pss 1meg 100\n.snac dec 2 1k 10k\n.end\n",
+        base ++ ".pss 1meg 100\n.snnoise v(a) v1 dec 2 1k 10k\n.end\n",
+        base ++ ".pss 1meg 100\n.snxf v(a) dec 2 1k 10k\n.end\n",
+        base ++ ".snosc v(a) 1meg 64\n.end\n",
+        base ++ ".hbosc v(a) 1meg 7\n.end\n",
+        base ++ ".ac dec 2 1k 10k\n.acphasenoise v(a) v1 carrier=1g\n.end\n",
+        base ++ ".tran 1n 2u\n.power v1 from=0 to=1u\n.end\n",
+        base ++ ".tran 1n 2u\n.stimuli pwl v(a)\n.end\n",
+        base ++ ".tran 1n 2u\n.jitter tran trig v(a) val=0 td=50n\n.end\n",
     });
 }
 
@@ -519,6 +556,17 @@ test "parseAnalyses takes analysis cards only (#64)" {
     for ([_][]const u8{ "r1 a 0 1\n", ".temp 27\n", ".foo 1\n", ".param p=1\n", ".model m d\n" }) |text|
         try std.testing.expectError(error.UnsupportedDirectiveMutation, netlist.parseAnalyses(a, text, Lookup{}));
     try std.testing.expectEqual(@as(usize, 0), (try netlist.parseAnalyses(a, "", Lookup{})).len);
+}
+
+test "a card keeps the deck's spelling next to a card joined from + lines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Oracle: the deck's own bytes. The joined `.model` moves its text, so
+    // the cards around it must still be found where the deck has them,
+    // whatever the title line's length.
+    const nl = try netlist.parse(arena.allocator(), "A Title Longer Than The Cards Below It\n.OPTION NOACCT\n.TRAN 1N 10N\n.MODEL dm D IS=1e-14\n+ N=1\nd1 a 0 dm\nv1 a 0 1\n");
+    try std.testing.expectEqualStrings(".TRAN 1N 10N", nl.deck.analyses[0].line);
+    try std.testing.expectEqualStrings(".OPTION NOACCT", nl.deck.config[0].line);
 }
 
 fn parseAnalysesAll(gpa: std.mem.Allocator) !void {

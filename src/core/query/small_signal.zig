@@ -7,7 +7,7 @@
 //! HSPICE [CR .SAMPLE, .LIN, .NET, .STB]; VACASK `acstb`.
 //!
 //! Contents:
-//! - `pub const Port = struct`, `Port.Band`, `Port.no_branch`
+//! - `pub const Port = struct`, `Port.Leg`, `Port.Band`, `Port.no_branch`
 //! - `pub const Ac = struct`
 //! - `pub const Noise = struct`, `pub const NoiseSample = struct`
 //! - `pub const Sp = struct`, `Sp.Lin = struct`
@@ -37,6 +37,15 @@ pub const Port = struct {
     /// The band `.hblin` reads this port in (the V card's `hblin_h=` and
     /// `hblin_s=`): sign·f + harmonic·f0 for input frequency f.
     band: Band = .{},
+    /// A balanced port's − leg: the second portnum V card on this port
+    /// number, `node`/`neg`/`branch` being the first card's + leg. Each leg
+    /// has this z0 in series and is read against its own `neg`; the port's
+    /// modes are differential, v+ − v− against 2·z0, and common,
+    /// (v+ + v−)/2 against z0/2 [SA Ch.17]. Null for a single-ended port.
+    balanced: ?Leg = null,
+
+    /// Node rows and branch row of a balanced port's − leg.
+    pub const Leg = struct { node: u32, neg: u32, branch: u32 };
 
     /// `branch` of a port with no source branch, which `.net` drives with
     /// a current into `node`.
@@ -52,8 +61,7 @@ pub const Ac = struct {
     sweep: FreqSweep,
 };
 
-/// Small-signal noise at one output over a sweep (`.noise`, HSPICE
-/// `.acphasenoise`).
+/// Small-signal noise at one output over a sweep (`.noise`).
 pub const Noise = struct {
     tol: Tolerances = .{},
     out_node: u32,
@@ -77,12 +85,14 @@ pub const Noise = struct {
     /// Card names for the contribution columns. An unnamed instance falls
     /// back to `<type>#<ordinal>`.
     card_names: CardNames = .empty,
+    /// The quiet resistors (`noisy=0`), as an existence table: an instance
+    /// it names publishes no contribution column, as ngspice's resnoise.c:57
+    /// skips it. Its generator is zero (resistor.va scales it by `noisy`),
+    /// so the totals are the same either way.
+    quiet: CardNames = .empty,
     /// HSPICE `.sample`: also publish the output noise folded by a sampler
     /// (`onoise_sampled`); spectrum queries only.
     sample: ?NoiseSample = null,
-    /// HSPICE `.acphasenoise`: the output is a phase in radians, published
-    /// as phase noise `phnoise` in dBc/Hz instead of the noise curves.
-    phase: bool = false,
 };
 
 /// HSPICE `.sample FS= [MAXFLD=] [BETA=]` [CR .SAMPLE]: noise sampled at
@@ -128,6 +138,10 @@ pub const Sp = struct {
         touchstone: bool = false,
         /// `filename=`; empty is the deck's file name without extension.
         file: []const u8 = "",
+        /// `mixedmode2port=`: whether port 1's and port 2's mode in the
+        /// two-port measurements (H, stability, noise) is its common mode
+        /// (`c`) rather than its first one (`s` or `d`).
+        common: [2]bool = .{ false, false },
     };
 };
 

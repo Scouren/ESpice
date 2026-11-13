@@ -53,10 +53,11 @@ pub const Pss = struct {
     gmres_max_restarts: u32 = 10,
     /// Relative tolerance of the inner GMRES solve.
     gmres_tol: f64 = 1e-3,
-    /// Oscillator node row of an autonomous solve (`.snosc`). The period is
-    /// then an unknown and `period` only its first guess, and this node's
-    /// value at t = 0 is pinned as the phase condition. GROUND means a
-    /// driven circuit with a known period, unless `phase_node` picks one.
+    /// Oscillator node row of an autonomous solve (`.pss v(osc) f`). The
+    /// period is then an unknown and `period` only its first guess, and
+    /// this node's value at t = 0 is pinned as the phase condition. GROUND
+    /// means a driven circuit with a known period, unless `phase_node`
+    /// picks one.
     osc_node: u32 = 0,
     /// Where an autonomous solve's phase node comes from: `osc_node`, or,
     /// with `osc_node` GROUND, the non-ground net with the largest swing
@@ -81,7 +82,7 @@ pub const Pss = struct {
 };
 
 /// Periodic or quasi-periodic steady state by harmonic balance (`.hb`;
-/// autonomous `.hbosc` with `osc_node`).
+/// autonomous `.hb v(osc) f` with `osc_node`).
 pub const Hb = struct {
     tol: Tolerances = .{},
     /// Fundamental, in Hz.
@@ -89,10 +90,10 @@ pub const Hb = struct {
     n_harmonics: u16 = 8,
     max_iter: u16 = 200,
     hb_tol: f64 = 1e-9,
-    /// Oscillator node row of an autonomous solve (`.hbosc`): f0 is then an
-    /// unknown seeded from the oscillator's shooting orbit, and this node's
-    /// fundamental is held a pure cosine as the phase condition. GROUND
-    /// means a driven circuit with a known f0.
+    /// Oscillator node row of an autonomous solve (`.hb v(osc) f`): f0 is
+    /// then an unknown seeded from the oscillator's shooting orbit, and
+    /// this node's fundamental is held a pure cosine as the phase
+    /// condition. GROUND means a driven circuit with a known f0.
     osc_node: u32 = 0,
     /// Tones after `f0`, HSPICE `.hb TONES=f0 f1 ...` [CR .HB]; empty for
     /// one tone. Driven only.

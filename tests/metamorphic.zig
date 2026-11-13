@@ -154,8 +154,10 @@ fn isGround(node: []const u8) bool {
 /// the rewrite has nothing to act on.
 pub fn rewrite(a: Allocator, src: []const u8, kind: Kind) Allocator.Error!?Variant {
     const cs = try cards(a, src) orelse return null;
-    // `.options rshunt` shunts every node, a split's new one too, and no scale reaches it.
-    if ((kind == .split or kind == .scale) and setsOption(cs, "rshunt")) return null;
+    // `.options rshunt`, `gshunt` and `cshunt` shunt every node, a split's
+    // new one too, and no scale reaches them.
+    const shunted = setsOption(cs, "rshunt") or setsOption(cs, "gshunt") or setsOption(cs, "cshunt");
+    if ((kind == .split or kind == .scale) and shunted) return null;
     const title_end = std.mem.indexOfScalar(u8, src, '\n') orelse return null;
     var v: Variant = .{ .kind = kind, .text = "" };
     var out: std.ArrayList(u8) = .empty;
@@ -288,6 +290,8 @@ test "each rewrite keeps the relation it states" {
     const shunted = "t\nVin in 0 10\nR1 in out 1k\nC1 out 0 1p\n.options rshunt=1k\n.op\n.end\n";
     try testing.expectEqual(null, try rewrite(a, shunted, .split));
     try testing.expectEqual(null, try rewrite(a, shunted, .scale));
+    try testing.expectEqual(null, try rewrite(a, "t\nVin in 0 10\nR1 in out 1k\n.option gshunt=1e-3\n.op\n", .split));
+    try testing.expectEqual(null, try rewrite(a, "t\nVin in 0 10\nR1 in out 1k\n.options cshunt=1p\n.tran 1n 10n\n", .split));
     // Out of scope: a MOSFET, a POLY source, a pair on an R, an I card under `scale`.
     try testing.expectEqual(null, try rewrite(a, "t\nm1 d g 0 0 nm\n.model nm nmos\n", .reorder));
     try testing.expectEqual(null, try rewrite(a, "t\ne1 o 0 poly(1) a 0 0 1\n", .reorder));

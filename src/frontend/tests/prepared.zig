@@ -2,8 +2,8 @@
 //! analyses, variants, saves and refusals, against hand-worked expectations
 //! (and, for runtime-registered devices, the same model built in).
 const std = @import("std");
-const input = @import("../prepare.zig");
-const analyses = @import("../analyses.zig");
+const input = @import("../Jobs.zig");
+const analyses = @import("../Jobs/analyses.zig");
 const netlist = @import("netlist");
 const core = @import("core");
 const requests = @import("core").query;
@@ -19,7 +19,7 @@ fn build(sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: netli
 }
 
 fn prepare(io: std.Io, session: std.mem.Allocator, source: input.Source) !netlist.Netlist {
-    return input.prepare(io, session, source, &.{}, .{});
+    return input.prepare(io, session, source, &.{});
 }
 const resolveQueries = input.resolveQueries;
 
@@ -53,7 +53,7 @@ test "analysis directives dispatch every implemented capability and reject malfo
         ".pnoise v(out) vin dec 2 10 100 1k 0",       ".pss 1k 128",                  ".pxf 1k dec 2 10 100",
         ".pz",                                        ".qpss 1k 1414 1 1",            ".sens v(out)",
         ".sp dec 2 10 100",                           ".stb vin dec 2 10 100",        ".tf v(out) vin",
-        ".tran 1u 10u",                               ".tran_noise 1u 10u",           ".hbac dec 2 10 100 1k",
+        ".tran 1u 10u",                               ".trannoise 1u 10u",            ".hbac dec 2 10 100 1k",
         ".hbnoise v(out) vin dec 2 10 100 1k 4 2",    ".hbxf v(out) dec 2 10 100 1k", ".phasenoise v(out) dec 2 10 100 1meg",
         ".lstb mode=single vsource=vin dec 2 10 100", ".acxf v(out) dec 2 10 100",    ".dcxf v(out) tf",
         ".dcinc",                                     ".fft v(out)",                  ".acmatch v(out)",
@@ -670,6 +670,63 @@ test "cards without an output measure the last net the deck introduces, whatever
     try std.testing.expectEqual(deck.output_node, deck.queries[3].pac.out_node);
 }
 
+// Oracle: the grid by hand, POI 10, 20 and 40 Hz [CR .AC], which is also
+// the same deck's `.ac` grid. `.pxf v(mid)` names its output; a bare `.pxf`
+// takes the deck's last net, as `.pac` does.
+test ".pac, .pxf and .pnoise read the .ac grid, POI included; .pxf v(out) names its output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nl = try parse(a,
+        \\poi grids
+        \\v1 in 0 dc 0 ac 1 sin(0 1 1k)
+        \\r1 in mid 1k
+        \\r2 mid out 1k
+        \\c1 out 0 1u
+        \\.ac poi 3 10 20 40
+        \\.pac 1k poi 3 10 20 40
+        \\.pxf 1k poi 3 10 20 40
+        \\.pxf v(mid) 1k poi 3 10 20 40
+        \\.pnoise v(out) v1 poi 3 10 20 40 1k
+        \\.pnoise v(out) v1 poi 3 10 20 40 1k 3
+        \\.end
+    );
+    var prepared = try build(a, a, nl);
+    defer prepared.deinit();
+    const q = prepared.deck.queries;
+    try std.testing.expectEqual(6, q.len);
+    try std.testing.expectEqualSlices(f64, &.{ 10, 20, 40 }, q[0].ac.sweep.list);
+    for ([_]core.numerics.FreqSweep{ q[1].pac.sweep, q[2].pxf.sweep, q[3].pxf.sweep, q[4].pnoise.sweep, q[5].pnoise.sweep }) |s| {
+        try std.testing.expectEqual(.poi, s.kind);
+        try std.testing.expectEqualSlices(f64, q[0].ac.sweep.list, s.list);
+    }
+    try std.testing.expectEqual(prepared.deck.output_node, q[1].pac.out_node);
+    try std.testing.expectEqual(prepared.deck.output_node, q[2].pxf.out_node);
+    try std.testing.expectEqualStrings("mid", prepared.circuit.nodeName(q[3].pxf.out_node));
+    try std.testing.expectEqual(@as(f64, 1e3), q[4].pnoise.f_fundamental);
+    try std.testing.expectEqual(7, q[4].pnoise.n_sidebands);
+    try std.testing.expectEqual(3, q[5].pnoise.n_sidebands);
+}
+
+// Oracle: the cards by hand. `.ptdnoise` runs at the fundamental of the
+// deck's first driven `.pss`, 1/(1/1 MHz), as `.hbac` takes the `.hb` tone.
+// An oscillator's `.pss`, whose period is an unknown, gives none, so a deck
+// with only that one has no fundamental to run at.
+test ".ptdnoise takes f0 from the deck's first driven .pss" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "ptd f0\ni1 0 d sin(1m 0.5m 1meg)\nd1 d 0 dm\n.model dm d is=1e-14\n.pss v(d) 2meg 64\n";
+    const tail = ".ptdnoise v(d) time=250n dec 2 1k 100k\n.end\n";
+    var prepared = try build(a, a, try parse(a, head ++ ".pss 1meg 100\n.pss 3meg 50\n" ++ tail));
+    defer prepared.deinit();
+    const q = prepared.deck.queries;
+    try std.testing.expectEqual(4, q.len);
+    try std.testing.expectEqual(@as(f64, 1e6), q[3].pnoise.f_fundamental);
+    try std.testing.expectApproxEqRel(250e-9, q[3].pnoise.strobe.?, 1e-15);
+    try std.testing.expectError(error.MissingAnalysisCard, build(a, a, try parse(a, head ++ tail)));
+}
+
 test "selected unresolved parameters fail while unused models stay inert" {
     inline for (.{
         ".model nm nmos(level=1 tox={missing})\nm1 out in 0 0 nm\n",
@@ -721,7 +778,7 @@ test "prepared bindings retain model fields and exclude runtime state from param
     var prepared = try build(session.allocator(), parse_arena.allocator(), nl);
     defer prepared.deinit();
     _ = parse_arena.reset(.free_all);
-    const refs = try @import("../variants.zig").collect(session.allocator(), &prepared.circuit);
+    const refs = try @import("../Jobs/variants.zig").collect(session.allocator(), &prepared.circuit);
     var saw_pub = false;
     var resistors: u32 = 0;
     for (0..refs.len) |i| {
@@ -899,13 +956,53 @@ test "a .mosra plans one aged row per reliability time, the total last" {
     }
 }
 
+test "a flag-flipped P card labels its op-vars and .mosra row P, as the P kind does" {
+    // Oracle: `nmos level=3 pmos` binds the model `pmos level=3` binds
+    // (ngspice-44.2 reads the flag as a model parameter; src/tests/
+    // card_keys.zig), so its op-vars and .mosra row are the plain card's.
+    // Red before: both read the kind, so the flagged card ran P and reported
+    // N: @m1[id], vgs and vds and the delvto shift with their signs flipped.
+    var sa = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sa.deinit();
+    var pa = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer pa.deinit();
+    // A MOS3 under P bias, aged by `.mosra`, three terminal op-vars saved.
+    const text =
+        \\polarity labels
+        \\vd d 0 -1.5
+        \\vg g 0 -1.2
+        \\m1 d g 0 0 pm w=10u l=1u
+        \\.model pm {s}
+        \\.model nra mosra level=1 tit0=1e-4 tn=0.25
+        \\.appendmodel nra mosra pm pmos
+        \\.mosra reltotaltime=10 simmode=0
+        \\.save @m1[id] @m1[vgs] @m1[vds]
+        \\.tran 1n 10n
+        \\.end
+    ;
+    const pa_a = pa.allocator();
+    var plain = try build(sa.allocator(), pa_a, try netlist.parse(pa_a, try std.fmt.allocPrint(pa_a, text, .{"pmos level=3"})));
+    defer plain.deinit();
+    var flagged = try build(sa.allocator(), pa_a, try netlist.parse(pa_a, try std.fmt.allocPrint(pa_a, text, .{"nmos level=3 pmos"})));
+    defer flagged.deinit();
+    const want = plain.deck;
+    const got = flagged.deck;
+    try std.testing.expectEqual(@as(usize, 3), want.opvars.len);
+    try std.testing.expect(want.opvars[0].pmos);
+    try std.testing.expectEqual(want.opvars.len, got.opvars.len);
+    for (want.opvars, got.opvars) |w, g| try std.testing.expectEqualDeep(w, g);
+    try std.testing.expectEqualSlices(bool, &.{true}, want.mosra.?.pmos);
+    try std.testing.expectEqualSlices(bool, want.mosra.?.pmos, got.mosra.?.pmos);
+    try std.testing.expectEqualSlices(f64, want.mosra.?.delvto_fresh, got.mosra.?.delvto_fresh);
+}
+
 /// Reads, builds and frees `src` with every table on arenas over `gpa`.
 fn prepareAndBuild(gpa: std.mem.Allocator, lib: *const device.Library, src: []const u8) !void {
     var session = std.heap.ArenaAllocator.init(gpa);
     defer session.deinit();
     var parse_arena = std.heap.ArenaAllocator.init(gpa);
     defer parse_arena.deinit();
-    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, &.{}, .{});
+    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, &.{});
     var prepared = try input.build(lib, session.allocator(), parse_arena.allocator(), nl);
     prepared.deinit();
 }

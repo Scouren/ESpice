@@ -131,7 +131,7 @@ pub const VpiError = error{
 /// ships ESPice in its own bundle can point at the files inside it (#13). A
 /// null field keeps the default. The library reads no environment: the
 /// facade fills `zig` and `cache_dir` from it when the embedder leaves them
-/// null (`espice.zig` `toolchainFromEnv`).
+/// null (`espice/config.zig` `toolchainFromEnv`).
 pub const Toolchain = struct {
     /// The Zig compiler that builds a loaded device; null runs `zig` from
     /// PATH. It must be the version this espice was built with.

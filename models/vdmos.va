@@ -78,7 +78,7 @@ module vdmos(d, g, s);
     parameter real bv  = 0.0   from [0:inf);   // reverse breakdown, 0 = none [V]
     parameter real ibv = 1e-10 from [0:inf);   // current at bv [A]
     parameter real nbv = 1.0   from (0:inf);   // breakdown emission coefficient
-    parameter real cjo = 0.0   from [0:inf);   // zero-bias junction cap [F]
+    parameter real cjo = 5e-10 from [0:inf);   // zero-bias junction cap [F] (vdmosset.c:46-47)
     parameter real vj  = 0.8   from (0:inf);   // junction potential [V]
     parameter real mj  = 0.5   from (0:1);     // grading coefficient (model card key `m`)
     parameter real fc  = 0.5   from (0:1);     // forward-bias cap coefficient
@@ -338,7 +338,13 @@ module vdmos(d, g, s);
             idch = betaeff * mtriode * vdse * (vgste - 0.5 * mtriode * vdse);
         else
             idch = 0.5 * betaeff * vgste * vgste;
-        idch = idch * (1.0 + lambda * vdse);
+        // vdmosload.c:366 (45): t0 = 1 + lambda*vds on the signed ty-frame
+        // vds, so a reversed channel carries less current (ngspice 44.2:
+        // 0.95x at vds = -0.5 V, lambda 0.1). ngspice's gds keeps +lambda's
+        // slope in reverse mode (:370, 381, 388) where this exact slope is
+        // its negative: the same DC point, a reverse-mode AC that differs
+        // from ngspice's by twice that term.
+        idch = idch * (1.0 + lambda * vdsi);
 
         I(dp, sp) <+ ty * msign * idch;
         // vdmosload.c:423 VDMOScd = mode * cdrain; gm and gds are dcdrain
@@ -367,7 +373,7 @@ module vdmos(d, g, s);
         // evaluates on unseeded values, so ddx() (the gm op var) reads 0 here.
         dvgste = (sarg > 30.0) ? 1.0 : exp(sarg) / (1.0 + exp(sarg));
         gmn = ((vdse < vknee) ? betaeff * mtriode * vdse : betaeff * vgste)
-                * (1.0 + lambda * vdse) * dvgste
+                * (1.0 + lambda * vdsi) * dvgste
             - idch * theta / (1.0 + theta * vgste) * dvgste;
         coxn = 3.9 * 8.854214871e-12 / 1.0e-7;
         I(dp, sp) <+ white_noise(4.0 * 1.38064852e-23 * $temperature * 2.0 / 3.0 * abs(gmn), "id");

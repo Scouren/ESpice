@@ -1,0 +1,448 @@
+//! Stage 5 and the frontend module root: the spine the Problem facade
+//! calls. In: an ngspice deck (file or bytes). Out: `Prepared`, the jobs
+//! the simulator runs: the frozen circuit, its deck (queries, variants,
+//! measures, outputs) and the variant runs that need a circuit of their own.
+//!
+//!     prepare:  source (includes, `.alter` runs) -> Ast.parse -> Netlist.elaborate
+//!     loadModels: the HDL models the netlist includes, into the library
+//!     build:    per run, Circuit.bind -> plan
+//!
+//! `resolveQueries` plans analysis cards appended later. Leaves never
+//! import this file.
+//! Cites: none (house pipeline; each stage file cites its sources).
+//!
+//! Contents:
+//! - `pub const Library = device.Library`
+//! - `pub const Tuner = variants.Tuner`
+//! - `pub const Sss = variants.Sss`
+//! - `pub const WorstCase = variants.WorstCase`
+//! - `pub const Prepared = struct`
+//! - `pub fn deinit(self: *Prepared) void`
+//! - `pub const Source`
+//! - `pub const Bytes = struct`
+//! - `pub fn node(self: NodeIndex, name: []const u8) u32`
+//! - `pub fn prepare(io: std.Io, session: Allocator, input: Source, live: []const []const u8) !netlist.Netlist`
+//! - `pub fn loadModels(io: std.Io, lib: *device.Library, session: Allocator, nl: netlist.Netlist, origin: []const u8, apps: []const []const u8) !void`
+//! - `pub fn build(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: netlist.Netlist) !Prepared`
+//! - `pub fn resolveQueries(arena: Allocator, prepared: *const Prepared, directive_text: []const u8) ![]const Job`
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const core = @import("core");
+const requests = core.query;
+const netlist = @import("netlist");
+const device = @import("device");
+const builder = @import("builder");
+const analyses = @import("Jobs/analyses.zig");
+const variants = @import("Jobs/variants.zig");
+const mosra = @import("Jobs/mosra.zig");
+const prepared_deck = @import("Jobs/prepared_deck.zig");
+const prepared_opvars = @import("Jobs/prepared_opvars.zig");
+const prepared_soa = @import("Jobs/prepared_soa.zig");
+const prepared_temper = @import("Jobs/prepared_temper.zig");
+const Job = requests.Query;
+const NO_NODE = analyses.NO_NODE;
+
+/// The per-Problem device library the facade fills before `build`.
+pub const Library = device.Library;
+
+/// HSPICE `OPTIMIZE=`: the optimizer's point-to-rows adapter (variants.zig).
+pub const Tuner = variants.Tuner;
+
+/// A SIGMA_SCALE card, for counting its trials' failures (#239).
+pub const Sss = variants.Sss;
+
+/// `.wcd`: FORM's points to variant rows (#240, variants.zig).
+pub const WorstCase = variants.WorstCase;
+
+/// Construction result: the frozen topology and what the deck says about it.
+/// The session arena owns every deck slice; `deinit` releases the circuits.
+pub const Prepared = struct {
+    /// The frozen topology; `deinit` releases it.
+    circuit: device.Circuit,
+    /// Queries, probes, measures and variants; its slices live in the
+    /// session arena.
+    deck: core.Deck,
+    /// Variant runs whose topology differs from `circuit` (an `.alter`
+    /// that swaps elements, a point that collapses a node), each with its
+    /// own circuit, deck and variant labels, in output order after this one.
+    runs: []Prepared = &.{},
+    /// The deck's HSPICE optimization, when it has one. It borrows the
+    /// parse arena, which must then outlive the Prepared.
+    tuner: ?variants.Tuner = null,
+    /// The live `.param` values a caller sets on the prepared circuit
+    /// (`prepare`'s `live`); null without any. It borrows the parse arena,
+    /// which must then outlive the Prepared.
+    tuning: ?*variants.Tuning = null,
+    /// The deck's SIGMA_SCALE cards (#239), in the session arena.
+    sss: []const variants.Sss = &.{},
+    /// The deck's `.wcd` (#240), on the main run only. It borrows the parse
+    /// arena, which must then outlive the Prepared.
+    wcd: ?variants.WorstCase = null,
+
+    /// Releases this run's circuit and every nested run's, and the tuning's
+    /// templates. The deck slices stay with the session arena. Leaves
+    /// `self` undefined.
+    pub fn deinit(self: *Prepared) void {
+        for (self.runs) |*run| run.deinit();
+        if (self.tuning) |t| t.deinit();
+        self.circuit.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Where a deck comes from.
+pub const Source = union(enum) {
+    /// Path of the deck file.
+    file: []const u8,
+    /// Deck text already in memory.
+    bytes: Bytes,
+
+    /// In-memory deck; `origin` is a real or virtual filename whose
+    /// directory relative includes resolve against.
+    pub const Bytes = struct { data: []const u8, origin: []const u8 };
+};
+
+// What `buildRun` can fail with, spelled out because it recurses: the
+// errors of `buildOne` and of setting a point's live values, each logged
+// with its card by the stage that owns it. A failed build releases every
+// circuit it froze; its slices stay in the arenas until they die.
+const BuildError = ErrorOf(buildOne) || ErrorOf(variants.setPoint);
+
+/// One run without its rebuilt points: the prepared run and the runs its
+/// plan asks for.
+const Planned = struct { prepared: Prepared, rebuilds: []const variants.Rebuild };
+
+/// Frozen-circuit node row by label, for cards appended after the build.
+const NodeIndex = struct {
+    map: std.StringHashMapUnmanaged(u32),
+
+    fn init(arena: Allocator, circuit: *const device.Circuit) !NodeIndex {
+        var map: std.StringHashMapUnmanaged(u32) = .empty;
+        try map.ensureTotalCapacity(arena, circuit.n);
+        for (0..circuit.n) |i| {
+            const label = circuit.nodeName(@intCast(i));
+            if (label.len != 0) map.putAssumeCapacity(label, @intCast(i));
+        }
+        return .{ .map = map };
+    }
+
+    /// Row of net `name`; NO_NODE when the deck never named it.
+    pub fn node(self: NodeIndex, name: []const u8) u32 {
+        return self.map.get(name) orelse NO_NODE;
+    }
+};
+
+/// Reads, expands and flattens `input` into `session` and reads its data
+/// files; compiles nothing (`loadModels` does, #13). The global `.param`
+/// names in `live` stay live, so the built circuit takes new values for
+/// them without a re-parse (`Prepared.tuning`). The netlist borrows
+/// `session`; release it once `build` has returned, or with the Prepared
+/// when `live` is not empty. Fails with `UnknownParameter` for a `live`
+/// name no global `.param` defines, with the file error of an
+/// unreadable deck, include, data or `soalimits` file, and with
+/// `InvalidSoaLimits` for a `soalimits` file `prepared_soa.ratings`
+/// refuses.
+pub fn prepare(io: std.Io, session: Allocator, input: Source, live: []const []const u8) !netlist.Netlist {
+    const origin = switch (input) {
+        .file => |path| path,
+        .bytes => |bytes| bytes.origin,
+    };
+    const raw = switch (input) {
+        .file => |path| try std.Io.Dir.cwd().readFileAlloc(io, path, session, .unlimited),
+        .bytes => |bytes| try session.dupe(u8, bytes.data),
+    };
+    const runs = try netlist.source.splitAlters(session, raw);
+    const ast = try netlist.Ast.parse(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), .deck);
+    var nl = try netlist.elaborate(session, &ast, live);
+    const alters = try session.alloc([]const u8, runs.len - 1);
+    for (alters, runs[1..]) |*text, run| text.* = try netlist.source.expand(io, std.heap.page_allocator, session, origin, run);
+    nl.deck.alters = alters;
+    nl.files = try loadData(io, session, nl.deck.foreign, origin);
+    // The `.options soalimits=` file, relative to the deck (#238).
+    if (nl.deck.soa_file.len != 0) nl.soa_ratings = try prepared_soa.ratings(io, session, try deckRelative(session, origin, nl.deck.soa_file));
+    return nl;
+}
+
+/// Compiles and loads into `lib` the HDL models `nl` (from `prepare` on a
+/// deck at `origin`) includes: a `.hdl` path relative to the deck's
+/// directory, an `.include`d one absolute, where source.zig found it in
+/// ngspice's include order (never joined again). First loads the VPI applications `apps` names (`--vpi`, as given) and the
+/// deck's `.options vpi=` (relative to the deck), since a registration
+/// decides how a model compiles (LRM 12.32.1).
+/// Fails with `OsdiUnsupported` on any OSDI include (`pre_osdi`, `osdi`),
+/// with `Library.loadVpiApp`'s error for an application, and with the
+/// loader's error for a model that does not compile.
+pub fn loadModels(io: std.Io, lib: *device.Library, session: Allocator, nl: netlist.Netlist, origin: []const u8, apps: []const []const u8) !void {
+    for (apps) |app| try lib.loadVpiApp(app);
+    for (nl.deck.vpi_apps) |app| try lib.loadVpiApp(try deckRelative(session, origin, app));
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (nl.deck.foreign) |f| switch (f.kind) {
+        .data => {},
+        .verilog_a, .verilog => try paths.append(session, try deckRelative(session, origin, f.path)),
+        // ESPice compiles Verilog-A through VerA and never loads OSDI, so an
+        // OSDI reference is an error rather than a guess at a substitute.
+        .osdi_include, .pre_osdi => {
+            if (!@import("builtin").is_test) std.log.err("netlist: {s} {s}: espice does not load OSDI binaries; load the Verilog-A source with .hdl \"model.va\"", .{ @tagName(f.kind), f.path });
+            return error.OsdiUnsupported;
+        },
+    };
+    if (paths.items.len == 0) return;
+    try lib.load(io, paths.items);
+}
+
+/// Builds the frozen circuit and deck data from `nl`, with its variants
+/// (`.step`, `SWEEP`, `.alter`, Monte Carlo). `parse_arena` holds
+/// construction scratch; `sim_arena` owns every published slice and must
+/// outlive the result, as must `lib` when the deck uses loaded devices.
+/// Caller owns the result and releases its circuits with `Prepared.deinit`.
+pub fn build(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: netlist.Netlist) !Prepared {
+    const owned = try parse_arena.create(netlist.Netlist);
+    owned.* = nl;
+    return buildRun(lib, sim_arena, parse_arena, owned, .{});
+}
+
+/// Resolves analysis cards appended to a built circuit. Topology and deck
+/// settings stay fixed; only the queries are allocated, in `arena`. Any card
+/// that is not an analysis, or a single-value `.temp`, is
+/// `UnsupportedDirectiveMutation`; text holding no card is
+/// `InvalidAnalysisArguments`.
+pub fn resolveQueries(arena: Allocator, prepared: *const Prepared, directive_text: []const u8) ![]const Job {
+    const nodes: NodeIndex = try .init(arena, &prepared.circuit);
+    const cards = try netlist.parseAnalyses(arena, directive_text, nodes);
+    if (cards.len == 0) return error.InvalidAnalysisArguments;
+    for (cards) |*a| if (namesNoOutput(a.*)) {
+        a.pos = prepared.deck.output_node;
+    };
+    return analyses.queries(arena, cards, prepared.circuit.n, true, prepared.deck.bindings, prepared.deck.cards, .{
+        .tol = prepared.deck.deck_tol,
+        .method = prepared.deck.deck_method,
+        .temp_c = prepared.deck.deck_temp,
+        .card_names = prepared.deck.card_names,
+    }, .{});
+}
+
+// ---- private ----
+
+/// Reads every data file the deck names, relative to the deck's directory.
+fn loadData(io: std.Io, session: Allocator, foreign: []const netlist.Foreign, origin: []const u8) ![]const netlist.DataFile {
+    var files: std.ArrayList(netlist.DataFile) = .empty;
+    for (foreign) |f| if (f.kind == .data) {
+        const path = try deckRelative(session, origin, f.path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, session, .unlimited) catch |err| {
+            std.log.err("netlist: cannot read data file {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        try files.append(session, .{ .path = f.path, .bytes = bytes });
+    };
+    return files.items;
+}
+
+/// `path` as written when absolute, else joined onto the directory of the
+/// deck at `origin`, allocated in `session`.
+fn deckRelative(session: Allocator, origin: []const u8, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.join(session, &.{ std.fs.path.dirname(origin) orelse ".", path });
+}
+
+fn ErrorOf(comptime f: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+}
+
+/// `build` for one run of the deck in `nl`, which must outlive the result
+/// when the deck has an HSPICE optimization or a `.wcd` (`Prepared.tuner`
+/// and `Prepared.wcd` borrow it).
+/// A `run.point` sets `nl`'s live values first; they are nominal again
+/// when a run with rebuilt points returns.
+fn buildRun(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: *netlist.Netlist, run: variants.Run) BuildError!Prepared {
+    var stack: std.ArrayList(netlist.expr.Val) = .empty;
+    if (run.point) |pt| try variants.setPoint(parse_arena, &stack, nl, pt);
+    var one = try buildOne(lib, sim_arena, parse_arena, nl, run);
+    errdefer one.prepared.deinit();
+    // Points the plan could not hold as rows, each its own run. A rebuilt
+    // `.alter` netlist has no `.alter` of its own and a point run plans no
+    // rebuilds, so this recursion is at most two runs deep.
+    const runs = try sim_arena.alloc(Prepared, one.rebuilds.len);
+    var built: usize = 0;
+    errdefer for (runs[0..built]) |*r| r.deinit();
+    for (one.rebuilds, runs) |r, *dst| {
+        dst.* = try buildRun(lib, sim_arena, parse_arena, r.nl, r.run);
+        built += 1;
+    }
+    for (one.rebuilds) |r| if (r.run.point != null) {
+        try variants.setPoint(parse_arena, &stack, nl, .{ .label = "", .axis = 0, .live = nl.live.nominal });
+        break;
+    };
+    one.prepared.runs = runs;
+    return one.prepared;
+}
+
+/// One run without its rebuilt points: `bind`, then `plan`.
+/// `CircuitTooLarge` when the deck has more analysis cards than a u32 job
+/// index can fan out.
+fn buildOne(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: *netlist.Netlist, run: variants.Run) !Planned {
+    if (nl.deck.analyses.len > (std.math.maxInt(u32) - 1) / 3) return error.CircuitTooLarge;
+    const deck_opts = try analyses.deckOptions(nl.deck.config);
+    if (nl.deck.draw_seed and run.point == null and !variants.any(nl.deck)) try variants.drawOnce(parse_arena, nl);
+    // The values that read `temper` at the deck's temperature, over this
+    // run's draws and live values; each analysis moves them from there.
+    const temp_c = deck_opts.temp_c orelse netlist.temper_slots.default_temp_c;
+    var stack: std.ArrayList(netlist.expr.Val) = .empty;
+    try netlist.temper_slots.setTemp(nl, parse_arena, &stack, temp_c);
+    // `.options tnom` is a model-card default (b4set.c:1950): models read it
+    // as they are derived, before the pattern freezes.
+    const bound = try builder.bind(lib, sim_arena, parse_arena, nl, .{ .nom_temp_c = deck_opts.tnom_c, .tol = deck_opts.tol });
+    return plan(lib, sim_arena, parse_arena, nl, &bound, deck_opts, run);
+}
+
+/// Stage 5: the deck's queries, variants, measures and outputs over the
+/// bound circuit, and the runs its plan asks to rebuild. Owns
+/// `bound.circuit` from the call on: a failure releases it.
+fn plan(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator, nl: *netlist.Netlist, bound: *const builder.Bound, deck_opts: analyses.DeckOptions, run: variants.Run) !Planned {
+    const nb = bound.nets;
+    const cards = bound.cards;
+    var circuit = bound.circuit;
+    errdefer circuit.deinit();
+    try prepared_deck.frozenIndices(parse_arena, cards, &circuit);
+    const card_names = try requests.CardNames.init(sim_arena, cards);
+    const temper = try prepared_temper.table(lib, sim_arena, parse_arena, nl, &circuit, card_names);
+
+    var out = try nb.publish(sim_arena, &circuit, bound.perm);
+    if (nl.deck.saves.len > 0) try prepared_deck.keepSaved(parse_arena, &out.probes, &out.probe_labels, nl.deck.saves);
+
+    // Analysis nets to circuit rows.
+    const cards_rows = try parse_arena.dupe(netlist.Analysis, nl.deck.analyses);
+    for (cards_rows) |*a| {
+        a.pos = nb.frozenRow(a.pos);
+        if (namesNoOutput(a.*)) a.pos = out.output_node;
+        a.neg = nb.frozenRow(a.neg);
+        for (&a.ports) |*p| p.* = nb.frozenRow(p.*);
+    }
+    var tuner: ?variants.Tuner = null;
+    // Variation groups for the mismatch and sensitivity cards: the deck's
+    // `.variation` block, else the distribution calls in its models and
+    // parameters (a PDK's mismatch), else `dcmatch`'s Pelgrom-or-unit
+    // fallback, said aloud.
+    var card_opts = deck_opts;
+    for (nl.deck.analyses) |a| switch (a.kind) {
+        .dcmatch, .acmatch, .dcsens => {
+            if (nl.deck.variations.len == 0 and nl.live.site_keys.len == 0) {
+                if (!@import("builtin").is_test) std.log.warn("variants: {s}: no .variation block and no agauss/gauss/unif/aunif/limit in a model or parameter, so each parameter takes its Pelgrom sigma, or unit variance without one", .{a.line});
+                break;
+            }
+            var planner = try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "");
+            card_opts.variations = if (nl.deck.variations.len != 0) try variants.variations(&planner) else try variants.siteVariations(&planner);
+            if (nl.deck.variations.len == 0 and card_opts.variations.labels.len == 0 and !@import("builtin").is_test)
+                std.log.warn("variants: {s}: no distribution call moves a device parameter (a PDK corner without its mismatch switch?), so the mismatch is zero", .{a.line});
+            break;
+        },
+        else => {},
+    };
+    var aging: ?mosra.Plan = null;
+    if (nl.deck.mosra) |m| {
+        if (run.point != null or run.prefix.len != 0 or variants.any(nl.deck)) {
+            if (!@import("builtin").is_test) std.log.err("netlist: .mosra together with .step, .alter or an analysis sweep: {s}", .{m.line});
+            return error.UnsupportedCard;
+        }
+        aging = try mosra.plan(sim_arena, parse_arena, nl, nb, &circuit, cards, deck_opts.temp_c orelse 27);
+    }
+    const variant_plan: variants.Plan = if (aging) |a| .{ .variants = a.variants, .fanout = a.fanout } else if (run.point) |pt| blk: {
+        var planner = try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "");
+        var own = pt;
+        own.label = run.prefix;
+        try planner.add(own);
+        break :blk .{ .variants = try planner.table(), .fanout = .{ .global = .{ .count = 1, .nominal = false }, .only = run.card } };
+    } else if (run.prefix.len != 0 or variants.any(nl.deck)) blk: {
+        var planner = try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, run.prefix);
+        const planned = try variants.plan(&planner);
+        if (nl.deck.optimize != null) tuner = try variants.Tuner.init(planner);
+        break :blk planned;
+    } else .{};
+    // A planner of its own: the plan's left the live values nominal.
+    const wcd = if (nl.deck.wcd != null and run.point == null and run.prefix.len == 0) try variants.WorstCase.init(try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "")) else null;
+    const tuning = if (nl.tunable.len != 0 and run.point == null and run.prefix.len == 0) try variants.Tuning.init(core.gpa, lib, sim_arena, parse_arena, nl, &circuit, cards) else null;
+    errdefer if (tuning) |t| t.deinit();
+    if (variant_plan.variants.refs.len != 0 or tuning != null or wcd != null or temper != null) try circuit.countParams();
+    card_opts.sample = nl.deck.sample;
+    card_opts.card_names = card_names;
+    // The quiet resistors at their frozen (type, index), from their card rows.
+    const quiet = try parse_arena.alloc(requests.CardRef, nb.quiet.items.len);
+    for (quiet, nb.quiet.items) |*q, row| q.* = cards[row];
+    card_opts.quiet = try requests.CardNames.init(sim_arena, quiet);
+    const queries = try analyses.queries(sim_arena, cards_rows, circuit.n, false, out.bindings, cards, card_opts, variant_plan.fanout);
+    if (aging) |*a| a.mosra.tran = for (queries) |q| {
+        if (q == .tran and q.tran.tol.variant == null) break q.tran;
+    } else {
+        if (!@import("builtin").is_test) std.log.err("netlist: .mosra needs a .tran to stress the devices: {s}", .{nl.deck.mosra.?.line});
+        return error.UnsupportedCard;
+    };
+    const ov = try prepared_opvars.opVars(sim_arena, parse_arena, lib, &circuit, cards, out.probes, out.probe_labels, nl, nb, queries);
+    return .{ .rebuilds = variant_plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .wcd = wcd, .sss = try variants.sssCards(sim_arena, nl.deck), .deck = .{
+        .probes = out.probes,
+        .probe_labels = out.probe_labels,
+        .source_node = out.source_node,
+        .source_branch = out.source_branch,
+        .output_node = out.output_node,
+        .ac_drive = out.ac_drive,
+        .title = try sim_arena.dupe(u8, nl.deck.title),
+        .n_devices = nl.deviceCount(),
+        .ic = try prepared_deck.nodeRows(sim_arena, nb, nl.deck.ic),
+        .nodeset = try prepared_deck.nodeRows(sim_arena, nb, nl.deck.nodeset),
+        .uic_ic = out.uic_ic,
+        .deck_tol = deck_opts.tol,
+        .deck_temp = deck_opts.temp_c,
+        .deck_method = deck_opts.method,
+        .queries = queries,
+        .mosra = if (aging) |a| a.mosra else null,
+        .variants = variant_plan.variants,
+        .bindings = out.bindings,
+        .cards = cards,
+        .card_names = card_names,
+        .ac_overrides = try prepared_deck.acOverrides(sim_arena, cards, nb.ac_res.items(.name), nb.ac_res.items(.value)),
+        .noise_gaps = try prepared_deck.noiseGaps(sim_arena, nb.noise_gaps.items),
+        .temper = temper,
+        .measures = try prepared_deck.measures(sim_arena, nl.deck.measures),
+        .save_op = if (nl.deck.save_op) |s| blk: {
+            var own = s;
+            if (s.file) |file| own.file = try sim_arena.dupe(u8, file);
+            break :blk own;
+        } else null,
+        .stims = try prepared_deck.stims(sim_arena, nl.deck.stims),
+        .soa = if (deck_opts.soa) .{ .max_warns = deck_opts.max_warns, .limits = try prepared_soa.limits(sim_arena, nl, nb, &circuit) } else .{},
+        .opvars = ov.vars,
+        .opvar_probes = ov.probes,
+        .opvar_labels = ov.labels,
+        .emir_ports = try prepared_deck.portCounts(sim_arena, lib, &circuit),
+        .em_recovery = deck_opts.em_recovery,
+        .card_models = try prepared_deck.cardModels(sim_arena, parse_arena, nl, cards),
+        .emir_file = if (nl.deck.emir_file) |f| try sim_arena.dupe(u8, f) else null,
+    } } };
+}
+
+/// Cards whose output is `Deck.output_node` because they name none: `.pxf
+/// v(out) ...` names its own.
+fn namesNoOutput(a: netlist.Analysis) bool {
+    const pxf_bare = a.kind == .pxf and (a.args.len == 0 or a.args[0] != .group);
+    return a.kind == .pac or pxf_bare or a.kind == .disto or a.kind == .hbac;
+}
+
+test namesNoOutput {
+    try std.testing.expect(namesNoOutput(.{ .kind = .pac, .args = &.{} }));
+    try std.testing.expect(namesNoOutput(.{ .kind = .pxf, .args = &.{.{ .num = 1e3 }} }));
+    try std.testing.expect(!namesNoOutput(.{ .kind = .pxf, .args = &.{.{ .group = .{ .items = &.{ .{ .name = "v" }, .{ .name = "out" } } } }} }));
+    try std.testing.expect(!namesNoOutput(.{ .kind = .ac, .args = &.{} }));
+}
+
+test {
+    _ = prepared_deck;
+    _ = prepared_opvars;
+    _ = prepared_soa;
+    _ = prepared_temper;
+    _ = @import("tests/builder.zig");
+    _ = @import("tests/prepared.zig");
+    _ = @import("tests/models.zig");
+    _ = @import("tests/variants.zig");
+    _ = variants;
+    _ = analyses;
+    _ = mosra;
+}

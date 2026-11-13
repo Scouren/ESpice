@@ -1,6 +1,7 @@
-//! Temperature sweep (`.temp`): one structural lane per temperature, using
-//! the devices' own temperature physics (`Circuit.setCircuitTemp`), no
-//! external coefficients.
+//! Temperature sweep, the API's `temp` query (`core.query.Temp`; no deck
+//! card reaches it: a deck sweeps temperature with `.dc temp`): one
+//! structural lane per temperature, using the devices' own temperature
+//! physics (`Circuit.setCircuitTemp`), no external coefficients.
 //! In: a run context and the temperature range. Out: real point-major rows
 //! (temp, probes...), one per converged temperature.
 //! Cites no outside source.

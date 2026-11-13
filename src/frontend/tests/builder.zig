@@ -874,6 +874,13 @@ test "topology: V/L shorts must agree on KVL, current sources need a DC path" {
     // unequal ones are a cutset.
     try std.testing.expect(try buildDeck("* balanced\nI1 0 a 1m\nI2 a b 1m\nR1 b 0 1k\nC1 a 0 1p\n.end\n"));
     try std.testing.expectError(error.CurrentSourceCutset, buildDeck("* unbalanced\nI1 0 a 1m\nI2 a b 2m\nR1 b 0 1k\nC1 a 0 1p\n.end\n"));
+    // A `.ic` node is held through a transient's operating point (ngspice
+    // cktload.c, MODETRANOP), a DC path for that solve: ngspice 44.2 runs
+    // the cutset deck with it, v(out) 0 at t = 0 and the exact 1 V/ms ramp,
+    // with no warning. A `.ic` on another node holds nothing here (ngspice:
+    // singular matrix at out).
+    try std.testing.expect(try buildDeck("* held\nI1 0 out 1m\nC1 out 0 1u\n.ic v(out)=0\n.tran 1u 1m\n.end\n"));
+    try std.testing.expectError(error.CurrentSourceCutset, buildDeck("* held elsewhere\nI1 0 out 1m\nC1 out 0 1u\nV1 a 0 1\nR1 a 0 1k\n.ic v(a)=1\n.tran 1u 1m\n.end\n"));
     // A node only capacitors reach needs the transient operating point,
     // also behind a series short that touches no ground (#90).
     try std.testing.expect(try buildDeck("* cap node\nV1 a 0 1\nC1 a b 1p\nC2 b 0 1p\n.end\n"));
@@ -955,17 +962,33 @@ fn publishPorts(a: std.mem.Allocator, comptime body: []const u8) ![]const @impor
     return (try c.nb.publish(a, &c.circuit, null)).bindings.ports;
 }
 
-test "publish orders .sp ports by portnum and refuses a gapped or doubled set" {
+test "publish orders .sp ports by portnum and refuses a gapped set, a third card on a number or unequal legs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // A duplicate wins over a gap wherever it sits, as in vsrctemp.c.
+    // A card error wins over a gap wherever it sits, as in vsrctemp.c.
     inline for ([_]struct { []const u8, anyerror }{
         .{ "V1 a 0 0 AC 1 portnum 2\nR1 a 0 50\n", error.MissingPortNumber },
         .{ "V1 a 0 0 AC 1 portnum 1\nV2 b 0 0 AC 1 portnum 3\nR1 a b 50\n", error.MissingPortNumber },
-        .{ "V1 a 0 0 AC 1 portnum 1\nV2 b 0 0 AC 1 portnum 1\nR1 a b 50\n", error.DuplicatePortNumber },
-        .{ "V1 a 0 0 AC 1 portnum 5\nV2 b 0 0 AC 1 portnum 5\nR1 a b 50\n", error.DuplicatePortNumber },
+        .{ "V1 a 0 0 AC 1 portnum 5\nV2 b 0 0 AC 1 portnum 5\nR1 a b 50\n", error.MissingPortNumber },
+        .{ "V1 a 0 0 AC 1 portnum 1\nV2 b 0 0 AC 1 portnum 1\nV3 c 0 0 portnum 1\nR1 a b 50\nR2 c 0 50\n", error.DuplicatePortNumber },
+        .{ "V1 a 0 0 AC 1 portnum 5\nV2 b 0 0 AC 1 portnum 5\nV3 c 0 0 portnum 5\nR1 a b 50\nR2 c 0 50\n", error.DuplicatePortNumber },
+        .{ "V1 a 0 0 AC 1 portnum 1\nV2 b 0 0 AC 1 portnum 1 z0 75\nR1 a b 50\n", error.UnbalancedPort },
+        .{ "V1 a r 0 AC 1 portnum 1\nV2 b 0 0 AC 1 portnum 1\nR1 a b 50\nR2 r 0 50\n", error.UnbalancedPort },
+        .{ "V1 a 0 0 AC 1 portnum 5\nV2 b 0 0 AC 1 portnum 5 z0 25\nR1 a b 50\n", error.UnbalancedPort },
     }) |case| try std.testing.expectError(case[1], publishPorts(a, case[0]));
+    // Two cards on one number are one balanced port, each leg against its
+    // own n-; the first in deck order, Vb, is the + leg, and as it is
+    // stamped first its branch row is the lower.
+    const pair = try publishPorts(a, "V9 x 0 0 portnum 2\nVb b r 0 portnum 1\nVa a r 0 portnum 1\nR1 a b 50\nR2 r 0 50\nR3 x a 50\n");
+    try std.testing.expectEqual(@as(usize, 2), pair.len);
+    const minus = pair[0].balanced orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pair[0].branch < minus.branch);
+    try std.testing.expect(pair[0].node != minus.node);
+    try std.testing.expectEqual(pair[0].neg, minus.neg);
+    try std.testing.expect(pair[0].neg != 0);
+    try std.testing.expectEqual(@as(f64, 50), pair[0].z0);
+    try std.testing.expect(pair[1].balanced == null);
     try std.testing.expectEqual(@as(usize, 0), (try publishPorts(a, "V1 a 0 0 AC 1\nR1 a 0 50\n")).len);
     const ports = try publishPorts(a, "V2 b 0 0 AC 1 portnum 2 z0 75\nV1 a 0 0 AC 1 portnum 1\nR1 a b 50\n");
     try std.testing.expectEqual(@as(usize, 2), ports.len);
@@ -1122,6 +1145,28 @@ test "a refused card names what it failed on: the V or L card it lacks, the valu
     const v = cardWith("v1", 'v', &.{.{ .group = sin }}, &.{});
     try std.testing.expectEqualStrings("not a number: 'ampl'", ta.subject(&nb, &buf, v, error.UnresolvedParameter).?);
     try std.testing.expectEqual(null, ta.subject(&nb, &buf, f, error.OutOfMemory));
+}
+
+test "an UnsupportedDevice names why: the model the card cannot use, the model it lacks, or its letter" {
+    // Oracle: the cards' own text. M1 names an nmos model as a diode would
+    // not; M2 names no model a .model defines (or no bin held its L, W);
+    // A1 has a letter no device takes.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nl = try netlist.parse(a, "* subjects\nr0 a 0 1\n.end\n");
+    const lib = try device.Library.init(a);
+    var b = try Builder.init(a, &lib);
+    defer b.deinit();
+    var nb = try builder.NetBuilder.init(a, &b, nl);
+    var buf: [160]u8 = undefined;
+    var d = cardWith("d1", 'd', &.{.{ .name = "nch" }}, &.{});
+    d.model = .{ .name = "nch", .kind = "nmos", .kv = &.{} };
+    try std.testing.expectEqualStrings("model 'nch' (nmos) is not a device this card can use", ta.subject(&nb, &buf, d, error.UnsupportedDevice) orelse "");
+    const m = cardWith("m2", 'm', &.{.{ .name = "nbin" }}, &.{});
+    try std.testing.expectEqualStrings("no .model this card can use: its model name is not defined, or no bin of it holds the card's L and W", ta.subject(&nb, &buf, m, error.UnsupportedDevice) orelse "");
+    const u = cardWith("a1", 'a', &.{}, &.{});
+    try std.testing.expectEqualStrings("no device has the card letter 'a'", ta.subject(&nb, &buf, u, error.UnsupportedDevice) orelse "");
 }
 
 test "the branch-name index answers as the first-match scans did, duplicates included" {

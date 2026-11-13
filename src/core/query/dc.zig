@@ -9,7 +9,7 @@
 //! - `pub const Op = struct`
 //! - `pub const Dc = struct`, `Dc.SweepTarget = union(enum)`, `SweepTarget.Param`,
 //!   `Dc.hasOuter(self: Dc) bool`, `Dc.split`, `Dc.Segment = struct`,
-//!   `Dc.segments(self: Dc) u32`, `Dc.segment(self: Dc, s: u32) Segment`
+//!   `Dc.overlap`, `Dc.segments(self: Dc) u32`, `Dc.segment(self: Dc, s: u32) Segment`
 //! - `pub const Dcinc = struct`
 //! - `pub const Mc = struct`, `Mc.VariantRange = struct`
 //! - `pub const Temp = struct`
@@ -73,8 +73,8 @@ pub const Dc = struct {
     lane: ?u32 = null,
 
     /// How a single-axis sweep splits: at least `points` points per
-    /// segment and at most `max` segments. Each segment adds one cold
-    /// operating point and one overlap point to the sweep's work: 16
+    /// segment and at most `max` segments. Each segment adds `overlap`
+    /// points, one of them a cold operating point, to the sweep's work: 16
     /// points keep that a small share of a segment, and 64 bound it for a
     /// sweep of any length while leaving more segments than a host has
     /// workers or lanes.
@@ -82,9 +82,15 @@ pub const Dc = struct {
     /// `.dc` on a big circuit (a BSIM4 chain).
     pub const split: struct { points: u32, max: u32 } = .{ .points = 16, .max = 64 };
 
+    /// The points a segment past the first solves before its own: segment
+    /// s-1's last two, the first cold. ngspice predicts a point from the two
+    /// before it (dctrcurv.c:375; from one only at a sweep's second point,
+    /// :457-462), so the first own point starts as the whole sweep's does.
+    pub const overlap = 2;
+
     /// One segment's points: segment s of k over n points owns s·n/k up
-    /// to (s+1)·n/k, and s > 0 starts one point earlier, at segment s-1's
-    /// last point (its overlap, solved cold and dropped from its rows).
+    /// to (s+1)·n/k, and s > 0 starts `overlap` points earlier, on segment
+    /// s-1's last points (solved again and dropped from its rows).
     pub const Segment = struct { first: usize, len: usize };
 
     /// How many segments the session runs this sweep as, each its own row:
@@ -106,7 +112,7 @@ pub const Dc = struct {
         const n = self.innerCount();
         const lo = @as(usize, s) * n / k;
         const hi = (@as(usize, s) + 1) * n / k;
-        const first = if (s == 0) lo else lo - 1;
+        const first = if (s == 0) lo else lo - overlap;
         assert(first < hi);
         return .{ .first = first, .len = hi - first };
     }

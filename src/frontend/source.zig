@@ -3,26 +3,26 @@
 //! HSPICE `.load`, `.vec` and external `.data` inlined; an HDL include
 //! stays an `.include` of its resolved path.
 //! Paths resolve as ngspice resolves them, from the work directory, then
-//! the naming file's directory (source_search.locate).
+//! the naming file's directory (source_search.locate), to an absolute path
+//! no later reader resolves again.
 //! Cites: ngspice inpcom.c (.include, .lib sections), HSPICE [CR] .LIB,
 //! .LOAD, .VEC, .DATA, .ALTER.
 //!
 //! Contents:
-//! - `pub const Error = Io.Dir.ReadFileAllocError || error{...}`
-//! - `pub const ForeignKind = enum`
+//! - `pub const Error`
+//! - `pub const ForeignKind`
 //! - `pub const splitAlters = source_alter.splitAlters`
 //! - `pub fn load(io: Io, arena: Allocator, path: []const u8) Error![]const u8`
 //! - `pub fn expand(io: Io, gpa: Allocator, arena: Allocator, origin: []const u8, src: []const u8) Error![]const u8`
 //! - `pub fn foreignKindForPath(path: []const u8) ?ForeignKind`
 
 const std = @import("std");
-const assert = std.debug.assert;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const vec = @import("vec.zig");
-const source_search = @import("source_search.zig");
-const source_alter = @import("source_alter.zig");
-const source_data = @import("source_data.zig");
+const vec = @import("source/vec.zig");
+const source_search = @import("source/source_search.zig");
+const source_alter = @import("source/source_alter.zig");
+const source_data = @import("source/source_data.zig");
 const Fields = source_search.Fields;
 const Search = source_search.Search;
 const Files = source_search.Files;
@@ -54,6 +54,7 @@ pub const ForeignKind = enum { osdi_include, pre_osdi, verilog_a, verilog, data 
 pub const splitAlters = source_alter.splitAlters;
 
 const Directive = enum { include, lib, endl, load, data, vec };
+
 const directives = std.StaticStringMap(Directive).initComptime(.{
     .{ ".include", .include }, .{ ".inc", .include }, .{ ".lib", .lib }, .{ ".endl", .endl },
     .{ ".load", .load },       .{ ".data", .data },   .{ ".vec", .vec },
@@ -74,7 +75,7 @@ pub fn load(io: Io, arena: Allocator, path: []const u8) Error![]const u8 {
 
 /// Inlines includes and selected .lib sections, finding each file as
 /// ngspice does (source_search.locate) from `origin`, the top deck; an HDL
-/// include stays an `.include` of its resolved path. Returns `src` itself
+/// include stays an `.include` of its resolved, absolute path. Returns `src` itself
 /// when it names none, else a copy in `arena`; `gpa` holds the scratch
 /// (file buffers, the text being built), all freed before return. Fails
 /// per `Error`.
@@ -89,7 +90,15 @@ pub fn expand(io: Io, gpa: Allocator, arena: Allocator, origin: []const u8, src:
     defer out.deinit(gpa);
     var files: Files = .{};
     defer files.deinit(gpa);
-    try appendContents(io, gpa, .{ .deck = origin, .files = &files }, origin, src, null, 0, &out);
+    // Found paths start from the work directory, so `prepare.loadModels`
+    // reads an HDL include where it was found, not again beside the deck.
+    // One that cannot be named (unlinked, too long) leaves them relative.
+    var cwd_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = if (std.process.currentPath(io, &cwd_buf)) |n| cwd_buf[0..n] else |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => ".",
+    };
+    try appendContents(io, gpa, .{ .deck = origin, .cwd = cwd, .files = &files }, origin, src, null, 0, &out);
     return try arena.dupe(u8, out.items);
 }
 
@@ -127,7 +136,7 @@ fn appendFile(io: Io, gpa: Allocator, search: Search, path: []const u8, section:
 /// accepted and unused.
 fn appendLoad(io: Io, gpa: Allocator, search: Search, path: []const u8, tokens: *Fields, depth: u8, out: *std.ArrayList(u8)) Error!void {
     var file: ?[]const u8 = null;
-    while (tokens.next()) |key| {
+    while (tokens.field()) |key| {
         if (!Fields.isWord(key) or !tokens.takeEq()) return error.InvalidInclude;
         const value = (try source_search.word(tokens)) orelse return error.InvalidInclude;
         if (std.ascii.eqlIgnoreCase(key, "file")) file = value else if (!std.ascii.eqlIgnoreCase(key, "run")) return error.InvalidInclude;
@@ -147,7 +156,7 @@ fn appendLoad(io: Io, gpa: Allocator, search: Search, path: []const u8, tokens: 
 }
 
 /// HSPICE `.vec 'file'`: the sources and `.dout` cards the vector file
-/// stands for (frontend/vec.zig).
+/// stands for (frontend/source/vec.zig).
 fn appendVec(io: Io, gpa: Allocator, path: []const u8, out: *std.ArrayList(u8)) Error!void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -177,8 +186,8 @@ fn appendContents(io: Io, gpa: Allocator, search: Search, path: []const u8, src:
             _ = try source_search.word(&tokens);
             if (kind == .data) {
                 // An inline table passes through; MER and LAM read files.
-                const name = tokens.next() orelse "";
-                const mode = tokens.next() orelse "";
+                const name = tokens.field() orelse "";
+                const mode = tokens.field() orelse "";
                 const lam = std.ascii.eqlIgnoreCase(mode, "lam");
                 if (selected and (lam or std.ascii.eqlIgnoreCase(mode, "mer"))) {
                     try source_data.appendData(io, gpa, search, path, name, lam, tokens, &lines, out);

@@ -357,7 +357,8 @@ pub const Executor = struct {
         // Borrowed lanes serve the device stamp and the multicore refactor;
         // both are bitwise their one-thread forms, so only speed moves.
         var lanes = self.config.device_threads;
-        // An explicit ESPICE_THREADS stamps on its lanes whatever the weight.
+        // An explicit ESPICE_THREADS stamps on a ParEval whatever the weight,
+        // one lane per `lane_min_weight` up to its count.
         var eval_lanes = lanes;
         // Lever p1: the plan, not the pool's grant, prices the device.
         var priced_lanes = eval_lanes;
@@ -388,8 +389,13 @@ pub const Executor = struct {
         }
         var par: ?ParEval = null;
         if (eval_lanes > 1) {
+            // At most one stamp lane per `lane_min_weight`: a lane with less
+            // costs its barriers a pass more than its share saves. One lane
+            // still stages and reduces, so the 1-vs-N oracle
+            // (tools/determinism.sh) keeps comparing that path to the serial one.
+            const stamp_lanes: u32 = @intCast(@max(1, @min(eval_lanes, deviceWeight(&self.circuit) / lane_min_weight)));
             const levers: par_eval.Levers = .{ .c6 = perf.c6, .c7 = perf.c7, .n8 = perf.n8, .n3 = perf.n3 };
-            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, eval_lanes, levers);
+            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, stamp_lanes, levers);
             self.circuit.par_eval = &par.?;
             // C7 step 2's census: statistics only.
             if (self.config.knobs.tran_stats) par.?.printCensus();
@@ -611,6 +617,12 @@ const gpu_lu_min_n = 10_000;
 /// measured 3.3x on 4,000 bsim4 at 8 threads and no gain on 4,000 mos1,
 /// whose summed weight sits below this (`gpu/context.zig` cost notes).
 pub const borrow_min_weight: u64 = 4_000_000;
+/// Device weight per ParEval lane. ReleaseSafe, alone on 32 cores, at 1 / 2
+/// / 8 threads: vacask_rc (weight ~150, 1M steps) 6.0 / 9.2 / 12.1 s,
+/// hspice_samples (8) 0.7 / 1.3 / 6.8 s, vacask_graetz (4 diodes, ~1,200)
+/// 39.7 / 32.7 / 25.6 s, device_mos6_inverter (~90,000) 0.81 / 0.49 / 0.19 s
+/// (#248). 512 keeps each lane at half the ideal speedup or better on these.
+const lane_min_weight: u64 = 512;
 /// Matrix entries from which a refactor may be thick enough for the
 /// multicore LU; its own per-epoch admission (`direct.zig`) still decides.
 pub const borrow_min_nnz: u32 = 50_000;

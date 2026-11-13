@@ -1,8 +1,8 @@
 //! Finished results in, the text a deck's cards ask for out: each
 //! optimization's summary, each result's `.meas` block in request order,
 //! the Monte Carlo statistics or SIGMA_SCALE reports, the `.wcd` report,
-//! and the `--tangents` slopes; and the same `.meas` results as JSON
-//! (`--measures`). `run_all` streams the blocks as their turn comes
+//! and the `--tangents` slopes; and the same `.meas` results, with the
+//! optimized parameters, as JSON (`--measures`). `run_all` streams the blocks as their turn comes
 //! (`printReady`); `print_measures` writes what is left.
 //! Cites: none for the `.meas` blocks (output/measure.zig owns their
 //! format); the optimization listings follow HSPICE's [SA Ch.19].
@@ -69,8 +69,12 @@ pub fn writeMeasuresJson(self: *Problem, out: *std.Io.Writer, deck: []const u8) 
     const results = if (self.measure_json) |*j| j.written() else return error.MeasuresJsonOff;
     try out.writeAll("{\n  \"format\": \"espice-measures/1\",\n  \"deck\": ");
     try std.json.Stringify.encodeJsonString(deck, .{}, out);
+    var optimized: std.Io.Writer.Allocating = .init(self.gpa);
+    defer optimized.deinit();
+    try writeOptimized(self, &optimized.writer);
+    const o = optimized.written();
     // Each object is led by `,\n`; the first one's comma goes.
-    try out.print(",\n  \"results\": [{s}\n  ],\n  \"statistics\": [", .{if (results.len == 0) "" else results[1..]});
+    try out.print(",\n  \"results\": [{s}\n  ],\n  \"optimized\": [{s}\n  ],\n  \"statistics\": [", .{ if (results.len == 0) "" else results[1..], if (o.len == 0) "" else o[1..] });
     var stats: std.Io.Writer.Allocating = .init(self.gpa);
     defer stats.deinit();
     try writeStatistics(self, &stats.writer, true);
@@ -314,6 +318,32 @@ fn printOptimization(out: *std.Io.Writer, lm: *const core.lm.Lm, t: *const front
     }
     try out.writeAll("\n  goal errors at the optimum (weight * (result - goal) / max(|goal|, minval))\n");
     for (t.results, lm.r) |card, r| try out.print("  error({s}) = {e:.6}\n", .{ measures[card].name, r });
+}
+
+/// Each optimization's final parameter values, one JSON object led by `,\n`
+/// per `name = value` line its summary prints, in that order: `name`, the
+/// `optimization`, the `.step` `point` it started from when it has one, and
+/// the exact `value`.
+fn writeOptimized(self: *const Problem, out: *std.Io.Writer) !void {
+    const t = if (self.prepared.tuner) |*t| t else return;
+    for (self.optimization, 0..) |*lm, k| for (t.names, lm.x) |name, x| try writeOptimum(out, t, k, name, x);
+    for (self.bisection, 0..) |*b, k| try writeOptimum(out, t, k, t.names[0], b.x);
+}
+
+fn writeOptimum(out: *std.Io.Writer, t: *const frontend.Tuner, base: usize, name: []const u8, x: f64) !void {
+    assert(base < t.bases.len);
+    assert(name.len != 0);
+    try out.writeAll(",\n    {\"name\": ");
+    try std.json.Stringify.encodeJsonString(name, .{}, out);
+    try out.writeAll(", \"optimization\": ");
+    try std.json.Stringify.encodeJsonString(t.spec.name, .{}, out);
+    if (t.bases[base].label.len != 0) {
+        try out.writeAll(", \"point\": ");
+        try std.json.Stringify.encodeJsonString(t.bases[base].label, .{}, out);
+    }
+    try out.writeAll(", \"value\": ");
+    try output.writeJsonNumber(out, x);
+    try out.writeAll("}");
 }
 
 /// The bisection summary: one line per midpoint test with the window it

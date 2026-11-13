@@ -8,8 +8,9 @@
 //! (sweep value, probes...), outer blocks concatenated, then one block per
 //! `tangents` variant row.
 //! A segment of a split sweep (`Options.lane`, dc/segments.zig) runs its
-//! points alone, from a cold start, and keeps its first and last full
-//! solutions for the seam test (`RunCtx.seam`).
+//! points alone, from a cold start, and keeps its full solutions at its
+//! point `Options.overlap - 1` and its last for the seam test
+//! (`RunCtx.seam`).
 //! Cites ngspice dctrcurv.c (predictor, state rotation at :290 and
 //! :457-462, accumulated steps at :469) and DCTsetup;
 //! dev/analysis/dc-sweep.md and dev/analysis/optimize.md (tangent rows).
@@ -280,12 +281,14 @@ fn previous(s: *const Sweep) []f64 {
 }
 
 /// `pt`'s full solution into its half of a segment's `RunCtx.seam` when it
-/// is the segment's first or last point, NaN when it did not converge.
+/// is the segment's last overlap point (`Options.overlap - 1`, the previous
+/// segment's last) or its own last point, NaN when it did not converge.
 fn keepSeam(s: *const Sweep, pt: usize, converged: bool) void {
     const n = s.ckt.n;
     assert(s.ctx.seam.len == 2 * n);
     assert(s.opts.lane != null);
-    for ([_]usize{ 0, s.n_inner - 1 }, 0..) |end, half| if (pt == end) {
+    assert(s.n_inner > Options.overlap);
+    for ([_]usize{ Options.overlap - 1, s.n_inner - 1 }, 0..) |end, half| if (pt == end) {
         const dst = s.ctx.seam[half * n ..][0..n];
         if (converged) @memcpy(dst, s.sol()) else @memset(dst, std.math.nan(f64));
     };

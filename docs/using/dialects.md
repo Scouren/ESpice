@@ -8,8 +8,11 @@ what comes back. Without `--tokenizer` the CLI picks the dialect from
 markers in the deck's own file, ngspice when none is present (see
 [`--tokenizer`](cli.md#options)). A marker is a spelling ESPice's own
 reader refuses, and ngspice 44.2 too: Spectre's `simulator lang=` or `r1
-(a b) resistor` form, or HSPICE's `.dcvolt`, `.temperature`, `.dc ...
-START=` or a `P` card's `PORT=`. So a deck that runs as written is never
+(a b) resistor` form, or HSPICE's `.dcvolt`, `.temperature`, `.sn`,
+`.snac`, `.snnoise`, `.snxf`, `.snosc`, `.hbosc`, `.acphasenoise`,
+`.power`, `.stimuli`, `.jitter`, `.dc ... START=`, a `P` card's
+`PORT=`, or an `E` or `G` card's `SCALE=`, `MAX=`, `MIN=` or `ABS=`. So a
+deck that runs as written is never
 translated, and the stderr note names the line and spelling that sent a
 deck to SpiceRack. Name the dialect to be sure:
 
@@ -49,7 +52,8 @@ espice: spicerack translated <deck> (<d> -> ngspice, <n> files) in <s> s
 espice: finished <deck> in <s> s, plus <s> s in spicerack
 ```
 
-A deck SpiceRack refuses or cannot translate stops with `SpiceRackFailed`,
+A deck SpiceRack refuses stops with `SpiceRackRefused` and SpiceRack's
+coded line; one it cannot translate, with `SpiceRackFailed`,
 `SpiceRackNotFound` or `SpiceRackNoEntry` (see
 [Diagnostics](diagnostics.md)); it is never read as ngspice instead. A deck
 in another dialect is read from a file: one through a pipe or FIFO is
@@ -66,7 +70,12 @@ include search order and `.option search`, its signed
 spellings of ngspice cards (`.temperature`, `.dcvolt` and bare `.ic` /
 `.nodeset` pairs, `.dc src START= STOP= STEP=`, `.noise v(out) src` and
 `.pz v(out) src` without a grid or ports, and the option names `gmindc`,
-`absv`, `relv`, `absi` and `method=bdf`); Spectre's
+`absv`, `relv`, `absi` and `method=bdf`), and its other spellings of
+ESPice's cards: `.sn` (`.pss`), `.snac` (`.pac`), `.snnoise` (`.pnoise`),
+`.snxf` (`.pxf v(out)`), `.snosc` (`.pss v(osc)`), `.hbosc` (`.hb
+v(osc)`), `.acphasenoise` (`.noise`; phnoise is 10·log10(onoise²/2)),
+`.power` (four `.meas tran` cards), `.stimuli` (`.stim`) and `.jitter`
+(`.meas ... jitter`); Spectre's
 statements, its case-sensitive names and `name:param` operating-point
 variables. The library reads ngspice only: the C API refuses any other
 `dialect` with `UnsupportedDialect` ([The C API](../embed/c-api.md)), and
@@ -144,11 +153,10 @@ them as written; `--tokenizer=hspice` sends it through SpiceRack instead.
   MONTE=n` and `MONTE=list(...)`; `SWEEP OPTIMIZE=` with `.param p =
   name(init, lo, hi[, dels[, grid]])` (the grid is ESPice's) and `.meas ... GOAL=`.
 - **Analysis cards:** `.op t1 t2 ...` (operating points at times),
-  `.dc ... POI`, `.ac POI`, `.four f v(a) v(b) ...`, `.fft`, `.lin`,
-  `.net`, `.sn`/`.snac`/`.snxf`/`.snnoise`/`.snosc`, `.hb TONES= NHARMS=`,
-  `.hbosc`, `.hbac`, `.hbxf`, `.hbnoise`, `.hblin`, `.phasenoise`,
-  `.acphasenoise`, `.ptdnoise`, `.lstb`, `.dcmatch`, `.acmatch`,
-  `.dcsens`, `.trannoise`.
+  `.dc ... POI`, `.ac POI` (and `POI` on `.pac`, `.pxf`, `.pnoise`),
+  `.four f v(a) v(b) ...`, `.fft`, `.lin`, `.net`, `.hb TONES= NHARMS=`,
+  `.hbac`, `.hbxf`, `.hbnoise`, `.hblin`, `.phasenoise`, `.ptdnoise`,
+  `.lstb`, `.dcmatch`, `.acmatch`, `.dcsens`, `.trannoise`.
 - **Measurements:** `INTEGRAL`, `DERIVATIVE`, `ERR`, `ERR1`-`ERR3`, `PARAM=`,
   `TRAN_CONT`/`AC_CONT`/`DC_CONT`, `EM_AVG`, `par('expr')`, values that name
   earlier results, `TD=TRIG`, and measures of FFT, LSTB, DCMATCH, ACMATCH,
@@ -158,7 +166,7 @@ them as written; `--tokenizer=hspice` sends it through SpiceRack instead.
   pattern nests at most 32 `[ ]` levels, counted through the `.pat` names
   it reads.
 - **Checks and reports:** `.check rise|fall|slew|setup|hold|edge|irdrop`,
-  `.dout`, `.biaschk`, `.power`, `.stim`.
+  `.dout`, `.biaschk`, `.stim`.
 - **Statistics:** `agauss`, `gauss`, `aunif`, `unif`, `limit`; `DEV` and
   `LOT` tolerances on `.model` values; the `.variation` block.
 - **Other:** `.load` (inline a saved `.ic`/`.nodeset` file), `.save
@@ -189,6 +197,7 @@ anyway.
 | URC card without `l=` | zero length | unit length |
 | Verilog-A `$simparam("gmin")` during gmin stepping | the deck gmin | the stepped gmin |
 | `.options vpi="app.so"` | not an option | ESPice's own: loads a VPI application, as `--vpi` does; see [VPI applications](devices.md#vpi-applications) |
+| two V cards on one `portnum` | ngspice 44.2 refuses: `duplicate port Index` | ESPice's own: one balanced port for `.sp` and `.lin`, HSPICE's mixed-mode P element; see [`.sp`](analyses.md#sp) |
 | `.ic` with `.tran` but without `uic` | held during the transient's operating point | used only under `uic` |
 | `.store` | checkpoints the process | warning; no checkpoint written |
 | `.powerdc` | per-instance port currents | refused |

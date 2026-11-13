@@ -467,7 +467,9 @@ pub fn stampCensus(
 /// about 2x slower than one on a P-core, and four P-core lanes beat four
 /// mixed ones by 1.35-1.38x (dev/devices/gpu-evaluation.md, "Eight host
 /// threads"). The lane counts the thread pool hands out stay within the
-/// P-core threads, so pinned lanes do not pile onto each other.
+/// P-core threads, so pinned lanes do not pile onto each other. Only the
+/// P-cores the thread may already run on: replacing the mask moved the
+/// workers of a run under `taskset -c 0-3` onto cores 0-15 (#248).
 pub fn pinToPerformanceCores() void {
     if (comptime builtin.os.tag != .linux) return;
     const linux = std.os.linux;
@@ -479,7 +481,6 @@ pub fn pinToPerformanceCores() void {
     const n = linux.read(fd, &buf, buf.len);
     if (linux.errno(n) != .SUCCESS) return;
     var set: linux.cpu_set_t = @splat(0);
-    var any = false;
     var ranges = std.mem.tokenizeAny(u8, buf[0..n], ",\n ");
     while (ranges.next()) |r| {
         var ends = std.mem.splitScalar(u8, r, '-');
@@ -487,9 +488,12 @@ pub fn pinToPerformanceCores() void {
         const hi = if (ends.next()) |h| std.fmt.parseInt(usize, h, 10) catch return else lo;
         if (hi < lo or hi >= set.len * @bitSizeOf(usize)) return;
         for (lo..hi + 1) |c| set[c / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(c % @bitSizeOf(usize));
-        any = true;
     }
-    if (any) linux.sched_setaffinity(0, &set) catch {};
+    var allowed: linux.cpu_set_t = undefined;
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &allowed)) != .SUCCESS) return;
+    for (&set, allowed) |*cpus, a| cpus.* &= a;
+    // No allowed P-core (none listed, or a mask of E-cores): stay put.
+    if (std.mem.indexOfNone(usize, &set, &.{0}) != null) linux.sched_setaffinity(0, &set) catch {};
 }
 
 /// Spins, then yields, until `counter` reaches `target`. `pause` frees

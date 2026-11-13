@@ -37,6 +37,9 @@ pub const Dcmatch = struct {
     /// `v(a,b)` reference node for the output; GROUND is single-ended.
     output_neg: u32 = 0,
     variations: Variations = .{},
+    /// The deck's card names: without a variation block, an internal add
+    /// (`CardNames.internal`, such as a portnum V's z0 resistor) has no row.
+    card_names: CardNames = .empty,
 };
 
 /// HSPICE `.acmatch`: the 1-sigma spread of an AC output over the `.ac`
@@ -48,6 +51,9 @@ pub const Acmatch = struct {
     /// `v(a,b)` reference node for the output; GROUND is single-ended.
     output_neg: u32 = 0,
     variations: Variations = .{},
+    /// The deck's card names: without a variation block, an internal add
+    /// (`CardNames.internal`, such as a portnum V's z0 resistor) has no row.
+    card_names: CardNames = .empty,
 };
 
 /// HSPICE `.dcsens`: the DC output's change per one-sigma step of each
@@ -58,6 +64,9 @@ pub const Dcsens = struct {
     /// `v(a,b)` reference node for the output; GROUND is single-ended.
     output_neg: u32 = 0,
     variations: Variations = .{},
+    /// The deck's card names: without a variation block, an internal add
+    /// (`CardNames.internal`, such as a portnum V's z0 resistor) has no row.
+    card_names: CardNames = .empty,
 };
 
 /// Sensitivity of one output to every device parameter (`.sens`): DC, or

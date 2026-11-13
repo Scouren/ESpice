@@ -1,5 +1,5 @@
 //! Developer switches, read from the environment once by the facade
-//! (`espice.zig` `knobsFromEnv`) and carried by `Config.knobs` into
+//! (`espice/config.zig` `knobsFromEnv`) and carried by `Config.knobs` into
 //! `Circuit.knobs`, so nothing below the facade reads the environment. Each
 //! field names its variable; dev/ notes cite them.
 //! In: nothing at run time (plain data). Out: the switches.

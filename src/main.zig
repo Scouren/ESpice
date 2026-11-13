@@ -291,8 +291,6 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
     std.debug.assert(cli.max_parallel != 0);
     const start = std.Io.Timestamp.now(init.io, .awake);
     if (cli.timing_in_depth) std.debug.print("timing: {s}\n", .{path});
-    // Every timed log names the levers it ran with (`core.perf`).
-    if (cli.timing_in_depth) if (std.c.getenv("ESPICE_PERF")) |v| std.debug.print("timing: ESPICE_PERF={s}\n", .{std.mem.span(v)});
     // Each `.meas` block prints as its point ends (`Options.measures`).
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;
@@ -331,11 +329,13 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
         break :real real_buf[0..n];
     };
     var kit: ?spicerack.Kit = if (dialect == .ngspice) null else spicerack.translate(init.gpa, init.io, .{
+        // `--spicerack`'s default, read here and nowhere else: only the CLI
+        // runs spice2rack (the library reads ngspice alone, c_api.zig).
         .exe = cli.spicerack_exe orelse if (std.c.getenv("ESPICE_SPICERACK")) |v| std.mem.span(v) else "spice2rack",
         .dialect = dialect,
         .deck = path,
         .path = real,
-        .tmp_dir = if (std.c.getenv("TMPDIR")) |v| std.mem.span(v) else "/tmp",
+        .tmp_dir = problem.tmpDir(),
     }, &stderr.interface) catch |err| {
         try stderr.interface.flush();
         std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
@@ -366,15 +366,15 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
             .backend = backend,
             .gpu_explicit = cli.explicit_gpu,
             .gpu_quiet = cli.backend == null,
-            .solver_threads = @intCast(@min(envThreads("ESPICE_SOLVER_THREADS"), 16)),
-            .device_threads = envThreads("ESPICE_THREADS"),
             // One deck, run once: no query is appended later.
             .final_plan = true,
             .lanes = cli.lanes,
         },
         .max_parallel = cli.max_parallel,
-        // Unset thread variables: large queries borrow lanes.
-        .auto_threads = std.c.getenv("ESPICE_THREADS") == null and std.c.getenv("ESPICE_SOLVER_THREADS") == null,
+        // The CLI's own default: large queries borrow lanes. `ESPICE_THREADS`
+        // or `ESPICE_SOLVER_THREADS` fixes the counts instead, in the facade
+        // (`Problem.init`), for every caller.
+        .auto_threads = true,
         .timing_in_depth = cli.timing_in_depth,
         .point = cli.point,
         // --plan solves nothing, not even the warm OP.
@@ -524,12 +524,6 @@ fn autoJobs() u16 {
     return jobs;
 }
 
-/// A positive thread count from the environment, 1 when unset or unparsable.
-fn envThreads(comptime name: [:0]const u8) u32 {
-    const value = std.c.getenv(name) orelse return 1;
-    return @max(1, std.fmt.parseInt(u32, std.mem.span(value), 10) catch 1);
-}
-
 /// The value of `short`/`long` given as `-r X`, `--rawfile X` or
 /// `--rawfile=X`. Outer null: `arg` is not this flag. Inner null: the value
 /// is missing or empty (`--rawfile=`), which is a usage error. A separate
@@ -567,8 +561,7 @@ fn calibrate(init: std.process.Init, args: anytype) !u8 {
         if (!std.mem.eql(u8, arg, "--compile-all")) return usageFail();
         opts.compile_all = true;
     }
-    if (std.c.getenv("XDG_CACHE_HOME")) |v| opts.knobs.xdg_cache_home = std.mem.span(v);
-    if (std.c.getenv("HOME")) |v| opts.knobs.home = std.mem.span(v);
+    // The cache roots come from the facade (`calibrate.Options.knobs`).
     var err_buf: [1024]u8 = undefined;
     var stderr: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
     problem.calibrate.run(init.gpa, init.io, opts, &stderr.interface) catch |err| {
@@ -621,19 +614,4 @@ test "parseWindow: T1:T2 with 0 <= T1 < T2, nothing else" {
     try std.testing.expectEqual([2]f64{ 0, 2 }, parseWindow("0:2").?);
     for ([_][]const u8{ "", "1e-6", "3:1", "1:1", "-1:2", "0:inf", "a:2", "1:", ":2", "nan:1" }) |bad|
         try std.testing.expect(parseWindow(bad) == null);
-}
-
-test "envThreads: positive integers only, 1 otherwise" {
-    const libc = struct {
-        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-    };
-    const name = "ESPICE_TEST_THREADS";
-    defer _ = libc.unsetenv(name);
-    _ = libc.unsetenv(name);
-    try std.testing.expectEqual(@as(u32, 1), envThreads(name));
-    for ([_]struct { [*:0]const u8, u32 }{ .{ "8", 8 }, .{ "0", 1 }, .{ "-3", 1 }, .{ "abc", 1 }, .{ "", 1 } }) |case| {
-        try std.testing.expectEqual(@as(c_int, 0), libc.setenv(name, case[0], 1));
-        try std.testing.expectEqual(case[1], envThreads(name));
-    }
 }

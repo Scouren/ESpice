@@ -24,6 +24,9 @@ pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     // A validated plot has the layout: this cannot fail.
     const n_ports = plots.portCount(plot.schema()) catch unreachable;
     assert(n_ports > 0);
+    // `.sp` leads with its probes, as ngspice's plot does.
+    const first = plots.sStart(plot.result.varnames);
+    assert(first + n_ports * n_ports <= plot.result.varnames.len);
     assert(plot.z0.len == 0 or plot.z0.len == n_ports);
     const z0 = if (plot.z0.len == 0) 50.0 else plot.z0[0];
     const v2 = for (plot.z0) |z| {
@@ -45,15 +48,18 @@ pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
         if (n_ports <= 2) {
             // One line per frequency. The data is row-major (S11 S12 S21 S22);
             // the 2-port spec order is S11 S21 S12 S22.
-            const order: []const usize = if (n_ports == 1) &.{1} else &.{ 1, 3, 2, 4 };
-            for (order) |vi| try w.print(" {e} {e}", .{ row[2 * vi], row[2 * vi + 1] });
+            const order: []const usize = if (n_ports == 1) &.{0} else &.{ 0, 2, 1, 3 };
+            for (order) |k| {
+                const vi = first + k;
+                try w.print(" {e} {e}", .{ row[2 * vi], row[2 * vi + 1] });
+            }
             try w.writeByte('\n');
         } else {
             // n-port: the frequency alone, then one matrix row per line.
             try w.writeByte('\n');
             for (0..n_ports) |m| {
                 for (0..n_ports) |n| {
-                    const vi = 1 + m * n_ports + n;
+                    const vi = first + m * n_ports + n;
                     try w.print(" {e} {e}", .{ row[2 * vi], row[2 * vi + 1] });
                 }
                 try w.writeByte('\n');
@@ -139,6 +145,20 @@ test "Touchstone 1-port, 3-port matrix rows and a mismatched z0" {
         .data = &data,
     } });
     try std.testing.expectEqualStrings("! s3p\n# Hz S RI R 75\n0e0\n 2e0 3e0 4e0 5e0 6e0 7e0\n 8e0 9e0 1e1 1.1e1 1.2e1 1.3e1\n 1.4e1 1.5e1 1.6e1 1.7e1 1.8e1 1.9e1\n", w.buffered());
+}
+
+test "Touchstone writes the S block past an .sp plot's probes" {
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    // The probe columns hold 7s and 9s; only S may reach the file.
+    try encode(&w, .{ .title = "p", .result = .{
+        .plotname = "SP Analysis",
+        .varnames = &.{ "frequency", "v(a)", "i(v1)", "v(S_1_1)", "v(S_1_2)", "v(S_2_1)", "v(S_2_2)" },
+        .is_complex = true,
+        .npoints = 1,
+        .data = &.{ 1e9, 0, 7, 7, 9, 9, 0.5, -0.3, 0.8, 0.1, 0.1, -0.05, 0.4, -0.2 },
+    } });
+    try std.testing.expectEqualStrings("! p\n# Hz S RI R 50\n1e9 5e-1 -3e-1 1e-1 -5e-2 8e-1 1e-1 4e-1 -2e-1\n", w.buffered());
 }
 
 test "Touchstone 2-port noise parameters follow the S block" {

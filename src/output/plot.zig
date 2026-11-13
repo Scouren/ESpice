@@ -20,6 +20,7 @@
 //! - `pub fn validateSchema(format: Format, schema: Schema) ValidationError!void`
 //! - `pub fn validateQuery(format: Format, query: core.QuerySchema, title: []const u8, probe_labels: []const []const u8) QueryError!void`
 //! - `pub fn portCount(schema: Schema) ValidationError!u32`
+//! - `pub fn sStart(names: []const []const u8) usize`
 //! - `pub fn sParameter(name: []const u8) ?[2]u32`
 
 const std = @import("std");
@@ -158,24 +159,34 @@ pub fn validateQuery(format: Format, query: core.QuerySchema, title: []const u8,
 }
 
 /// Returns the port count of a complete S matrix: complex data, `frequency`
-/// first, then every `S(m,n)` in row-major order. Touchstone needs this
-/// layout; columns after the S block (`.lin`'s) are allowed.
+/// first, then every `S(m,n)` in row-major order from `sStart` on.
+/// Touchstone needs this layout; columns before the S block (`.sp`'s
+/// probes) and after it (`.lin`'s, donoise's) are allowed.
 pub fn portCount(schema: Schema) ValidationError!u32 {
     const names = schema.varnames;
     if (!schema.is_complex or names.len < 2 or !std.mem.eql(u8, names[0], "frequency")) return error.NotSParameterData;
-    var end: usize = 1;
+    const start = sStart(names);
+    if (start == names.len) return error.NotSParameterData;
+    var end: usize = start;
     while (end < names.len and sParameter(names[end]) != null) end += 1;
-    const last = sParameter(names[end - 1]) orelse return error.NotSParameterData;
+    const last = sParameter(names[end - 1]).?; // names[start] is one.
     const n: usize = last[0];
     if (last[1] != n) return error.NotSParameterData;
     const cells = std.math.mul(usize, n, n) catch return error.NotSParameterData;
-    if (cells != end - 1) return error.NotSParameterData;
-    for (names[1..end], 0..) |name, i| {
+    if (cells != end - start) return error.NotSParameterData;
+    for (names[start..end], 0..) |name, i| {
         const pair = sParameter(name).?; // The scan above stopped at the first non-S name.
         if (pair[0] != i / n + 1 or pair[1] != i % n + 1) return error.NotSParameterData;
     }
     assert(last[0] > 0);
     return last[0];
+}
+
+/// Returns the index of the first S-parameter column of `names`, past
+/// `frequency` and any probes before it; `names.len` when there is none.
+pub fn sStart(names: []const []const u8) usize {
+    for (names, 0..) |name, i| if (sParameter(name) != null) return i;
+    return names.len;
 }
 
 /// Returns the one-based port pair of an `S(m,n)` or ngspice `v(S_m_n)`
@@ -233,6 +244,15 @@ test "output schemas validate unknown sizes, checked dimensions and S-parameter 
     };
     try t.expectEqual(@as(u32, 2), try portCount(complete));
     try validateSchema(.touchstone, complete);
+    // ngspice's `.sp` plot: the probes, S, then the donoise columns.
+    const probed: Schema = .{
+        .varnames = &.{ "frequency", "v(a)", "i(v1)", "v(S_1_1)", "v(S_1_2)", "v(S_2_1)", "v(S_2_2)", "v(Cy_1_1)" },
+        .is_complex = true,
+    };
+    try t.expectEqual(@as(usize, 3), sStart(probed.varnames));
+    try t.expectEqual(@as(u32, 2), try portCount(probed));
+    try t.expectEqual(@as(usize, 2), sStart(&.{ "frequency", "v(a)" }));
+    try t.expectError(error.NotSParameterData, portCount(.{ .varnames = &.{ "frequency", "v(a)" }, .is_complex = true }));
 
     const too_many_names: [65][]const u8 = @splat("v(out)");
     try t.expectError(error.FormatLimitExceeded, validateSchema(.sst2, .{

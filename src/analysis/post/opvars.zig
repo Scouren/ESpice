@@ -146,10 +146,13 @@ pub fn publish(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const
         .steps = res.steps,
         .xmu = if (job == .tran) job.tran.xmu else 0.5,
     };
+    // An `.op` whose variables are all parameters records no column: its
+    // one row has none.
+    const w_in = res.varnames.len;
     var out = res;
     out.varnames = names;
-    out.data = try columns(a, scratch, circuit, deck, res.data, scale, run);
-    out.tangents = try columns(a, scratch, circuit, deck, res.tangents, scale, run);
+    out.data = try columns(a, scratch, circuit, deck, res.data, if (w_in == 0) res.npoints else res.data.len / w_in, scale, run);
+    out.tangents = try columns(a, scratch, circuit, deck, res.tangents, if (w_in == 0) 0 else res.tangents.len / w_in, scale, run);
     return out;
 }
 
@@ -169,25 +172,30 @@ fn closed(steps: []const core.Step, j: usize, xmu: f64) Closed {
     return .{ .method = s.method, .k = integrator.stepCoeffs(s.method, &dts, xmu) };
 }
 
-/// `publish` over the point-major rows of `in`: blocks of `run.steps.len`
-/// rows in a `.tran` (its tangent blocks repeat its rows), each replayed
-/// from its first.
-fn columns(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const types.Circuit, deck: *const core.Deck, in: []const f64, scale: usize, run: Run) ![]const f64 {
+/// `publish` over the `rows` point-major rows of `in`: blocks of
+/// `run.steps.len` rows in a `.tran` (its tangent blocks repeat its rows),
+/// each replayed from its first.
+fn columns(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const types.Circuit, deck: *const core.Deck, in: []const f64, rows: usize, scale: usize, run: Run) ![]const f64 {
     const w_in = scale + deck.opvar_probes.len;
     const kept = scale + deck.probes.len;
     const w_out = kept + deck.opvars.len;
-    std.debug.assert(in.len % w_in == 0);
-    const rows = in.len / w_in;
+    std.debug.assert(in.len == rows * w_in);
     std.debug.assert(run.steps.len == 0 or rows % run.steps.len == 0);
     const out = try a.alloc(f64, rows * w_out);
     if (rows == 0) return out;
     var n_max: usize = 0;
     var own_max: usize = 0;
     var n_replay: usize = 0;
+    // Whether a variable reads the step that reached a row. Only then are
+    // the steps replayed: a run whose first row is no operating point
+    // (TSTART > 0, uic) serves none of those (`publish`), and its steps,
+    // which start mid-history, never reach `closed`.
+    var stepped = false;
     for (deck.opvars) |v| {
         n_max = @max(n_max, circuit.batches[v.batch].n_u);
         own_max = @max(own_max, circuit.batches[v.batch].hooks.op_vars.len);
         if (v.charging) n_replay += 9 * @as(usize, v.ports);
+        stepped = stepped or v.charging or v.companion != null;
     }
     const replay_store = try scratch.alloc(f64, n_replay);
     defer scratch.free(replay_store);
@@ -225,7 +233,7 @@ fn columns(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const typ
         const dst = out[r * w_out ..][0..w_out];
         @memcpy(dst[0..kept], src[0..kept]);
         for (deck.opvar_probes, src[scale..]) |row, v| x[row] = v;
-        const j = if (run.steps.len == 0) 0 else r % run.steps.len;
+        const j = if (run.steps.len == 0 or !stepped) 0 else r % run.steps.len;
         const step: ?Closed = if (j == 0) null else closed(run.steps, j, run.xmu);
         for (deck.opvars, dst[kept..], fixed, on_scale, replays) |v, *o, f, s, *rp| {
             o.* = if (s) src[0] else v.times * (if (v.param != null) f else value(circuit.batches[v.batch], v, x, reals, ints, rp, step));

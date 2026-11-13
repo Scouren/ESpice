@@ -24,7 +24,8 @@ Error: bad_args.sp: InvalidAnalysisArguments
 | `LibrarySectionNotFound`, `InvalidLibrarySection` | `.lib file section` names a section the file does not have | check the section names inside the library |
 | `IncludeDepthExceeded` | includes nested more than 32 deep, usually a file including itself | |
 | `SpiceRackNotFound` | a deck in another dialect than ngspice, and no `spice2rack` to translate it: not at `--spicerack`, `$ESPICE_SPICERACK` or on `PATH` | install SpiceRack, or name it with `--spicerack=PATH`; `--tokenizer=ngspice` reads the deck as written. See [Dialects](dialects.md#other-dialects-spicerack) |
-| `SpiceRackFailed` | `spice2rack` refused the deck (its reason is the stderr line before), exited with an error, or wrote past 64 KiB of stdout or 1 MiB of stderr | fix what SpiceRack names, or report the construct to SpiceRack |
+| `SpiceRackRefused` | `spice2rack` refused a construct of the deck: the line before names its file, line, column and code (`error: spicerack: deck.sp: deck:6:1: W0001 a statement kept as another dialect's text`) | rewrite what SpiceRack names, or report the construct to SpiceRack |
+| `SpiceRackFailed` | `spice2rack` failed some other way: an unreadable deck, a crash (exit 101) or a signal, a usage error, or past 64 KiB of stdout or 1 MiB of stderr; the line before has its exit | report it to SpiceRack with that line |
 | `SpiceRackNoEntry` | `spice2rack` succeeded but printed no single path of a translated deck that exists | a SpiceRack without `--to espice --kit`: update it |
 | `SpiceRackNeedsFile` | a deck in another dialect came through a pipe or FIFO (`/dev/stdin`, `<(...)`): spice2rack opens the deck by path, with no stdin, and would read nothing | save it to a file first |
 
@@ -57,7 +58,7 @@ named `table` makes the rest of the line no longer parse. Rename the node.
 | `FloatingNode` | a node, or a group of nodes, has no DC path to ground: only capacitors, or nothing, connect it; also a node that only an expression reads (`B1 o 0 V={v(a)}` with nothing at `a`) |
 | `VoltageSourceLoop` | voltage sources (and inductors) form a loop that breaks Kirchhoff's voltage law, such as two different sources in parallel |
 | `NonuniqueOperatingPoint` | voltage sources alone form a loop that agrees with KVL, such as two equal sources in parallel: no equation fixes the current around it |
-| `CurrentSourceCutset` | current sources drive a group of nodes with no DC path to ground and their currents do not cancel |
+| `CurrentSourceCutset` | current sources drive a group of nodes with no DC path to ground and their currents do not cancel. A `.ic` on one of the nodes is a DC path for a `.tran`'s operating point, which holds it there as ngspice does; an operating point without that hold (`.op`, `.dc`, `.ac`) then fails with `FloatingNode` |
 | `InvalidParameterValue` | a value out of its allowed range, such as a URC model's `K` |
 | `UnknownParameter`, `WrongNodeCount` | an instance card sets a parameter its device (built-in or Verilog-A) does not declare, such as `ww=10u` for `w=10u`; an `S` or `W` card has a word other than `ON` or `OFF` after its model; an `O` card sets a key other than `v1`, `v2`, `i1`, `i2` or `ic`, such as `len=` (the line's length is its model's `len=`); or a Verilog-A instance has more nodes than its module has ports |
 
@@ -79,8 +80,11 @@ Error: bad_short.sp: VoltageSourceLoop
 | `UnsupportedFrequencySweep` | a sweep type other than `dec`, `oct`, `lin` (or `poi`) |
 | `AnalysisNodeNotFound` | the card's output node does not exist, or is ground |
 | `AnalysisSourceNotFound` | the card names a source (or probe) the deck does not have |
-| `MissingAnalysisCard` | a card that borrows another card's settings, and that card is missing: `.acphasenoise` needs an `.ac`, `.fft` a `.tran`, `.snac` an `.sn` |
-| `UnsupportedAnalysisOutput` | an output form the analysis cannot give, such as `i(...)` in `.fft` |
+| `MissingAnalysisCard` | a card that borrows another card's settings, and that card is missing: `.fft` needs a `.tran`, `.acmatch` an `.ac`, `.ptdnoise` a driven `.pss` |
+| `UnsupportedAnalysisOutput` | an output form the analysis cannot give, such as `i(...)` in `.fft` or a balanced port in `.hblin` |
+| `MissingPortNumber` | the deck's `portnum` numbers skip one: ports run 1 to N |
+| `DuplicatePortNumber` | a third V card on one `portnum`; two make a [balanced port](analyses.md#sp) |
+| `UnbalancedPort` | a balanced port's two V cards differ in z0 or n− |
 
 ```text
 error: analysis: .tf v(b) V9: AnalysisSourceNotFound
@@ -96,8 +100,8 @@ Error: bad_source.sp: AnalysisSourceNotFound
 | `OpDidNotConverge` | the operating point failed even after gmin and source stepping |
 | `HbDidNotConverge`, `QpssDidNotConverge`, `PzDidNotConverge`, `EnvelopeDidNotConverge`, `PacDidNotConverge` | the named analysis did not converge |
 | `MatexDidNotConverge` | a `.matex` step needed a Krylov space larger than its limit, or came out non-finite (stiffness beyond the exponential integrator); run `.tran` instead |
-| `OscillatorDidNotStart` | an autonomous `.pss` or `.hbosc` found no oscillation |
-| `NoPeriodicSteadyState` | an autonomous `.pss` or `.hbosc` started oscillating but its shooting found no periodic orbit. The line before it gives the residual and the swing's factor per period over the start-up: below 1, the oscillation decays to its operating point and has no steady state to publish |
+| `OscillatorDidNotStart` | an autonomous `.pss` or `.hb` found no oscillation |
+| `NoPeriodicSteadyState` | an autonomous `.pss` or `.hb` started oscillating but its shooting found no periodic orbit. The line before it gives the residual and the swing's factor per period over the start-up: below 1, the oscillation decays to its operating point and has no steady state to publish |
 
 For convergence trouble:
 

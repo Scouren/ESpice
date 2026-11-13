@@ -161,7 +161,8 @@ module diode(a, c);
     real egfet, egfet1, fact1, fact2, arg1, argt, pbfact, pbfact1;
     real pbo, gmaold, gmanew, mt, vj_t, cjo_t, is_t, isr_t, bv_t, rs_t, xbv;
     real ae, pe, issw_t, isep_t, vtsw, usw, ihisw, pbosw, gmaswold, gmaswnew, php_t, cjp_t;
-    real ibvx, vfcs, ccox, epsox;
+    real ibvx, ibvmiss, vfcs, ccox, epsox;
+    integer kbv;
     real vtt, ftun, itun_t, itunsw_t, ut, utlim, itun;
 `ifdef SELFHEATING
     real tamb, vte_a, is_a, pwr;
@@ -312,17 +313,25 @@ module diode(a, c);
         else           bv_t = bv * (1.0 - tcv * dtk);
 
         // diotemp.c: the breakdown knee xbv, placed so the breakdown branch
-        // -is(T)*exp(-(xbv+vd)/vtebrk) carries IBV at vd = -BV(T). An IBV
-        // too small to resolve against IS keeps xbv = BV(T).
-        // ponytail: one refinement of ngspice's fixed-point loop, which
-        // meets its reltol*IBV test on that first pass for any real card.
-        // IS here is the total, sidewall included; LEVEL=3 scales IBV by
-        // the area.
+        // -is(T)*exp(-(xbv+vd)/vtebrk) carries IBV at vd = -BV(T): ngspice's
+        // fixed point, at most 25 passes, until the knee's current is within
+        // reltol*IBV of IBV. One pass meets that at reltol=1e-3, not at the
+        // 1e-7 of dc/diode_area_sidewall (3 passes, 1e-3 less current in
+        // breakdown). An IBV too small to resolve against IS keeps xbv =
+        // BV(T). IS here is the total, sidewall included; LEVEL=3 scales IBV
+        // by the area.
         ibvx = (level == 3) ? ibv * ae : ibv;
         xbv = bv_t;
         if (bv > 0.0 && ibvx >= (is_t + isep_t) * bv_t / vt) begin
             xbv = bv_t - vtebrk * ln(1.0 + ibvx / (is_t + isep_t));
-            xbv = bv_t - vtebrk * ln(ibvx / (is_t + isep_t) + 1.0 - xbv / vt);
+            kbv = 0;
+            ibvmiss = 1.0;
+            while (kbv < 25 && ibvmiss > 0.0) begin
+                xbv = bv_t - vtebrk * ln(ibvx / (is_t + isep_t) + 1.0 - xbv / vt);
+                ibvmiss = abs((is_t + isep_t) * (exp((bv_t - xbv) / vtebrk) - 1.0 + xbv / vt) - ibvx)
+                        - $simparam("reltol") * ibvx;
+                kbv = kbv + 1;
+            end
         end
 
         // diotemp.c: RS(T). Floored like vdmos.va's rtemp(): the quadratic

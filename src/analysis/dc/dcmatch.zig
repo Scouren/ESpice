@@ -146,17 +146,34 @@ pub const Groups = struct {
 /// The refs a mismatch or sensitivity solves over, and `vars` numbered
 /// into them: with a variation block only its parameters, in block order
 /// (`Circuit.isolatedParams`, so the circuit's other instances keep sharing
-/// their Model rows), else every parameter (`Circuit.collectParams`).
-/// Free with `deinit` and the allocator `init` took.
+/// their Model rows), else every parameter (`Circuit.collectParams`) but an
+/// internal add's (`CardNames.internal`, such as a portnum V's z0
+/// resistor), which ngspice keeps inside its device. A block names cards,
+/// so it never reaches one. Free with `deinit` and the allocator `init` took.
 pub const Refs = struct {
     refs: []const root.ParamRef,
     vars: Variations,
     owned: bool,
 
     /// Without a variation block `refs` borrows `Circuit.collectParams`'
-    /// cached list; with one both slices are allocated with `a`.
-    pub fn init(a: Allocator, ckt: *root.Circuit, vars: Variations) !Refs {
-        if (vars.starts.len == 0) return .{ .refs = try ckt.collectParams(), .vars = vars, .owned = false };
+    /// cached list when `names` marks no instance internal, else it is a
+    /// copy without those; with a block both slices are allocated with `a`.
+    pub fn init(a: Allocator, ckt: *root.Circuit, vars: Variations, names: root.CardNames) !Refs {
+        if (vars.starts.len == 0) {
+            const all = try ckt.collectParams();
+            for (all) |r| {
+                if (names.internal(r.type, r.index)) break;
+            } else return .{ .refs = all, .vars = vars, .owned = false };
+            // ponytail: a full copy less the internal adds' refs; a circuit of
+            // millions of parameters with a port holds the list twice. Skip
+            // them in `Groups` instead when one does.
+            var kept: std.ArrayList(root.ParamRef) = .empty;
+            errdefer kept.deinit(a);
+            for (all) |r| if (!names.internal(r.type, r.index)) try kept.append(a, r);
+            assert(kept.items.len < all.len);
+            // `.{}`: `deinit` frees its empty `params`, never the caller's.
+            return .{ .refs = try kept.toOwnedSlice(a), .vars = .{}, .owned = true };
+        }
         const refs = try ckt.isolatedParams(a, vars.params);
         errdefer a.free(refs);
 
@@ -184,7 +201,7 @@ pub const Sens = struct {
     /// Contract entry: one real point, each group's dy/dsigma (dy/dp per
     /// parameter without a variation block) in group order.
     pub fn run(ctx: *const root.RunCtx, opts: Sens.Options) !root.Result {
-        return publish(ctx, opts.output_node, opts.output_neg, opts.variations, .sensitivity);
+        return publish(ctx, opts.output_node, opts.output_neg, opts.variations, opts.card_names, .sensitivity);
     }
 };
 
@@ -199,7 +216,7 @@ const Readout = enum { mismatch, sensitivity };
 /// sensitivity (`<type>#<index>.<param>`, or the variation label) in
 /// descending variance order.
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    return publish(ctx, opts.output_node, opts.output_neg, opts.variations, .mismatch);
+    return publish(ctx, opts.output_node, opts.output_neg, opts.variations, opts.card_names, .mismatch);
 }
 
 /// Returns each group's contribution to the mismatch of v(output_node) -
@@ -279,11 +296,11 @@ fn pelgromSigma(ref: root.ParamRef) f64 {
 
 /// Solves the groups and publishes them, as `.dcmatch` (the 3-sigma total
 /// first, variance-sorted) or `.dcsens`.
-fn publish(ctx: *const root.RunCtx, output_node: u32, output_neg: u32, vars: Variations, readout: Readout) !root.Result {
+fn publish(ctx: *const root.RunCtx, output_node: u32, output_neg: u32, vars: Variations, cards: root.CardNames, readout: Readout) !root.Result {
     const a = ctx.allocator;
     const ckt = ctx.circuit;
     const scratch = ctx.scratch_allocator;
-    const sel = try Refs.init(scratch, ckt, vars);
+    const sel = try Refs.init(scratch, ckt, vars, cards);
     defer sel.deinit(scratch);
 
     const groups = try Groups.init(scratch, sel.refs, sel.vars);

@@ -1,7 +1,7 @@
 //! Netlist tests: deck text → `Netlist` (parse, expand, live values), against hand-worked netlists; includes the allocation-failure test of `parse`.
 const std = @import("std");
-const netlist = @import("../netlist.zig");
-const lines = netlist.lines;
+const netlist = @import("../Netlist.zig");
+const tokenizer = netlist.tokenizer;
 const source = netlist.source;
 const Netlist = netlist.Netlist;
 const Value = netlist.Value;
@@ -68,7 +68,7 @@ test "case folding lowercases every byte and counts newlines, at every length" {
     var out: [257]u8 = undefined;
     prng.random().bytes(&src);
     for (0..src.len + 1) |n| {
-        try std.testing.expectEqual(std.mem.countScalar(u8, src[0..n], '\n'), lines.normalize(out[0..n], src[0..n]));
+        try std.testing.expectEqual(std.mem.countScalar(u8, src[0..n], '\n'), tokenizer.normalize(out[0..n], src[0..n]));
         for (src[0..n], out[0..n]) |before, after| try std.testing.expectEqual(std.ascii.toLower(before), after);
     }
 }
@@ -545,6 +545,49 @@ test "model bins: a subcircuit's own bins are picked and read per instance" {
         try std.testing.expectEqualStrings(bin, m.model.?.name);
         try std.testing.expectApproxEqRel(vto, try parameter(m.model.?.kv, "vto"), 1e-12);
     }
+}
+
+test "model bins: bounds that read the subcircuit's parameters pick per instance" {
+    // A PDK's device subcircuit sets the bin bounds as its own parameters
+    // (`lmin=lmin_p`); read at global scope they resolve to nothing, and
+    // the card had no model (UnsupportedDevice naming no card). By hand:
+    // x1 (wsplit=1.5u) puts w=1u in nm.1 and x2 (wsplit=0.5u) in nm.2.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\bounds from subcircuit parameters
+        \\.subckt cell d g wsplit=1.5u
+        \\.param lmin_p=0.9u lmax_p=1.1u
+        \\+ wlo_p=0.1u whi_p=10u
+        \\main d g 0 0 nm l=1u w=1u
+        \\.model nm.1 nmos level=1 lmin=lmin_p lmax=lmax_p wmin=wlo_p wmax=wsplit vto=0.5
+        \\.model nm.2 nmos level=1 lmin=lmin_p lmax=lmax_p wmin=wsplit wmax=whi_p vto=0.7
+        \\.ends
+        \\x1 d g cell
+        \\x2 d g cell wsplit=0.5u
+        \\.end
+    );
+    for ([_][]const u8{ "m.x1.main", "m.x2.main" }, [_][]const u8{ "nm.1", "nm.2" }, [_]f64{ 0.5, 0.7 }) |name, bin, vto| {
+        const model = (try device(nl, name)).model orelse return error.NoModel;
+        try std.testing.expectEqualStrings(bin, model.name);
+        try std.testing.expectApproxEqRel(vto, try parameter(model.kv, "vto"), 1e-12);
+    }
+}
+
+test "parameters: a subcircuit's chained .params fold once per instance, not once per read" {
+    // Each `pk` reads `p(k-1)` twice, so splicing every read expands 2^30
+    // copies of `p0` (a PDK's device subcircuit chains its `.param`s so,
+    // and its model card never finished reading). By hand: p30 = 2^30 * p0.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "chained parameters\n.subckt cell n p0=1\n");
+    for (1..31) |k| try src.print(a, ".param p{d}='p{d}+p{d}'\n", .{ k, k - 1, k - 1 });
+    try src.appendSlice(a, "r1 n 0 'p30'\n.ends\nx1 n cell\nx2 n cell p0=2\n.end\n");
+    const nl = try parse(a, src.items);
+    try std.testing.expectEqual(@as(f64, 1 << 30), try numeric((try device(nl, "r.x1.r1")).positional[0]));
+    try std.testing.expectEqual(@as(f64, 2 << 30), try numeric((try device(nl, "r.x2.r1")).positional[0]));
 }
 
 test ".if chains keep the first true branch, per subcircuit instance" {
@@ -1623,4 +1666,53 @@ test "a lone continuation at the end of input is no statement (#38)" {
     const a = arena.allocator();
     const nl = try parse(a, "lone\nV1 a 0 1\nR1 a 0 1k\n.op\n\\\\\n");
     try std.testing.expectEqual(@as(usize, 1), nl.deck.analyses.len);
+}
+
+test "values: unbraced key=expr in a subcircuit, compiled once, read per card and per instance" {
+    // `compiledAt` caches a body card's `key=expr` by the byte it starts
+    // at: r1's and r2's values start at the same column, so a key that is
+    // not the byte's own address hands r2 r1's expression. The 1146-deck
+    // golden did not see that key bug; this test does. By hand: k*3 and
+    // k+3 at k = 2 and k = 5.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\one compile per body value
+        \\.subckt cell n k=2
+        \\r1 n 0 1k tc1=k*3 tc2=1
+        \\r2 n 0 1k tc1=k+3 tc2=2
+        \\.ends
+        \\x1 n cell
+        \\x2 n cell k=5
+        \\.end
+    );
+    // tc2 after it: the cursor stops where a fresh compile stops.
+    for ([_][]const u8{ "r.x1.r1", "r.x1.r2", "r.x2.r1", "r.x2.r2" }, [_]f64{ 6, 5, 15, 8 }, [_]f64{ 1, 2, 1, 2 }) |name, want, tc2| {
+        const kv = (try device(nl, name)).kv;
+        try std.testing.expectEqual(want, try parameter(kv, "tc1"));
+        try std.testing.expectEqual(tc2, try parameter(kv, "tc2"));
+    }
+}
+
+test "values: braced B expressions in a subcircuit, checked once, keep each card's own text" {
+    // `unbraced` memoizes a body card's B text by its (address, length):
+    // b1's and b2's are the same length, so a key on the length alone
+    // hands b2 b1's text. The 1146-deck golden did not see that key bug;
+    // this test does. By hand: b1 multiplies, b2 adds, in each instance.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\one check per body expression
+        \\.subckt cell a k=2
+        \\b1 a 0 v={{k}*v(a)}
+        \\b2 a 0 v={{k}+v(a)}
+        \\.ends
+        \\x1 n cell
+        \\x2 n cell k=5
+        \\.end
+    );
+    for ([_][]const u8{ "b.x1.b1", "b.x1.b2", "b.x2.b1", "b.x2.b2" }, [_]netlist.expr.Code{ .mul, .add, .mul, .add }) |name, want| {
+        const ops = nl.exprOps((try device(nl, name)).kv[0].value.expr);
+        try std.testing.expectEqual(want, ops[ops.len - 1].code);
+    }
 }
