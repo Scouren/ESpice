@@ -203,6 +203,14 @@
           ) (builtins.filter (backend: builtins.elem system backend.systems) releaseTargets.backends)
         ) (builtins.filter (host: host.system == system) releaseTargets.hosts);
 
+        # In a .run bundle (`bundlers`), the caller's directory: relative
+        # decks and outputs resolve there, never in the bundle's /.
+        callerDir = ''
+          if [ -n "''${ESPICE_CALLER_PWD-}" ]; then
+            cd "$ESPICE_CALLER_PWD" || { echo "espice: the bundle cannot see $ESPICE_CALLER_PWD; run it from under /home or /tmp, or pass absolute paths" >&2; exit 1; }
+            unset ESPICE_CALLER_PWD
+          fi
+        '';
         mkEspice =
           {
             name ? "espice",
@@ -231,6 +239,7 @@
                 -j$NIX_BUILD_CORES --prefix "$out"
               wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig \
                 --set-default ESPICE_SPICERACK ${lib.getExe spice2rack} \
+                --run ${lib.escapeShellArg callerDir} \
                 ${lib.optionalString (hip != "none")
                   "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.rocmPackages.clr ]}"
                 }
@@ -296,8 +305,19 @@
           "espice-${baselineName}-cuda-sm_75" = espiceCuda;
         };
 
+        # nix-bundle's launcher cds into its cache before it runs anything,
+        # so the .run records the caller's directory first and espice's
+        # wrapper returns there (`callerDir`).
         bundlers = lib.optionalAttrs pkgs.stdenv.isLinux {
-          default = nix-bundle.bundlers.${system}.default;
+          default =
+            drv:
+            pkgs.runCommand "${drv.name}.run" { } ''
+              {
+                printf '#!/bin/sh\nESPICE_CALLER_PWD=$PWD; export ESPICE_CALLER_PWD\n'
+                cat ${nix-bundle.bundlers.${system}.default drv}
+              } > $out
+              chmod +x $out
+            '';
         };
 
         checks = {

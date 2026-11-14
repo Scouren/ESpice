@@ -187,6 +187,8 @@ Ubuntu 23.10 and later restrict them through AppArmor by default, and the
 launcher then stops with `Cannot bind mount ... Permission denied`. Permit
 them with `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, or
 install the `.deb` or the tarball instead, which need neither.
+It runs `espice` in the directory you start it from, so relative deck and
+output paths work as with any other install.
 The launcher's host prerequisites are a shell, `tar` and `bzip2`; they are
 needed before the bundled runtime can be extracted.
 
