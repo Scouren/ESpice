@@ -198,6 +198,8 @@ jobs:
   # and packaging/espice-hip.sh picks one at start (tools/hip_bundle.sh).
   hip-package:
     needs: [plan, build]
+    # A single-variant dispatch builds a HIP tarball only when it names one.
+    if: (inputs.variant || 'all') == 'all' || contains(inputs.variant, '-hip-')
     runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.plan.outputs.version }}
