@@ -182,7 +182,11 @@ Every Linux variant also produces a self-extracting `.run` file using
 It includes the application's Nix runtime closure and the pinned Zig
 compiler for `.hdl`; Nix does not need to be installed on the destination.
 HIP bundles include the ROCm runtime. GPU drivers must be installed on the
-host. Linux user namespaces must be permitted for the bundle launcher.
+host. Linux user namespaces must be permitted for the bundle launcher:
+Ubuntu 23.10 and later restrict them through AppArmor by default, and the
+launcher then stops with `Cannot bind mount ... Permission denied`. Permit
+them with `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, or
+install the `.deb` or the tarball instead, which need neither.
 The launcher's host prerequisites are a shell, `tar` and `bzip2`; they are
 needed before the bundled runtime can be extracted.
 

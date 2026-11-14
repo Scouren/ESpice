@@ -164,6 +164,9 @@ jobs:
       - name: Smoke bundle outside Nix
         if: matrix.bundle && steps.cpu.outputs.runnable == 'true'
         run: |
+          # The launcher needs user namespaces it can mount in (docs/using/install.md);
+          # Ubuntu 23.10+ hosts, this runner included, restrict them through AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           docker build -t espice-bundle-smoke -f tools/release-container.Dockerfile tools
           docker run --rm --network none \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
