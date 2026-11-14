@@ -170,9 +170,9 @@ jobs:
           docker build -t espice-bundle-smoke -f tools/release-container.Dockerfile tools
           docker run --rm --network none \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/conformance/tests/netlist:/fixtures:ro" \
+            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/conformance/tests/netlist:/home/bundle/fixtures:ro" \
             -v "$PWD/tools/release_smoke.sh:/smoke.sh:ro" \
-            espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
+            espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /home/bundle/fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
       # The tarball alone for hip-package: 18 .run bundles with ROCm inside
