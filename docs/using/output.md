@@ -89,8 +89,9 @@ frequency_re,frequency_im,i(v1)_re,i(v1)_im,v(in)_re,v(in)_im,v(out)_re,v(out)_i
 
 ### Touchstone and CITIfile
 
-These hold S-parameters only, so they accept only an `.sp` (or `.lin`,
-`.net`) result; anything else fails with `NotSParameterData`, and a deck
+These hold S-parameters only (an `.sp` plot's probe columns stay out),
+so they accept only an `.sp` (or `.lin`, `.net`) result; anything else
+fails with `NotSParameterData`, and a deck
 with no ports with `NoPorts`. Touchstone needs the full S matrix, written
 in real-imaginary form at the ports' reference impedance. Ports with
 different reference impedances write Touchstone 2.0, with each port's z0
@@ -120,8 +121,8 @@ Prefer `binary` or `psf` for interchange.
 
 ## Choosing what is written
 
-ngspice dialect: `.save` lists the vectors to keep; everything else is
-dropped from the results.
+`.save` lists the vectors to keep; everything else is dropped from the
+results.
 
 ```text
 .save v(out) i(vdd)
@@ -137,15 +138,9 @@ point, along a `.dc` sweep and in a `.tran`. Save or measure them by name:
 .meas op gm1 find @m1[gm]
 ```
 
-HSPICE names them `.probe op` (every variable of every device, written as
-`@m1[gm]`) and `.probe lx7(m1)`, Spectre `save m1:gm x1.mn1:vdsat`, and
-each dialect's `.meas` takes the same names (`.meas dc gm1 find lx7(m1)
-at=0.9`). A vector is written under the name it was saved as. HSPICE's
-element template numbers, after its MOSFET output templates: `lx1` vbs,
-`lx2` vgs, `lx3` vds, `lx4` id, `lx7` gm, `lx8` gds, `lx9` gmbs, `lx18`
-cgg, `lv9` vth, `lv10` vdsat; another number refuses the deck. A Spectre
-`inst:t` with a one-character or numeric `t` is a terminal current and is
-not written.
+A vector is written under the name it was saved as. HSPICE's `.probe op`
+and `lx7(m1)`, and Spectre's `save m1:gm`, are SpiceRack's to translate
+into these `@` names ([Dialects](dialects.md#other-dialects-spicerack)).
 
 A device has its model's own variables: each module-scope variable with a
 `desc` or `units` attribute (the LRM's output variables, §3.2.1), such as `vth`,
@@ -173,9 +168,11 @@ device's variables. A `.dc` that sweeps the temperature or a device of the
 same type is not supported yet (#236).
 
 `.print`, `.plot`, `.probe` and `.graph` are otherwise accepted and ignored for the
-same reason. In the HSPICE dialect `.save` has HSPICE's meaning: it writes
-the operating point as a loadable `.nodeset` or `.ic` file, beside the
-output file.
+same reason. A `.save` with a `TYPE=`, `FILE=`, `LEVEL=` or `TIME=` key is
+ESPice's operating-point save, never a vector list (ngspice's list carries
+no `key=value`): `.save type=ic level=top` writes the operating point as a
+loadable `.ic` (or `.nodeset`) file, `<deck>.ic0`, beside the output file,
+and `.load` reads it back.
 
 ## Measurements
 
@@ -210,6 +207,9 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
     {"name": "ph", "analysis": "ac", "variant": {"kind": "monte", "trial": 17}, "value": -1.667081},
     {"name": "off", "analysis": "dc", "variant": {"kind": "nominal"}, "value": null, "error": "out of interval"}
   ],
+  "optimized": [
+    {"name": "rx", "optimization": "opt1", "value": 666.6666667}
+  ],
   "statistics": [
     {"name": "ph", "analysis": "ac", "kind": "monte", "n": 30, "failed": 0, "mean": -1.66, "sigma": 0.02, "min": -1.71, "max": -1.61}
   ],
@@ -222,9 +222,8 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
 - `variant` names what produced the point: `nominal`, `step` (a `.step`
   or card `SWEEP` point, its parameter values in `params`), `data` (a
   `SWEEP DATA` row, its columns in `params`), `alter` (the run's `index`),
-  `monte` (the `trial`), `temp` (an HSPICE `.temp` list entry, in `temp`).
-  A point inside an `.alter` run also carries `alter`, and any point run at
-  a `.temp` entry carries `temp`.
+  `monte` (the `trial`). A point inside an `.alter` run also carries
+  `alter`.
 - `from`, `to` and `at` carry the window and position the stdout line
   prints.
 - Numbers are the shortest text that reads back as the same f64, parameter
@@ -234,6 +233,11 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   analysis failed), never a sentinel number.
 - Results keep the stdout order, so the JSON and the text agree line for
   line; a `_CONT` card's events are `name[1]`, `name[2]`, ... as printed.
+- `optimized` holds each optimization's final parameter values
+  ([reference](reference.md#statistics)), one per `rx = 6.666667e2 $ ...` line of its
+  summary and in the same order: the parameter's `name`, the
+  `optimization`, the `.step` `point` label it started from when it has
+  one, and the exact `value` the line rounds.
 - `statistics` holds, per card and Monte Carlo analysis, the trial count
   `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
   correction), min and max. An analysis run with `SIGMA_SCALE=` has one
@@ -297,19 +301,18 @@ source, for electromigration and IR-drop sign-off (values abridged):
   names (a binned card's bin; null for a card without one), `terminal` the
   device's port and `net` the node it connects to. Internal nodes of a
   device are not terminals. A source lists both of its terminals, so every
-  net's entries sum to zero.
-- In the Spectre dialect an analysis's `emirformat` or `emirfile`
-  parameter sets the flag: the file is `emirfile`, else
-  `<deck stem>.emir.json`, and JSON whatever the format names. In any
-  dialect `.options emirfile="FILE"` does the same; `--emir=FILE` names
-  the file over both.
+  net's entries sum to zero. A `portnum` V is one source between its n+
+  and n−, its z0 inside it, as ngspice's is: the z0 has no entry.
+- `.options emirfile="FILE"` sets the flag and names the file, JSON
+  whatever the name; `--emir=FILE` names the file over it.
 - Under `.step`, `.alter` or a sweep, each variant writes its own file
   (`FILE`, `FILE.2`, ...), the variant's label (the `--measures` object)
   under `variant`.
 - The file is the same at any `--jobs`. The transient runs on the CPU, to
   its end (no early stop).
 
-HSPICE's `.stim` writes transient signals as PWL sources or a `.data`
-table, and `.save` (HSPICE dialect) writes the operating point; both go
-beside the output file, or the working directory without one. HSPICE's own
-listing files (`.mt0`, `.lis`, `.err`) are not written.
+`.stim` writes transient signals as PWL sources or a `.data` table,
+`.save type=ic` writes the operating point, and `.lin format=touchstone`
+writes `<deck>.s<N>p`; all three go beside the output file, or the
+working directory without one, never beside the deck. HSPICE's own listing files
+(`.mt0`, `.lis`, `.err`) are not written.

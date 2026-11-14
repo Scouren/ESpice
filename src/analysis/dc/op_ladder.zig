@@ -10,6 +10,7 @@
 //! Contents:
 //! - `pub const failed: converger.Result`
 //! - `pub const GminStep = struct { gmin, converged }`
+//! - `pub const ladder_solves_max`
 //! - `pub fn solve(ckt: *Circuit, ws: *Workspace, x: []f64, options: Options, hold: []const Force) !converger.Result`
 //! - `pub fn afterPlain(ckt, ws, x, options, hold, plain: ?converger.Result) !converger.Result`
 //! - `pub fn gminFactor(factor: f64, iterations: u16, budget: u16) f64`
@@ -36,7 +37,7 @@ pub const GminStep = struct { gmin: f64, converged: bool };
 /// Solves at most per stepping rung. ngspice has no cap (each rung ends on
 /// its step floor); 100 ended chain_bsim4_100k's gmin stepping at 1.35e-6
 /// while every step still converged.
-const ladder_solves_max = 1000;
+pub const ladder_solves_max = 1000;
 
 /// Solves in a row a gmin descent may keep its factor under
 /// `stall_factor` (a decade per `stall_solves` solves) before it is stalled
@@ -106,13 +107,14 @@ pub fn afterPlain(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, option
 
     // Rung 4: JFNK. Damping plus residual backtracking catches circuits
     // where the factored Newton step wedges. It has no holds, so a held
-    // solve skips it.
-    if (hold.len == 0) {
+    // solve skips it, and no `dv` bound, so a bounded solve skips it too.
+    const jopts = converger.optionsFromTolerances(options.tol, null);
+    if (hold.len == 0 and !(jopts.dv < std.math.inf(f64))) {
         op.coldStart(ckt, x);
         // converger.run clears device limiting state on exit; a direct jfnk
         // call must too, so post-solve evals see clean state.
         defer ckt.clearLimits();
-        const jr = try converger.jfnk(ckt, ws, x, 0, converger.optionsFromTolerances(options.tol, null), root.EvalHook{});
+        const jr = try converger.jfnk(ckt, ws, x, 0, jopts, root.EvalHook{});
         total +|= jr.iterations;
         if (jr.converged) return .{ .converged = true, .iterations = total };
     }

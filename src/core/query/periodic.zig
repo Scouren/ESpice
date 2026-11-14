@@ -29,6 +29,19 @@ pub const Pss = struct {
     period: f64,
     max_shooting_iter: u16 = 50,
     shooting_tol: f64 = 1e-7,
+    /// ngspice's steadycoeff (ngspice-45 dcpss.c:762-786): converging also
+    /// needs every unknown's |x(T) - x(0)| within (swing * `tol.reltol` +
+    /// floor) * `tol.trtol` * steady_coeff, the swing that unknown's max
+    /// minus min over the period just integrated and the floor `tol.vntol`
+    /// on a net, `tol.abstol` on a branch or device-internal row (a name
+    /// holding '#', or none). 0 tests `shooting_tol` alone.
+    steady_coeff: f64 = 0,
+    /// ngspice's harms: nonzero, the query publishes the orbit's spectrum in
+    /// place of its period, ngspice's "Frequency Domain Periodic Steady
+    /// State Analysis" (ngspice-45 dcpss.c:993-1046): `harms` rows, row j at
+    /// j/T, each probe's DFT magnitude over the period's `n_samples`
+    /// samples (dcpss.c:1522-1590).
+    harms: u16 = 0,
     /// Perturbation of the finite-difference monodromy Jacobian.
     fd_epsilon: f64 = 1e-7,
     max_newton_iter: u16 = 50,
@@ -40,19 +53,36 @@ pub const Pss = struct {
     gmres_max_restarts: u32 = 10,
     /// Relative tolerance of the inner GMRES solve.
     gmres_tol: f64 = 1e-3,
-    /// Oscillator node row of an autonomous solve (`.snosc`). The period is
-    /// then an unknown and `period` only its first guess, and this node's
-    /// value at t = 0 is pinned as the phase condition. GROUND means a
-    /// driven circuit with a known period.
+    /// Oscillator node row of an autonomous solve (`.pss v(osc) f`). The
+    /// period is then an unknown and `period` only its first guess, and
+    /// this node's value at t = 0 is pinned as the phase condition. GROUND
+    /// means a driven circuit with a known period, unless `phase_node`
+    /// picks one.
     osc_node: u32 = 0,
+    /// Where an autonomous solve's phase node comes from: `osc_node`, or,
+    /// with `osc_node` GROUND, the non-ground net with the largest swing
+    /// over the last settle period (the lowest row on a tie). ngspice's
+    /// oscnob may name no net, since its shooting never reads that node
+    /// and INPtermInsert makes one (inp2dot.c:677-678).
+    phase_node: enum { given, largest_swing } = .given,
     /// Guess periods an autonomous solve integrates from the kicked DC
     /// point before it measures the period, so the oscillator has settled
-    /// onto its limit cycle (HSPICE's TRINIT, counted in periods).
+    /// onto its limit cycle (HSPICE's TRINIT, counted in periods). They run
+    /// as one transient from t = 0, as ngspice's tstab does, so a PWL or
+    /// pulse start-up kick plays once.
     osc_settle_periods: u16 = 30,
+    /// ngspice's `.pss ... uic`: that settling transient starts from the
+    /// `.ic` values (zero elsewhere), with no operating point.
+    uic: bool = false,
+    /// Seconds: where an integrated period starts on the sources' time
+    /// axis. 0 for a driven circuit. An autonomous solve sets it past its
+    /// settling transient, whose time it continues as ngspice's shooting
+    /// does (dcpss.c:3884, 4218), so the start-up never replays.
+    t_origin: f64 = 0,
 };
 
 /// Periodic or quasi-periodic steady state by harmonic balance (`.hb`;
-/// autonomous `.hbosc` with `osc_node`).
+/// autonomous `.hb v(osc) f` with `osc_node`).
 pub const Hb = struct {
     tol: Tolerances = .{},
     /// Fundamental, in Hz.
@@ -60,10 +90,10 @@ pub const Hb = struct {
     n_harmonics: u16 = 8,
     max_iter: u16 = 200,
     hb_tol: f64 = 1e-9,
-    /// Oscillator node row of an autonomous solve (`.hbosc`): f0 is then an
-    /// unknown seeded from the oscillator's shooting orbit, and this node's
-    /// fundamental is held a pure cosine as the phase condition. GROUND
-    /// means a driven circuit with a known f0.
+    /// Oscillator node row of an autonomous solve (`.hb v(osc) f`): f0 is
+    /// then an unknown seeded from the oscillator's shooting orbit, and
+    /// this node's fundamental is held a pure cosine as the phase
+    /// condition. GROUND means a driven circuit with a known f0.
     osc_node: u32 = 0,
     /// Tones after `f0`, HSPICE `.hb TONES=f0 f1 ...` [CR .HB]; empty for
     /// one tone. Driven only.

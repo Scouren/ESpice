@@ -39,8 +39,11 @@ enum {
 /* espice_create_options.source_kind: source holds a path (origin unused),
  * or netlist text named by origin. */
 enum { ESPICE_FILE = 0, ESPICE_BYTES = 1 };
-/* espice_create_options.dialect */
-enum { ESPICE_NGSPICE = 0, ESPICE_HSPICE = 1, ESPICE_SPECTRE = 2 };
+/* espice_create_options.dialect: ngspice is the only one read. Any other
+ * value is INVALID_ARGUMENT ("UnsupportedDialect"): translate an HSPICE,
+ * Spectre, LTspice, Xyce or VACASK deck with spice2rack first
+ * (`spice2rack --dialect <d> --to espice --kit -o DIR DECK`). */
+enum { ESPICE_NGSPICE = 0 };
 /* espice_create_options.backend */
 enum { ESPICE_CPU = 0, ESPICE_AUTO = 1, ESPICE_CUDA = 2, ESPICE_HIP = 3 };
 /* espice_create_options.output_format */
@@ -163,7 +166,7 @@ void espice_default_options(espice_create_options *options);
  * when capacity > 0 and truncated if necessary. ABI_MISMATCH for an
  * abi_version other than ESPICE_ABI_VERSION or a struct_size that ends
  * before zig_path. INVALID_ARGUMENT for an empty source, an unknown enum
- * value, explicit_gpu above 1, or max_parallel 0 or above 65535. A
+ * value, a dialect other than ESPICE_NGSPICE, explicit_gpu above 1, or max_parallel 0 or above 65535. A
  * successful create consumes its source immediately. */
 espice_status espice_create(const espice_create_options *options,
     espice_problem **out, char *diagnostic, size_t diagnostic_capacity);

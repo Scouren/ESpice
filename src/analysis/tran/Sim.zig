@@ -37,6 +37,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
 const converger = @import("solver").converger;
+const circuit_devices = @import("../circuit_devices.zig");
 const Stream = @import("measure").Stream;
 const root = @import("../types.zig");
 const host_ops = @import("host_ops.zig");
@@ -45,6 +46,7 @@ const sim_init = @import("sim_init.zig");
 const Tangents = @import("Tangents.zig");
 const tran_types = @import("types.zig");
 const Emir = @import("emir.zig").Emir;
+const StepClock = @import("step_clock.zig").StepClock;
 
 const HostOps = host_ops.HostOps;
 const Method = tran_types.Method;
@@ -63,6 +65,8 @@ allocator: std.mem.Allocator,
 tangents: ?*Tangents,
 stream: ?*Stream,
 ws: *converger.Workspace,
+/// `newtonOptions(options)`: every attempt of the run solves with it.
+nr_opts: converger.Options,
 n: usize,
 has_charge: bool,
 /// The two step buffers besides `x`; `cur`, `trial` and `prev` rotate
@@ -91,6 +95,18 @@ lte_state: []f64,
 qt_i_prev: []f64,
 qt_ring: [9][]f64,
 qt_g: []f64,
+/// N3 part 2: `rebase` re-reads only `rebase_batches` (ascending batch
+/// indices: every charge batch with accepted-step state, and every charge
+/// batch sharing a row with one) into `q_scratch` (n + 1), and copies
+/// `rebase_rows` (the rows the stateful ones touch, below n) into `q_vec`.
+/// Empty when the lever is off or narrowing saves no batch.
+rebase_batches: []u32,
+rebase_rows: []u32,
+q_scratch: []f64,
+/// N7: one min per chunk of `bound_chunk` LTE states, filled on the
+/// evaluation's lanes by `bound_lanes`; empty keeps the serial bound.
+bound_mins: []f64,
+bound_chunk: usize,
 /// The step ceiling, ngspice delmin and CKTminBreak, and the state-flip
 /// landing resolution, all in seconds.
 effective_dt_max: f64,
@@ -116,6 +132,8 @@ dt_old: [6]f64,
 steps: u32,
 stats_on: bool,
 st: Stats,
+/// `--timing-in-depth`'s bookkeeping split; unarmed otherwise.
+clock: StepClock,
 /// The integration order of the next attempt, and the run of accepted
 /// steps at `run_order` (gear-3..6 order control).
 order: u8,
@@ -216,7 +234,12 @@ pub fn deinit(s: *Sim) void {
             .{ s.t >= s.options.t_stop or atStop(s.t, s.options.t_stop), s.resolved, s.t, s.options.t_stop, s.waveform.len, s.n_qt, s.steps, st.attempts, st.nr_iters, st.rej_newton, st.rej_lte, st.rej_state, st.rej_vpi, st.order_drops, st.bp_landings, st.by_order, st.first_dt, st.max_dt, if (s.steps > 0) s.t / @as(f64, @floatFromInt(s.steps)) else 0 },
         );
     }
+    s.clock.print(s.steps, s.st.attempts, s.lteIp().len, s.bound_mins.len > 1);
     const a = s.allocator;
+    a.free(s.bound_mins);
+    a.free(s.q_scratch);
+    a.free(s.rebase_rows);
+    a.free(s.rebase_batches);
     a.free(s.lte_state);
     a.free(s.lte_zero);
     a.free(s.lte_rows);
@@ -224,6 +247,15 @@ pub fn deinit(s: *Sim) void {
     a.free(s.x_prev);
     a.free(s.x_try);
     s.ckt.land_rejects = false;
+    // N6's census (`sim_init`): one line per batch that counted, then off.
+    if (s.stats_on) for (s.ckt.batches) |b| {
+        const counts = b.hooks.census_counts orelse continue;
+        const c = counts(b.ctx);
+        if (c.charge_pairs + c.limit_pairs > 0) std.debug.print("latency-census: model={s} charge_same={d}/{d} limit_same={d}/{d}\n", .{ b.type_name, c.charge_same, c.charge_pairs, c.limit_same, c.limit_pairs });
+        if (b.hooks.census) |census| _ = census(b.ctx, false);
+    };
+    // Off whether or not `init` turned it on: a later analysis runs today's pass.
+    if (s.ckt.knobs.perf.n3) circuit_devices.setChargeTracking(s.ckt, false);
     s.* = undefined;
 }
 
@@ -251,6 +283,7 @@ pub fn drive(s: *Sim) !bool {
 pub fn begin(s: *Sim, ops: anytype) !?Attempt {
     const options = s.options;
     if (!(s.t < options.t_stop and !atStop(s.t, options.t_stop) and s.steps < options.max_steps)) return null;
+    s.clock.start();
     const ckt = s.ckt;
     if (s.st.attempts != 0) try ckt.checkpoint(s.event(s.dt));
     s.attempted_dt = s.dt;
@@ -289,14 +322,13 @@ pub fn begin(s: *Sim, ops: anytype) !?Attempt {
         .ag = undefined,
         .c = undefined,
         .hook = undefined,
-        .nr_opts = undefined,
+        .nr_opts = s.nr_opts,
     };
-    a.c = if (gear_hi) blk: {
-        a.ag = integrator.gearAg(s.order, &a.dts);
-        break :blk .{ .ag0 = a.ag[0], .ag2 = 0 };
-    } else integrator.coeffs(eff_method, dt, s.dt_old[0], options.xmu);
+    const sc = integrator.stepCoeffs(eff_method, &a.dts, options.xmu);
+    a.c = sc.c;
+    a.ag = sc.ag;
     ops.attempt(s, &a);
-    a.nr_opts = newtonOptions(options);
+    s.clock.lap(.begin);
     return a;
 }
 
@@ -318,6 +350,7 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
     const gear_hi = a.gear_hi;
     s.st.attempts += 1;
     s.st.nr_iters += nr.iterations;
+    s.clock.start();
 
     if (!nr.converged) {
         s.st.rej_newton += 1;
@@ -365,6 +398,7 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
     // residual all see q(trial).
     // `q_fresh`: the converger's `updateStates` already stamped them.
     if (has_charge) ops.charges(s, a);
+    s.clock.lap(.charges);
     const lte: integrator.LteIn = .{
         .dt = dt,
         .dt1 = s.dt_old[0],
@@ -479,6 +513,7 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
         // spaces run it: ngspice keeps it per state in
         // CKTstates[0][qcap+1], where CKTterr's volttol reads it.
         // Then [cur, prev, prev2, ...] -> [stale, cur, prev, ...].
+        s.clock.lap(.bound);
         ops.advance(s, a);
     }
     std.mem.copyBackwards(f64, s.dt_old[1..], s.dt_old[0 .. s.dt_old.len - 1]);
@@ -497,6 +532,8 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
     // §4.5.2 delay-line bookkeeping, once per accepted point
     // (`Hooks.commit_state`), then the commit that latches every stage.
     ops.commit(s);
+    // N6's census: this point is the limit passes' reference (stats only).
+    if (s.stats_on) for (ckt.batches) |b| if (b.hooks.census_accept) |f| f(b.ctx, s.cur);
 
     // Landed on a breakpoint: drop to BE and resume at
     // 0.1*min(saveDelta, gap to the next break), spice3 dctran's rule,
@@ -547,13 +584,14 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
     // txl2_3_line, hfet_inverter, mesa_oscillator and mos6_inverter.
     // `evalQ` computes the same q bits as `eval`, charges only.
     ops.rebase(s, a);
+    s.clock.lap(.ring);
     // `--emir` (#237): the terminal currents at the committed point,
     // under this step's companion coefficients.
     if (s.emir) |e| e.point(ckt, s.cur, t_new, .{ .method = eff_method, .c = cf, .ag = a.ag, .gear_hi = gear_hi });
 
     // ngspice neither steps onto TSTART nor prints it: dctran.c dumps
     // the accepted points at t >= CKTinitTime and nothing else (#167).
-    if (t_new >= options.t_start) try s.waveform.record(t_new, ops.accepted(s), s.probes);
+    if (t_new >= options.t_start) try s.waveform.recordStep(t_new, ops.accepted(s), s.probes, .{ .h = dt, .method = eff_method });
     // Before the breakpoint search below, so a time a callback forces
     // from this point is landed on.
     if (s.vpi) |v| v.accept(v.ctx, false, t_new >= options.t_stop or atStop(t_new, options.t_stop));
@@ -581,6 +619,7 @@ pub fn end(s: *Sim, a: *const Attempt, nr: converger.Result, ops: anytype) !Verd
 
     s.dt = dt_next;
     if (t_new + s.dt > options.t_stop) s.dt = options.t_stop - t_new;
+    s.clock.lap(.record);
     return .go;
 }
 
@@ -686,4 +725,7 @@ test "atStop: within 100 ulps of t_stop, not past them" {
 
 test {
     _ = @import("floor_retry_test.zig");
+    _ = @import("gpu_uic_test.zig");
+    _ = @import("gpu_gear_test.zig");
+    _ = @import("gpu_snapshot_test.zig");
 }

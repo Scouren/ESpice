@@ -15,8 +15,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
+const abi = @import("device").abi;
 const converger = @import("solver").converger;
 const root = @import("../types.zig");
+const bound_lanes = @import("bound_lanes.zig");
 const integrator = @import("integrator.zig");
 const Sim = @import("Sim.zig");
 const Attempt = Sim.Attempt;
@@ -86,10 +88,14 @@ pub const HostOps = struct {
     /// `stepBound` (order <= 2) of `method` after a step at `a.method`.
     pub inline fn bound(_: HostOps, s: *Sim, a: *const Attempt, method: Method, lte: integrator.LteIn) f64 {
         const h = s.lteHist();
+        if (s.bound_mins.len > 1) if (s.ckt.par_eval) |pe|
+            return bound_lanes.boundLanes(pe, s.bound_mins, s.bound_chunk, method, a.method, .{ h[0], h[1], h[2], h[3] }, s.lteIp(), a.c, lte);
         return integrator.stepBound(W, method, a.method, .{ h[0], h[1], h[2], h[3] }, s.lteIp(), a.c, lte);
     }
-    /// `stepBoundGear` of `method` after a step at `a.method`.
+    /// `stepBoundGear` of `method` after a step at `a.method`; its lane
+    /// min under N7, the same bits.
     pub inline fn boundGear(_: HostOps, s: *Sim, a: *const Attempt, method: Method, lte: integrator.LteIn) f64 {
+        if (s.ckt.knobs.perf.n7) return integrator.stepBoundGearLanes(method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
         return integrator.stepBoundGear(method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
     }
     /// advanceCurrent on both index spaces, then the ring rotation.
@@ -99,21 +105,25 @@ pub const HostOps = struct {
         integrator.advanceCurrent(a.method, s.i_prev, q_hist[0], q_hist[1], if (a.gear_hi) s.g_row else q_hist[2], a.c);
         if (s.n_qt > 0)
             integrator.advanceCurrent(a.method, s.qt_i_prev, qt_hist[0], qt_hist[1], if (a.gear_hi) s.qt_g else qt_hist[2], a.c);
-        std.mem.rotate([]f64, q_hist, s.n_hist - 1);
-        if (s.n_qt > 0) std.mem.rotate([]f64, qt_hist, s.n_hist - 1);
+        shiftRing(q_hist);
+        if (s.n_qt > 0) shiftRing(qt_hist);
     }
     /// commitStates and the commit, at the rotated `cur`.
     pub inline fn commit(_: HostOps, s: *Sim) void {
         _ = s.ckt.commitStates(s.cur);
         _ = s.ckt.stateCtl(.commit);
     }
-    /// The stateful-charge re-read at `cur` (`has_state_q`).
+    /// The stateful-charge re-read at `cur` (`has_state_q`); under N3
+    /// over `Sim.rebase_batches` only (`rebaseNarrow`), the same bits.
     pub inline fn rebase(_: HostOps, s: *Sim, a: *const Attempt) void {
         const ckt = s.ckt;
         const q_hist = s.qHist();
         const qt_hist = s.qtHist();
         if (!(s.has_charge and ckt.has_state_q)) return;
-        ckt.evalQ(s.cur, s.t);
+        if (s.rebase_batches.len > 0 and ckt.gpuContext() == null and ckt.par_eval == null)
+            rebaseNarrow(s)
+        else
+            ckt.evalQ(s.cur, s.t);
         integrator.rebaseCurrent(s.i_prev, ckt.q_vec[0..s.n], q_hist[1], a.c.ag0);
         num.copySimd(q_hist[1], ckt.q_vec[0..s.n]);
         if (s.n_qt > 0) {
@@ -144,7 +154,7 @@ pub fn lteSnap(c: *root.Circuit, dst: []f64, zero: []const [2]u32, rows: []const
 }
 
 /// Prints the operands of the state that bound a rejected step
-/// (`ESPICE_TRAN_LTE_TRACE`), replayed from the captured history. Asserts
+/// (`ZP_TRAN_LTE_TRACE`), replayed from the captured history. Asserts
 /// that the replay reproduces `bound` bit for bit.
 pub fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrator.LteIn, bound: f64) void {
     const hit = integrator.diagnoseBound(a.method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
@@ -181,4 +191,56 @@ pub fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrato
         "tran-lte-operands: ip={e:.17} i_new={e:.17} current_tol={e:.17} charge_tol={e:.17} tol={e:.17} dd={e:.17} lte_coefficient={e:.17} unrooted_bound={e:.17} ag0={e:.17} ag1={e:.17} ag2={e:.17} trtol={e:.17}\n",
         .{ hit.i_prev, hit.i_new, hit.current_tol, hit.charge_tol, hit.tolerance, hit.difference, hit.coefficient, hit.unrooted_bound, a.c.ag0, a.c.ag1, a.c.ag2, lte.trtol },
     );
+}
+
+// ---- private ----
+
+/// `evalQ(cur, t)`'s `q_vec` and tapes, re-reading only `rebase_batches`
+/// into `q_scratch`. Every other charge batch has no accepted-step state,
+/// so its tape and its terms still hold the accept pass's bits at the same
+/// x, time and state, and only re-read batches stamp `rebase_rows`: each
+/// copied row sums the same terms from +0.0 in the same batch order.
+fn rebaseNarrow(s: *Sim) void {
+    const ckt = s.ckt;
+    const scratch = s.q_scratch;
+    assert(scratch.len == @as(usize, ckt.n) + 1);
+    assert(s.rebase_rows.len <= ckt.n);
+    num.zeroSimd(scratch);
+    const pl: abi.Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = scratch };
+    for (s.rebase_batches) |bi| {
+        const b = ckt.batches[bi];
+        b.hooks.eval_q.?(b.ctx, &pl, 0, b.count, s.cur, s.t);
+    }
+    for (s.rebase_rows) |r| ckt.q_vec[r] = scratch[r];
+    // What `evalQ` leaves besides the planes.
+    ckt.lin.valid = false;
+    ckt.q_fresh = false;
+}
+
+/// Moves every history slot one older, [cur, prev, ...] -> [stale, cur,
+/// prev, ...]: the oldest slot comes round as the scratch slot 0. The
+/// permutation of `std.mem.rotate(h, h.len - 1)` (the GPU lanes and emir
+/// still move their rings that way), without its three reversals: they
+/// cost 3.6% of vacask_rc's instructions.
+fn shiftRing(h: [][]f64) void {
+    assert(h.len > 0);
+    const stale = h[h.len - 1];
+    std.mem.copyBackwards([]f64, h[1..], h[0 .. h.len - 1]);
+    h[0] = stale;
+}
+
+test "shiftRing is std.mem.rotate by len - 1 at every ring length" {
+    var block: [10]f64 = undefined;
+    for (1..10) |len| {
+        var a: [9][]f64 = undefined;
+        var b: [9][]f64 = undefined;
+        for (a[0..len], b[0..len], 0..) |*x, *y, k| {
+            x.* = block[k..][0..1];
+            y.* = x.*;
+        }
+        shiftRing(a[0..len]);
+        std.mem.rotate([]f64, b[0..len], len - 1);
+        for (a[0..len], b[0..len]) |x, y| try std.testing.expectEqual(y.ptr, x.ptr);
+        if (len > 1) try std.testing.expect(a[0].ptr != a[1].ptr);
+    }
 }

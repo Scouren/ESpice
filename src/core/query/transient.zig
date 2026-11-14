@@ -110,6 +110,9 @@ pub const PointOptions = struct {
     /// `emir`'s window in seconds, read as `.meas` FROM=/TO= read theirs:
     /// `to` 0 runs to the end.
     emir_window: [2]f64 = .{ 0, 0 },
+    /// Keep each recorded row's step in `Result.steps`, which device
+    /// operating-point variables replay (#236).
+    steps: bool = false,
 };
 
 /// Transient noise: a transient with sampled noise sources, or the noise

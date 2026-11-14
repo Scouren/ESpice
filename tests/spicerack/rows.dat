@@ -1,0 +1,4 @@
+* rows.dat: a decoy in the working directory of the spicerack/data check,
+* named as files_spice2rack.sh's .data file. Read in its place, rl = 3k
+* and v(out) is 1.5 V, not 1 V.
+3k

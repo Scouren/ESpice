@@ -27,6 +27,7 @@ module mos6(d, g, s, b);
 
     // ---- channel (Sakurai-Newton), ngspice MOS6 names/defaults -------------
     parameter real    vto   = 0.0;                      // zero-bias threshold [V]
+    aliasparam vt0 = vto;                    // ngspice mos6.c:116 IOPR spelling
     // KV = 0 is legal in ngspice (vdsat collapses to 0 => always the saturation
     // expression); mos6set.c range-checks nothing but PHI > 0.
     parameter real    kv      = 2.0 from [0:inf);   // Vdsat coefficient [V^(1-nv)]

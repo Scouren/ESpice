@@ -1,13 +1,13 @@
 //! Netlist tests: deck text → `Netlist` (parse, expand, live values), against hand-worked netlists; includes the allocation-failure test of `parse`.
 const std = @import("std");
-const netlist = @import("../netlist.zig");
-const lines = netlist.lines;
+const netlist = @import("../Netlist.zig");
+const tokenizer = netlist.tokenizer;
 const source = netlist.source;
 const Netlist = netlist.Netlist;
 const Value = netlist.Value;
 
 fn parse(arena: std.mem.Allocator, src: []const u8) !Netlist {
-    return netlist.parse(arena, src, .ngspice);
+    return netlist.parse(arena, src);
 }
 
 fn device(nl: Netlist, name: []const u8) !Netlist.View {
@@ -30,6 +30,18 @@ fn parameter(kv: []const netlist.Kv, name: []const u8) !f64 {
 fn pinNames(nl: Netlist, d: Netlist.View, buf: [][]const u8) []const []const u8 {
     for (d.pins, 0..) |v, i| buf[i] = nl.netName(v);
     return buf[0..d.pins.len];
+}
+
+/// SpiceRack #10's layout (P8-210): `deck/deck.sp` under `tmp` includes
+/// `rel.inc`, which only the work directory holds (`r_cwd`). Every test
+/// shares the process's directory, so the deck names the file by its path
+/// from there, a name absent from the deck's directory. Returns the deck's
+/// path.
+fn workDirDeck(io: std.Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]const u8 {
+    try tmp.dir.createDirPath(io, "deck");
+    try tmp.dir.writeFile(io, .{ .sub_path = "deck/deck.sp", .data = try a.print("t\n.include '.zig-cache/tmp/{s}/rel.inc'\n.end\n", .{tmp.sub_path}) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "rel.inc", .data = "r_cwd a 0 1\n" });
+    return a.print(".zig-cache/tmp/{s}/deck/deck.sp", .{tmp.sub_path});
 }
 
 test "HDL includes are foreign models; ordinary includes are inert" {
@@ -56,7 +68,7 @@ test "case folding lowercases every byte and counts newlines, at every length" {
     var out: [257]u8 = undefined;
     prng.random().bytes(&src);
     for (0..src.len + 1) |n| {
-        try std.testing.expectEqual(std.mem.countScalar(u8, src[0..n], '\n'), lines.normalize(out[0..n], src[0..n]));
+        try std.testing.expectEqual(std.mem.countScalar(u8, src[0..n], '\n'), tokenizer.normalize(out[0..n], src[0..n]));
         for (src[0..n], out[0..n]) |before, after| try std.testing.expectEqual(std.ascii.toLower(before), after);
     }
 }
@@ -144,6 +156,69 @@ test "source: a library named by several .lib cards gives each its own section" 
     try std.testing.expectEqualStrings("t\nm1 d g s b n\nr1 a 0 1k\nm1 d g s b n\n.end\n\n", text);
 }
 
+// Oracle: ngspice-45 (`./name` first, inpcom.c:2207-2252) reads a nested
+// library named from the work directory, so it reads the first layout below
+// run from the deck's directory, as SpiceRack #4's harness runs it
+// (P1-037/b, files as it ran). Run from elsewhere, as here, ESPice reads it
+// from the top deck's directory.
+test "source: a nested .lib named from the top deck's directory is found there, after the parent's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".cross_sim_inc");
+    try tmp.dir.writeFile(io, .{ .sub_path = "deck.sp", .data = "* ex2a\n.lib '.cross_sim_inc/1-ex2.lib' MOS\nI1 7 0 -1m\nX1 7 0 sub1_in_lib\nVcheck1 7 check1 1\nI2 9 0 -1m\nX2 9 0 sub2_in_lib\nVcheck2 9 check2 2\n.op\n.end\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".cross_sim_inc/1-ex2.lib", .data = ".lib MOS\n.subckt sub1_in_lib n1 n2\n.lib '.cross_sim_inc/1-ex2.lib' RES\nXsub1 n1 n2 sub3_in_lib\nR1a n1 n2 4k\nR1b n1 n2 2k\n.ends sub1_in_lib\n.subckt sub2_in_lib n1 n2\n.lib '.cross_sim_inc/1-ex2.lib' RES\nXsub2 n1 n2 sub3_in_lib\nR2 n1 n2 4k\n.ends sub2_in_lib\n.endl MOS\n.lib RES\n.subckt sub3_in_lib n1 n2\nR3 n1 n2 4k\n.ends sub3_in_lib\n.endl RES\n" });
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}/deck.sp", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const text = try source.load(io, std.testing.allocator, path);
+    defer std.testing.allocator.free(text);
+    // Each subcircuit's nested card reads RES; beside the library it would
+    // name .cross_sim_inc/.cross_sim_inc/1-ex2.lib, which does not exist.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "R3 n1 n2 4k"));
+    // Past the work directory, which holds no res.lib, the parent library's
+    // directory (ngspice's `dir`) comes before the top deck's.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".cross_sim_inc/1-ex2.lib", .data = ".lib MOS\n.lib 'res.lib' RES\n.endl MOS\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".cross_sim_inc/res.lib", .data = ".lib RES\nr_parent a 0 1\n.endl RES\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "res.lib", .data = ".lib RES\nr_deck a 0 1\n.endl RES\n" });
+    const parent = try source.load(io, std.testing.allocator, path);
+    defer std.testing.allocator.free(parent);
+    try std.testing.expect(std.mem.indexOf(u8, parent, "r_parent a 0 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent, "r_deck") == null);
+    // Found in neither, the open still fails.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".cross_sim_inc/1-ex2.lib", .data = ".lib MOS\n.lib 'nowhere.lib' RES\n.endl MOS\n" });
+    try std.testing.expectError(error.FileNotFound, source.load(io, std.testing.allocator, path));
+}
+
+// Oracle: ngspice-45 tries `./name` in the work directory before the naming
+// file's directory (inp_pathresolve_at, inpcom.c:2207-2252), so it runs
+// SpiceRack #10's deck, whose rel.inc only the work directory holds.
+test "source: an include only the work directory holds is read from there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deck = try workDirDeck(io, a, &tmp);
+    try std.testing.expectEqualStrings("t\nr_cwd a 0 1\n\n.end\n\n", try source.load(io, a, deck));
+}
+
+// Oracle: as above; ngspice's first try is the work directory, so it wins
+// when the deck's directory holds the name too.
+test "source: an include both the work directory and the deck's directory hold is the work directory's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deck = try workDirDeck(io, a, &tmp);
+    const beside = try a.print("deck/.zig-cache/tmp/{s}", .{tmp.sub_path});
+    try tmp.dir.createDirPath(io, beside);
+    try tmp.dir.writeFile(io, .{ .sub_path = try a.print("{s}/rel.inc", .{beside}), .data = "r_deck a 0 1\n" });
+    try std.testing.expectEqualStrings("t\nr_cwd a 0 1\n\n.end\n\n", try source.load(io, a, deck));
+}
+
 fn expandAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8, src: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -156,10 +231,9 @@ test "source.expand: every allocation failure surfaces as OutOfMemory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "Models");
-    try tmp.dir.createDirPath(io, "Search");
     try tmp.dir.writeFile(io, .{ .sub_path = "Models/lib.sp", .data = ".lib ss\n.include missing.sp\n.endl\n.lib tt\n.inc 'res.sp'\n.include 'm.va'\n.endl\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "Models/res.sp", .data = "R1 out 0 1k\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "Search/found.sp", .data = "R2 out 0 2k\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "found.sp", .data = "R2 out 0 2k\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "a.dat", .data = "1 1k\n2 3k\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.dat", .data = "9k, 0.5\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "deck.ic0", .data = ".ic v(out)=0.5\n" });
@@ -167,7 +241,6 @@ test "source.expand: every allocation failure surfaces as OutOfMemory" {
     defer std.testing.allocator.free(path);
     const src =
         \\expand under allocation failure
-        \\.option search='Search'
         \\.lib 'Models/lib.sp' tt
         \\.include 'found.sp'
         \\.data rows MER
@@ -218,6 +291,66 @@ test "parameters: unquoted parameter model and instance expressions" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5e-6), try parameter((try device(nl, "m1")).kv, "l"), 1e-18);
     try std.testing.expectEqual(@as(f64, 1000), try parameter((try device(nl, "r1")).kv, "r"));
     try std.testing.expectEqualStrings("nm", (try device(nl, "m1")).model.?.name);
+}
+
+test "parameters: a three-argument limit refuses as PSPICE's clamp; two arguments stay numparam's limit" {
+    // numparam's limit(nom, var) folds to its nominal (xpressn.c:81-85).
+    // Three arguments are PSPICE's LIMIT(x, a, b), a clamp only ngspice's
+    // PSPICE mode defines (inpcompat.c:692-695). Plain ngspice-44.2 draws
+    // nom ± the last argument, {limit(0.25, 0, 1)} = -0.75, and reads 0 in
+    // a B source or an E VALUE (measured): no number to match, so each
+    // site refuses (UnsupportedCard), and SpiceRack translates PSPICE decks
+    // first. Red before: the prebuilt espice of 2026-11-10 solved
+    // `vp p 0 {p}` with p = limit(0.25, 0, 1) at 0 V; the tree then
+    // clamped it to 0.25.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        ".param p={limit(0.25, 0, 1)}\nvp p 0 {p}\n",
+        ".param p={limit(0.25, 0, 1)}\n",
+        "r1 a 0 {1+2*limit(3, 0, 1)}\n",
+        "v1 a 0 1\nb1 o 0 v=limit(v(a), 0, 1)\n",
+        "v1 a 0 1\ne1 o 0 value={limit(v(a), 0, 1)}\n",
+        "r1 a 0 {limit(5)}\n",
+    }) |body| try std.testing.expectError(error.UnsupportedCard, parse(a, try a.print("pspice limit\n{s}.end\n", .{body})));
+    const nl = try parse(a, "numparam limit\nr6 a 0 {limit(5, 1)}\n.end\n");
+    try std.testing.expectEqual(@as(f64, 5), try numeric((try device(nl, "r6")).positional[0]));
+}
+
+test "parameters: pow and pwr are numparam's in a .param and a value, the B parser's in a B or E expression and the .func bodies it calls" {
+    // numparam's pow is C's and its pwr |x|^y (xpressn.c XFU_POW, XFU_PWR);
+    // the B parser's pow is |x|^y and its pwr sign(x)·|x|^y (ptfuncs.c
+    // PTpower, PTpwr). A parameter's text stays numparam's where a B card
+    // reads it (b5); a .func body takes its caller's. ngspice-44.2 printed
+    // each value (src/tests/expressions.zig runs the same cards end to
+    // end). Red before: r1, r3, r4, b2, b4, b5 and e1 read the other
+    // meaning (the 2026-11-10 binary, measured on the same cards).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\pow and pwr
+        \\.param p1={pow(-2,3)}
+        \\.func fw(x) {pwr(x,3)}
+        \\.func fp(x) {pow(x,3)}
+        \\.param q1={fw(-2)}
+        \\.param q2={fp(-2)}
+        \\r1 a 0 {p1}
+        \\r2 b 0 {q1}
+        \\r3 c 0 {q2}
+        \\r4 d 0 {10+pow(-2,3)}
+        \\b1 o1 0 v=pow(-2,3)
+        \\b2 o2 0 v=pwr(-2,3)
+        \\b3 o3 0 v=fp(-2)
+        \\b4 o4 0 v=fw(-2)
+        \\b5 o5 0 v=q2
+        \\e1 o6 0 value={pwr(-2,3)}
+        \\.end
+    );
+    for ([_]struct { []const u8, f64 }{ .{ "r1", -8 }, .{ "r2", 8 }, .{ "r3", -8 }, .{ "r4", 2 } }) |c|
+        try std.testing.expectEqual(c[1], try numeric((try device(nl, c[0])).positional[0]));
+    for ([_]struct { []const u8, f64 }{ .{ "b1", 8 }, .{ "b2", -8 }, .{ "b3", 8 }, .{ "b4", -8 }, .{ "b5", -8 }, .{ "e1", -8 } }) |c|
+        try std.testing.expectEqual(c[1], try parameter((try device(nl, c[0])).kv, "v"));
 }
 
 test "parameters: global definitions keep their scope under nested overrides" {
@@ -326,6 +459,51 @@ test "subcircuit models are visible only to their own body" {
     }
 }
 
+test "a model name that reads as a number names the model (1N4148, 2SK170, 2N2222)" {
+    // ngspice looks the word after a D, Q, J, M or S card's nodes up as a
+    // model before anything reads it as a number (inp2d.c:47-51,
+    // inp2j.c:47-49, inp2q.c:56-60, inp2m.c:76-84, inp2s.c:57-59). Oracle:
+    // the model each card names, by hand. Before the fix each word read as
+    // a number (1n4148 = 1e-9, 2sk170 = 2): no model, and a D card ran a
+    // default diode (ngspice 44.2: v(b) = 0.5481728 with this 1N4148, the
+    // default diode 0.6294408).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\digit-led model names
+        \\.model 1N4148 d is=2.52n n=1.752
+        \\.model 2SK170 njf beta=59.86m vto=-0.5024
+        \\.model 2N2222 npn bf=100
+        \\.model 2N7000 nmos level=1 vto=1 kp=1m
+        \\.model 1sw sw vt=1 ron=1
+        \\d1 a 0 1N4148 2
+        \\j1 a g 0 2SK170
+        \\q1 a g 0 2N2222
+        \\q2 a g 0 9 2N2222
+        \\m1 a g 0 0 2N7000
+        \\s1 a 0 g 0 1sw
+        \\.subckt cell p
+        \\d1 p 0 1n4148
+        \\j1 p p 0 2sk170
+        \\.ends
+        \\x1 a cell
+        \\x2 g cell
+        \\.end
+    );
+    const cards = [_][]const u8{ "d1", "j1", "q1", "q2", "m1", "s1", "d.x1.d1", "j.x1.j1", "d.x2.d1", "j.x2.j1" };
+    const models = [_][]const u8{ "1n4148", "2sk170", "2n2222", "2n2222", "2n7000", "1sw", "1n4148", "2sk170", "1n4148", "2sk170" };
+    for (cards, models) |card, model| {
+        const d = try device(nl, card);
+        try std.testing.expectEqualStrings(model, (d.model orelse return error.NoModel).name);
+    }
+    // The area after the model stays a number; Q's fourth word is its substrate.
+    try std.testing.expectEqual(@as(f64, 2), try numeric((try device(nl, "d1")).positional[1]));
+    var buf: [8][]const u8 = undefined;
+    const q2 = try device(nl, "q2");
+    try std.testing.expectEqualStrings("9", pinNames(nl, q2, &buf)[3]);
+    try std.testing.expectEqual(@as(usize, 4), (try device(nl, "m1")).pins.len);
+}
+
 test "a subcircuit .model under .if applies only to the instances that keep it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -369,6 +547,49 @@ test "model bins: a subcircuit's own bins are picked and read per instance" {
     }
 }
 
+test "model bins: bounds that read the subcircuit's parameters pick per instance" {
+    // A PDK's device subcircuit sets the bin bounds as its own parameters
+    // (`lmin=lmin_p`); read at global scope they resolve to nothing, and
+    // the card had no model (UnsupportedDevice naming no card). By hand:
+    // x1 (wsplit=1.5u) puts w=1u in nm.1 and x2 (wsplit=0.5u) in nm.2.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\bounds from subcircuit parameters
+        \\.subckt cell d g wsplit=1.5u
+        \\.param lmin_p=0.9u lmax_p=1.1u
+        \\+ wlo_p=0.1u whi_p=10u
+        \\main d g 0 0 nm l=1u w=1u
+        \\.model nm.1 nmos level=1 lmin=lmin_p lmax=lmax_p wmin=wlo_p wmax=wsplit vto=0.5
+        \\.model nm.2 nmos level=1 lmin=lmin_p lmax=lmax_p wmin=wsplit wmax=whi_p vto=0.7
+        \\.ends
+        \\x1 d g cell
+        \\x2 d g cell wsplit=0.5u
+        \\.end
+    );
+    for ([_][]const u8{ "m.x1.main", "m.x2.main" }, [_][]const u8{ "nm.1", "nm.2" }, [_]f64{ 0.5, 0.7 }) |name, bin, vto| {
+        const model = (try device(nl, name)).model orelse return error.NoModel;
+        try std.testing.expectEqualStrings(bin, model.name);
+        try std.testing.expectApproxEqRel(vto, try parameter(model.kv, "vto"), 1e-12);
+    }
+}
+
+test "parameters: a subcircuit's chained .params fold once per instance, not once per read" {
+    // Each `pk` reads `p(k-1)` twice, so splicing every read expands 2^30
+    // copies of `p0` (a PDK's device subcircuit chains its `.param`s so,
+    // and its model card never finished reading). By hand: p30 = 2^30 * p0.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "chained parameters\n.subckt cell n p0=1\n");
+    for (1..31) |k| try src.print(a, ".param p{d}='p{d}+p{d}'\n", .{ k, k - 1, k - 1 });
+    try src.appendSlice(a, "r1 n 0 'p30'\n.ends\nx1 n cell\nx2 n cell p0=2\n.end\n");
+    const nl = try parse(a, src.items);
+    try std.testing.expectEqual(@as(f64, 1 << 30), try numeric((try device(nl, "r.x1.r1")).positional[0]));
+    try std.testing.expectEqual(@as(f64, 2 << 30), try numeric((try device(nl, "r.x2.r1")).positional[0]));
+}
+
 test ".if chains keep the first true branch, per subcircuit instance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -408,6 +629,151 @@ test ".if chains keep the first true branch, per subcircuit instance" {
     var arena2 = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena2.deinit();
     try std.testing.expectError(error.ParseError, parse(arena2.allocator(), "t\n.if (1)\nr1 a 0 1\n.end\n"));
+}
+
+test "a lone = in an .if or .elseif condition is numparam's equality (if-elseif.sp)" {
+    // xpressn.c:709-710, 819: `=` and `==` are one operator; ngspice keeps
+    // the `select2 = 3` branch of tests/regression/misc/if-elseif.sp.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\if-elseif
+        \\.param select2 = 3
+        \\.if (select2 = 2)
+        \\r2 a 0 2
+        \\.elseif (select2 = 3)
+        \\r3 a 0 3
+        \\.endif
+        \\.if (select2 >= 3 && select2 != 4)
+        \\r4 b 0 4
+        \\.endif
+        \\.end
+    );
+    try std.testing.expectEqual(2, nl.deviceCount());
+    try std.testing.expectEqual(3, try numeric((try device(nl, "r3")).positional[0]));
+    try std.testing.expectEqual(4, try numeric((try device(nl, "r4")).positional[0]));
+}
+
+test "a top-level .if reads each parameter's last definition, so each .alter run picks its own branch" {
+    // Oracle: ngspice-45's last-definition rule, measured below (no
+    // `.alter`), and ESPice's `.alter` (cumulative runs, each re-reading
+    // the `.if`). A run's i(v1) is -10 V times the conductance its
+    // branches leave (SpiceRack #9: hcb3.sp, and hcb.sp, VACASK
+    // test_cblock: R = 1k, 2k, 500, 4k, 250, 2k).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hcb3 = "t\n.param a=1\nv1 1 0 10\n.if (a==1)\nr1 1 0 1k\n.else\nr1 1 0 4k\n.endif\n.op\n.alter\n.param a=2\n.end\n";
+    const hcb =
+        \\test_cblock
+        \\.param a=1
+        \\.param b=0
+        \\v1 1 0 10
+        \\.if (a==1)
+        \\r1 1 0 1k
+        \\.elseif (a==2)
+        \\r1 1 0 2k
+        \\.if (b==1)
+        \\r1a 1 0 2k
+        \\r1b 1 0 1k
+        \\r1c 1 0 500
+        \\.endif
+        \\.elseif (a==3)
+        \\r1a 1 0 1k
+        \\r1b 1 0 1k
+        \\.else
+        \\r1 1 0 4k
+        \\.endif
+        \\.op
+        \\.alter
+        \\.param a=2 b=0
+        \\.alter
+        \\.param a=3 b=0
+        \\.alter
+        \\.param a=4 b=0
+        \\.alter
+        \\.param a=2 b=1
+        \\.alter
+        \\.param a=2 b=0
+        \\.end
+    ;
+    for ([_]struct { []const u8, []const f64 }{
+        .{ hcb3, &.{ -0.01, -0.0025 } },
+        .{ hcb, &.{ -0.01, -0.005, -0.02, -0.0025, -0.04, -0.005 } },
+    }) |case| {
+        const runs = try source.splitAlters(a, case[0]);
+        try std.testing.expectEqual(case[1].len, runs.len);
+        for (runs, case[1]) |run, want| {
+            const nl = try parse(a, run);
+            var g: f64 = 0;
+            for (0..nl.deviceCount()) |e| {
+                const d = nl.device(.from(e));
+                if (d.kind == 'r') g += 1 / try numeric(d.positional[0]);
+            }
+            try std.testing.expectApproxEqRel(want, -10 * g, 1e-12);
+        }
+    }
+    // No `.alter`: a `.param` below the `.if` decides it, and one defined
+    // only below it is read. ngspice-45 agrees (`ngspice -n -b`: v1#branch
+    // -2.5e-3 for the first deck, -1e-2 for the second).
+    for ([_]struct { []const u8, f64 }{
+        .{ "t\n.param a=1\nv1 1 0 10\n.if (a==1)\nr1 1 0 1k\n.else\nr1 1 0 4k\n.endif\n.param a=2\n.op\n.end\n", 4e3 },
+        .{ "t\nv1 1 0 10\n.if (a==2)\nr1 1 0 1k\n.else\nr1 1 0 4k\n.endif\n.param a=2\n.op\n.end\n", 1e3 },
+    }) |case| {
+        const nl = try parse(a, case[0]);
+        try std.testing.expectEqual(case[1], try numeric((try device(nl, "r1")).positional[0]));
+    }
+}
+
+test ".csparam feeds only the .control interpreter and leaves the circuit as written (filter.sp)" {
+    // inp.c:1104-1131: ngspice `let`s each pair into the `const` plot and
+    // comments the card out; the `.if` beside it reads `.param do_sp`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\filter
+        \\.param do_sp=0
+        \\.csparam do_sp=do_sp
+        \\.if (do_sp)
+        \\vgen 1 0 dc 0 ac 1 portnum 1
+        \\.else
+        \\rs in 1 50
+        \\.endif
+        \\.end
+    );
+    try std.testing.expectEqual(1, nl.deviceCount());
+    try std.testing.expectEqual(50, try numeric((try device(nl, "rs")).positional[0]));
+}
+
+test "F, H, W and K inside a subcircuit name the instance's own V and L cards" {
+    // subckt.c:1422-1436 and 1475-1486 translate the sensed source and the
+    // coupled inductors as the instance names its own cards: `v.x1.vs`,
+    // `l.x1.l1`. A top-level card's references stay as written.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\refs
+        \\.subckt cell a
+        \\vs a b 0
+        \\f1 c 0 vs 2
+        \\h1 d 0 vs 100
+        \\w1 e 0 vs sw
+        \\l1 b 0 1u
+        \\l2 c 0 1u
+        \\k1 l1 l2 0.5
+        \\.ends
+        \\x1 1 cell
+        \\f0 9 0 v1 1
+        \\v1 1 0 1
+        \\.end
+    );
+    for ([_][]const u8{ "f.x1.f1", "h.x1.h1", "w.x1.w1" }) |name|
+        try std.testing.expectEqualStrings("v.x1.vs", (try device(nl, name)).positional[0].name);
+    const k = try device(nl, "k.x1.k1");
+    try std.testing.expectEqualStrings("l.x1.l1", k.positional[0].name);
+    try std.testing.expectEqualStrings("l.x1.l2", k.positional[1].name);
+    try std.testing.expectEqualStrings("sw", (try device(nl, "w.x1.w1")).positional[1].name);
+    try std.testing.expectEqualStrings("v1", (try device(nl, "f0")).positional[0].name);
 }
 
 test "a line holding only a // comment is a comment line (#164)" {
@@ -456,8 +822,6 @@ test "SIGMA_SCALE and FAIL (#239): the scales in order, FAIL over the card's own
         .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='agauss(0,1,1) > ph'" },
         .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'\n.ac dec 10 1 1g sweep monte=5" },
     }) |c| try std.testing.expectError(c[0], parse(a, try a.print(deck, .{c[1]})));
-    // An HSPICE `.temp` list would run each trial at several temperatures.
-    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, try a.print(deck, .{".temp 0 50\n.ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'"}), .hspice));
 }
 
 test ".wcd (#240): specs name .meas cards with their bounds, options in any order; every other form refused" {
@@ -497,8 +861,6 @@ test ".wcd (#240): specs name .meas cards with their bounds, options in any orde
         .{ error.ParseError, ".wcd pm '>= 1' top=-1" },
         .{ error.ParseError, ".wcd pm '>= 1' seed=3" },
     }) |c| try std.testing.expectError(c[0], parse(a, try a.print(deck, .{c[1]})));
-    // An HSPICE `.temp` list would give each spec several values.
-    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, try a.print(deck, .{".temp 0 50\n.wcd pm '>= 1'"}), .hspice));
 }
 
 test "a block close with no block open is refused (#162)" {
@@ -728,7 +1090,8 @@ test "analysis cards resolve output nets; a numeric reference is a net" {
         \\.temp 50
         \\.end
     );
-    try std.testing.expectEqual(@as(usize, 4), nl.deck.analyses.len);
+    // `.temp` is configuration, no analysis.
+    try std.testing.expectEqual(@as(usize, 3), nl.deck.analyses.len);
     const in = nl.deck.analyses[0].pos;
     try std.testing.expectEqualStrings("in", nl.netName(.from(in)));
     try std.testing.expectEqualStrings("2", nl.netName(.from(nl.deck.analyses[0].neg)));
@@ -769,15 +1132,13 @@ test "continuations join across comment and blank lines; tails are stripped" {
         \\r2 a b 1k
     );
     // ngspice turns `.end` into a comment and reads on (#121,
-    // dev/research/ngspice-syntax.md §1.7); HSPICE's `.end` ends the run.
+    // dev/research/ngspice-syntax.md §1.7).
     try std.testing.expectEqual(@as(u32, 2), nl.deviceCount());
     const r1 = try device(nl, "r1");
     var buf: [2][]const u8 = undefined;
     try std.testing.expectEqualStrings("a", pinNames(nl, r1, &buf)[0]);
     try std.testing.expectEqualStrings("b", pinNames(nl, r1, &buf)[1]);
     try std.testing.expectEqual(@as(f64, 2000), try numeric(r1.positional[0]));
-    const hs = try netlist.parse(arena.allocator(), "t\nr1 a b 1k\n.end\nr2 a b 1k\n", .hspice);
-    try std.testing.expectEqual(@as(u32, 1), hs.deviceCount());
 }
 
 test "nested .subckt definitions flatten through both levels (#121)" {
@@ -961,13 +1322,15 @@ test "nesting is bounded: groups, .if chains and repeated type words" {
         else
             try std.testing.expectError(error.ParseError, parse(a, src.items));
     }
-    // `E1 a b VCVS VCVS ... c d 2`: one copy of the line, not one per word.
+    // `E1 a b VCVS VCVS ... c d 2`: refused in one pass over the line, not
+    // one copy per word. ngspice-44.2 strips one type word (`e1 a 0 vcvs c
+    // d 2` gives v(a) = 2·v(c,d)) and stops on two ("Error on line 5").
     src.clearRetainingCapacity();
     try src.appendSlice(a, "t\ne1 a b");
     for (0..20_000) |_| try src.appendSlice(a, " vcvs");
     try src.appendSlice(a, " c d 2\n");
-    const nl = try parse(a, src.items);
-    const e1 = try device(nl, "e1");
+    try std.testing.expectError(error.UnsupportedCard, parse(a, src.items));
+    const e1 = try device(try parse(a, "t\ne1 a b vcvs c d 2\n"), "e1");
     try std.testing.expectEqual(@as(usize, 4), e1.pins.len);
     try std.testing.expectEqual(@as(f64, 2), try numeric(e1.positional[0]));
 }
@@ -1027,6 +1390,29 @@ test ".step sweeps a global parameter; the device keeps its nominal" {
     try std.testing.expectEqualSlices(f64, &.{ 5, 7 }, list.deck.steps[0].values);
 }
 
+test "a swept name that is both a card and a .param is the card (P3-056)" {
+    // Oracle: ngspice's DCtrCurv looks a .dc name up among the resistors,
+    // the V and the I sources, then as temp and @inst[param], never among
+    // the parameters (dctrcurv.c:156-247); ngspice-44.2 sweeps V1 here.
+    // So the .dc keeps its source arguments for the card lookup, `.step`
+    // targets the card, and the .param never goes live.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dc = try parse(a, "s\n.param v1=5\nV1 a 0 1\nR1 a 0 1k\nV2 b 0 {v1}\n.dc V1 1 3 1\n.end\n");
+    try std.testing.expect(dc.deck.analyses[0].sweep == .none);
+    try std.testing.expectEqual(@as(usize, 4), dc.deck.analyses[0].args.len);
+    try std.testing.expectEqual(@as(usize, 0), dc.live.names.len);
+    for ([_][]const u8{ "s\n.param v1=5\nV1 a 0 1\n.step V1 1 3 1\n.op\n.end\n", "s\n.param v1=5\nV1 a 0 1\n.step V1 list 1 2\n.op\n.end\n" }) |deck| {
+        const step = try parse(a, deck);
+        try std.testing.expectEqualStrings("v1", step.deck.steps[0].target.card);
+        try std.testing.expectEqual(@as(usize, 0), step.live.names.len);
+    }
+    // No card of the name: the .param is still the swept quantity.
+    const param = try parse(a, "s\n.param p=5\nV1 a 0 {p}\n.dc p 1 3 1\n.end\n");
+    try std.testing.expectEqual(@as(u32, 0), param.deck.analyses[0].sweep.step.target.param);
+}
+
 test ".step reaches a .model value that reads the swept name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1080,8 +1466,121 @@ test "a controlled-source type word for another letter is refused" {
     const a = arena.allocator();
     // ngspice refuses `E1 o 0 CCCS ...`; it is not a zero-gain VCVS (#75).
     try std.testing.expectError(error.UnsupportedCard, parse(a, "t\nvs a 0 0\ne1 o 0 cccs vs 2\n.end\n"));
-    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, "t\ne1 o 0 vcr c 0 2\n.end\n", .hspice));
+    try std.testing.expectError(error.UnsupportedCard, parse(a, "t\ne1 o 0 vcr c 0 2\n.end\n"));
     _ = try parse(a, "t\nv1 c 0 1\ne1 o 0 vcvs c 0 2\n.end\n");
+}
+
+test "an R card whose value reads the circuit is ngspice's B source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Oracle: ngspice inpcom.c:6878, `b<name> n1 n2 i = v(n1,n2)/(eq)
+    // tc1 tc2 m reciproctc=1 reciprocm=0`, quotes read as braces (:3693).
+    for ([_][]const u8{
+        "r1 a 0 '1k*(1+0*abs(v(a)))' tc1=1m m=2 noise=0",
+        "r1 a 0 r='1k*(1+0*abs(v(a)))' tc1=1m m=2 noise=0",
+    }) |card| {
+        const nl = try parse(a, try a.print("t\nv1 a 0 1\n{s}\n.end\n", .{card}));
+        const b = try device(nl, "br1");
+        try std.testing.expectEqual(@as(u8, 'b'), b.kind);
+        try std.testing.expectEqualStrings("i", b.kv[0].key);
+        try std.testing.expect(b.kv[0].value == .expr);
+        try std.testing.expectEqual(@as(f64, 1e-3), try parameter(b.kv, "tc1"));
+        try std.testing.expectEqual(@as(f64, 2), try parameter(b.kv, "m"));
+        try std.testing.expectEqual(@as(f64, 1), try parameter(b.kv, "reciproctc"));
+        try std.testing.expectEqual(@as(f64, 0), try parameter(b.kv, "reciprocm"));
+        try std.testing.expectError(error.MissingDevice, device(nl, "r1"));
+        try std.testing.expectError(error.MissingDevice, device(nl, "br1_1"));
+    }
+    // SpiceRack's two spellings as written (P1-037 v.sp, req.sp).
+    for ([_][]const u8{ "R1 a 0 '1k*(1+0*abs(v(a)))'", "R1 a 0 R='1k*(1+0*abs(v(a)))'" }) |card| {
+        const nl = try parse(a, try a.print("* t\nV1 a 0 1\n{s}\n.op\n.end\n", .{card}));
+        try std.testing.expectEqual(@as(u8, 'b'), (try device(nl, "br1")).kind);
+        try std.testing.expectError(error.MissingDevice, device(nl, "r1"));
+    }
+    // In a subcircuit the B takes the flattened name and the mapped nets.
+    const sub = try parse(a, "t\n.subckt rp p q\nrb p q r={1k*(1+abs(v(p,q)))}\n.ends\nx1 a 0 rp\nv1 a 0 1\n.end\n");
+    var buf: [2][]const u8 = undefined;
+    const pins = pinNames(sub, try device(sub, "b.x1.brb"), &buf);
+    try std.testing.expectEqualStrings("a", pins[0]);
+    try std.testing.expectEqualStrings("0", pins[1]);
+    // A value that reads no circuit quantity stays a resistor.
+    const plain = try parse(a, "t\n.param r=1k\nv1 a 0 1\nr1 a 0 'r*2'\n.end\n");
+    try std.testing.expectEqual(@as(f64, 2000), try numeric((try device(plain, "r1")).positional[0]));
+    // The noise network (inpcom.c:6880-6886) under noisy=1; ngspice's
+    // default (enable_noisy_r unset) has none.
+    {
+        const nl = try parse(a, "t\nv1 a 0 1\nr1 a b '1k+v(a)' noisy=1\n.end\n");
+        try std.testing.expect((try device(nl, "br1_1")).kv[0].value == .expr);
+        try std.testing.expectEqual(@as(f64, 1), try numeric((try device(nl, "rr1_2")).positional[0]));
+        try std.testing.expectEqualStrings("r1_3", pinNames(nl, try device(nl, "vr1_3"), &buf)[0]);
+    }
+    try std.testing.expectError(error.MissingDevice, device(try parse(a, "t\nv1 a 0 1\nr1 a b '1k+v(a)'\n.end\n"), "br1_1"));
+    // Unsupported fails: no braces or quotes around the equation (ngspice's
+    // "mal formed resistor instance").
+    try std.testing.expectError(error.UnsupportedCard, parse(a, "t\nv1 a 0 1\nr1 a 0 r=v(a)\n.end\n"));
+}
+
+test "a C or L card whose value reads the circuit is ngspice's network of plain cards and B sources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [4][]const u8 = undefined;
+    // Oracle: ngspice inpcom.c:6979-7000 (a9da7bc), the c= form: G/R/C/V
+    // turn dv/dt into i(vcurrmeas<x>), which the B scales by C(v).
+    const nl = try parse(a, "t\nv1 a 0 1\nc1 a 0 c={1n*(1+0.5*v(a))} m=2 tc1=1m\nc2 b 0 q={1n*v(b)}\nl1 a b '1m*(1+v(a))' m=2 tc1=1m\n.end\n");
+    try std.testing.expectError(error.MissingDevice, device(nl, "c1"));
+    const g = try device(nl, "gc1");
+    try std.testing.expectEqual(@as(u8, 'g'), g.kind);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "c1_int1", "0", "0", "a" }), pinNames(nl, g, &buf));
+    try std.testing.expectEqual(@as(f64, 1e9), try numeric(g.positional[0]));
+    try std.testing.expectEqual(@as(f64, 2), try parameter(g.kv, "m"));
+    try std.testing.expectEqual(@as(f64, 1e-9), try numeric((try device(nl, "rc1")).positional[0]));
+    try std.testing.expectEqual(@as(f64, 1e-6), try numeric((try device(nl, "cc1")).positional[0]));
+    try std.testing.expectEqualStrings("c1_int2", pinNames(nl, try device(nl, "vcurrmeasc1"), &buf)[0]);
+    try std.testing.expectEqual(@as(f64, 1e15), try numeric((try device(nl, "rc1par")).positional[0]));
+    const b = try device(nl, "bc1");
+    try std.testing.expectEqualStrings("i", b.kv[0].key);
+    try std.testing.expect(b.kv[0].value == .expr);
+    try std.testing.expectEqual(@as(f64, 1e-3), try parameter(b.kv, "tc1"));
+    try std.testing.expectEqual(@as(f64, 1), try parameter(b.kv, "reciproctc"));
+    try std.testing.expectError(error.MissingParameter, parameter(b.kv, "m"));
+    // q= (:6948-6962): the B drives q into a 1 H inductor, whose voltage
+    // dq/dt the G draws through the card's nodes.
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "b", "0", "c2_int1", "0" }), pinNames(nl, try device(nl, "gc2"), &buf));
+    try std.testing.expectEqual(@as(f64, 1), try numeric((try device(nl, "lc2")).positional[0]));
+    try std.testing.expectEqualStrings("c2_int1", pinNames(nl, try device(nl, "bc2"), &buf)[1]);
+    // L (:7048-7056): a v= B from n2 to n1 over a 1 H inductor's di/dt,
+    // its current sensed by the F's twin; m divides, tc multiplies.
+    const bl = try device(nl, "bl1");
+    try std.testing.expectEqualStrings("v", bl.kv[0].key);
+    try std.testing.expectEqual(@as(f64, 0), try parameter(bl.kv, "reciproctc"));
+    try std.testing.expectEqualStrings("b", pinNames(nl, bl, &buf)[0]);
+    try std.testing.expectEqualStrings("i", (try device(nl, "fl1")).kv[0].key);
+    try std.testing.expectEqualStrings("l1_int2", pinNames(nl, try device(nl, "ll1"), &buf)[0]);
+    // An X card's m reaches the G (inpcom.c:4250-4305 runs first), not the B.
+    const sub = try parse(a, "t\n.subckt cs p q\ncq p q c={1n*(1+v(p,q))}\n.ends\nx1 a 0 cs m=2\nv1 a 0 1\n.end\n");
+    try std.testing.expectEqual(@as(f64, 2), try parameter((try device(sub, "g.x1.gcq")).kv, "m"));
+    try std.testing.expectError(error.MissingParameter, parameter((try device(sub, "b.x1.bcq")).kv, "m"));
+    _ = try device(sub, "v.x1.vcurrmeascq");
+    // A value that reads nothing stays the plain card; no braces is
+    // ngspice's "mal formed capacitor instance".
+    try std.testing.expectEqual(@as(f64, 2e-9), try numeric((try device(try parse(a, "t\nc1 a 0 '1n*2'\n.end\n"), "c1")).positional[0]));
+    try std.testing.expectError(error.UnsupportedCard, parse(a, "t\nv1 a 0 1\nc1 a 0 c=v(a)\n.end\n"));
+}
+
+test "a B card's instance parameters follow an unbraced expression (asrc-tc-1.sp)" {
+    // Oracle: ngspice's B lexer ends `i=v(1)` at `tc1=` (inpptree.c:1529-1546),
+    // so ngspice-45 runs ngspice/tests/regression/misc/asrc-tc-1.sp.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(), "t\nv1 1 0 dc=100 ac=1\nb2 2 0 i=v(1) tc1=0.001\nv2 0 2 0\nb3 3 0 v=v(1) tc1=0.001 reciproctc=1\n.end\n");
+    for ([_][]const u8{ "b2", "b3" }) |name| {
+        const b = try device(nl, name);
+        try std.testing.expect(b.kv[0].value == .expr);
+        try std.testing.expectEqual(@as(f64, 1e-3), try parameter(b.kv, "tc1"));
+    }
+    try std.testing.expectEqual(@as(f64, 1), try parameter((try device(nl, "b3")).kv, "reciproctc"));
 }
 
 test "parseAnalyses reads analysis cards only and resolves their nets" {
@@ -1165,8 +1664,55 @@ test "a lone continuation at the end of input is no statement (#38)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_]netlist.Dialect{ .hspice, .ngspice }) |dialect| {
-        const nl = try netlist.parse(a, "lone\nV1 a 0 1\nR1 a 0 1k\n.op\n\\\\\n", dialect);
-        try std.testing.expectEqual(@as(usize, 1), nl.deck.analyses.len);
+    const nl = try parse(a, "lone\nV1 a 0 1\nR1 a 0 1k\n.op\n\\\\\n");
+    try std.testing.expectEqual(@as(usize, 1), nl.deck.analyses.len);
+}
+
+test "values: unbraced key=expr in a subcircuit, compiled once, read per card and per instance" {
+    // `compiledAt` caches a body card's `key=expr` by the byte it starts
+    // at: r1's and r2's values start at the same column, so a key that is
+    // not the byte's own address hands r2 r1's expression. The 1146-deck
+    // golden did not see that key bug; this test does. By hand: k*3 and
+    // k+3 at k = 2 and k = 5.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\one compile per body value
+        \\.subckt cell n k=2
+        \\r1 n 0 1k tc1=k*3 tc2=1
+        \\r2 n 0 1k tc1=k+3 tc2=2
+        \\.ends
+        \\x1 n cell
+        \\x2 n cell k=5
+        \\.end
+    );
+    // tc2 after it: the cursor stops where a fresh compile stops.
+    for ([_][]const u8{ "r.x1.r1", "r.x1.r2", "r.x2.r1", "r.x2.r2" }, [_]f64{ 6, 5, 15, 8 }, [_]f64{ 1, 2, 1, 2 }) |name, want, tc2| {
+        const kv = (try device(nl, name)).kv;
+        try std.testing.expectEqual(want, try parameter(kv, "tc1"));
+        try std.testing.expectEqual(tc2, try parameter(kv, "tc2"));
+    }
+}
+
+test "values: braced B expressions in a subcircuit, checked once, keep each card's own text" {
+    // `unbraced` memoizes a body card's B text by its (address, length):
+    // b1's and b2's are the same length, so a key on the length alone
+    // hands b2 b1's text. The 1146-deck golden did not see that key bug;
+    // this test does. By hand: b1 multiplies, b2 adds, in each instance.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\one check per body expression
+        \\.subckt cell a k=2
+        \\b1 a 0 v={{k}*v(a)}
+        \\b2 a 0 v={{k}+v(a)}
+        \\.ends
+        \\x1 n cell
+        \\x2 n cell k=5
+        \\.end
+    );
+    for ([_][]const u8{ "b.x1.b1", "b.x1.b2", "b.x2.b1", "b.x2.b2" }, [_]netlist.expr.Code{ .mul, .add, .mul, .add }) |name, want| {
+        const ops = nl.exprOps((try device(nl, name)).kv[0].value.expr);
+        try std.testing.expectEqual(want, ops[ops.len - 1].code);
     }
 }

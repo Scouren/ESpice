@@ -817,6 +817,7 @@ branch  (n2 )  b_n2;
 
 aliasparam dtemp = dt; //HSpice, SmartSpice, Eldo
 aliasparam Trise = dt; //ADS
+aliasparam tref = tnom; // ESPice: ngspice hicum2.c:106 IOPR spelling
 
 //======================== Transistor model formulation ===================
 //

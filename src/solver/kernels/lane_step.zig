@@ -12,6 +12,8 @@
 //! - `pub const LteIn = extern struct`
 //! - `pub const dense_peel_max_n = 64`
 //! - `pub const LaneScalars = extern struct`
+//! - `pub const gear_run: u32 = 1 << 8`
+//! - `pub const LaneGear = extern struct`
 //! - `pub const LaneStep = extern struct`
 //! - `pub const StepReport = extern struct`
 //! - `pub const step_run: u8 = 0`
@@ -23,13 +25,16 @@
 //! - `pub const step_attempt: u8 = 1`
 //! - `pub const step_accept: u8 = 2`
 //! - `pub fn stepBound(method: u8, cur_method: u8, q0: anytype, q1: anytype, q2: anytype, q3: anytype, ip: anytype, len: usize, stride: usize, c: LteIn) f64`
+//! - `pub fn companionGear(comptime accumulate: bool, k: u8, ag: [7]f64, q: [8]f64, out: f64) f64`
+//! - `pub fn stepBoundGear(method: u8, cur_method: u8, q: anytype, ip: anytype, len: usize, stride: usize, lin: LteIn, gear: LaneGear) f64`
 //! - `pub fn denseSolveNeg(n: usize, m: anytype, x: anytype) bool`
 //! - `pub fn stepBegin(s: anytype, sc: anytype, sim: anytype, lin: anytype) bool`
 //! - `pub fn stepEndA(s: anytype, gate: lk.Gate, query: u32, lte: [2]f64, ops: anytype, accept: anytype, sc: anytype, pq: anytype, pqt: anytype, nh: usize) void`
-//! - `pub fn stepEndB(s: anytype, nb: f64) void`
+//! - `pub fn stepEndB(s: anytype, src: f64) void`
 
 const std = @import("std");
 const lk = @import("lane.zig");
+const gmath = @import("gompute").math;
 
 /// The LTE inputs of one step, per lane (uploaded with `LaneScalars`).
 pub const LteIn = extern struct { dt: f64, dt1: f64, dt2: f64, reltol: f64, abstol: f64, chgtol: f64, trtol: f64, ag0: f64, ag1: f64, ag2: f64 };
@@ -46,10 +51,11 @@ pub const LaneScalars = extern struct {
     ag0: f64,
     ag1: f64,
     ag2: f64,
-    /// 0 BE, 1 trap, 2 gear-2.
+    /// 0 BE, 1 trap, 2 gear-2, k gear-k (3..6; `LaneGear` holds its ag).
     method: u32,
     /// Bit 0: in this round. Bits 4-5: the order-2 promotion probe's
-    /// method code, read by `lte` for a lane at order 1.
+    /// method code, read by `lte` for a lane at order 1. `gear_run`: the
+    /// run's top order is 3..6, so `LaneGear` is live.
     flags: u32,
     /// The row ring's physical slots of logical 0, 1, 2 before this step's
     /// rotation, for `accept`.
@@ -58,11 +64,29 @@ pub const LaneScalars = extern struct {
     sqt: [4]u8,
 };
 
+/// `LaneScalars.flags` bit of a gear-3..6 run (`LaneGear` uploaded).
+pub const gear_run: u32 = 1 << 8;
+
+/// Per-lane Gear inputs of a gear-3..6 run's step, uploaded with
+/// `LaneScalars` only in such a run: `integrator.gearAg`'s ag (0 past the
+/// order, and unread below order 3), the steps [dt, dt_old...] its
+/// divided differences read, and the run's top order.
+pub const LaneGear = extern struct {
+    ag: [7]f64,
+    dts: [7]f64,
+    top: u32,
+    _pad: u32 = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(LaneGear) == 120);
+    }
+};
+
 /// One lane's transient step machine for device step control: `tran.Sim`'s
 /// scalars and stats, and the bodies `stepBegin`, `stepEndA` and
 /// `stepEndB`, which restate `Sim.begin` and `Sim.end` statement for
-/// statement for the shapes lanes admit (order <= 2, no VPI, tangents,
-/// delay lines or uic). The host drains each accepted row and runs the
+/// statement for the shapes lanes admit (order <= 2, no VPI, tangents or
+/// delay lines). The host drains each accepted row and runs the
 /// measures and early stop; `$bound_step` and `reject_at` park the lane.
 /// Host step control over the same device numerics is the bitwise oracle.
 pub const LaneStep = extern struct {
@@ -78,6 +102,9 @@ pub const LaneStep = extern struct {
     abstol: f64,
     chgtol: f64,
     trtol: f64,
+    /// `Sim.uic_bp`: under uic, ngspice's breakpoint at the first step
+    /// size (`Sim.nextBp`'s `extra`); inf for none.
+    uic_bp: f64,
     // `Sim`'s state.
     t: f64,
     dt: f64,
@@ -121,7 +148,13 @@ pub const LaneStep = extern struct {
     op_commit: u8,
     /// `AnalysisKind.tran`.
     kind_tran: u8,
-    _pad: [5]u8 = @splat(0),
+    /// `Options.sources_at_zero` (OPtran): the devices evaluate at t = 0
+    /// while t advances (`stepBegin`).
+    sources_at_zero: u8,
+    /// The method code (`LaneScalars.method`) of the step `stepEndA` last
+    /// accepted, before any order change, for `StepReport.method`.
+    step_method: u8 = 0,
+    _pad: [3]u8 = @splat(0),
 };
 
 /// What the host reads of each lane after a device-controlled round
@@ -136,7 +169,14 @@ pub const StepReport = extern struct {
     steps: u32,
     event: u8,
     status: u8,
-    _pad: [2]u8 = @splat(0),
+    /// On an accept: the method code its step took, which with
+    /// `attempted_dt` is what the integrator used (`Result.steps`).
+    method: u8 = 0,
+    _pad: [1]u8 = @splat(0),
+
+    comptime {
+        std.debug.assert(@sizeOf(StepReport) == 48);
+    }
 };
 
 /// `LaneStep.status`: stepping, reached t_stop or `max_steps`, dt below
@@ -208,6 +248,66 @@ pub fn stepBound(method: u8, cur_method: u8, q0: anytype, q1: anytype, q2: anyty
     return if (method == 0) vmin else @sqrt(vmin);
 }
 
+/// `integrator.companionAt(gear(k), accumulate, ...)` at one element, with
+/// `gearHistory`'s g as its q2: `(out + d) - g` (accumulate, the Newton
+/// residual's dynamic part) or `d - g` (`advanceCurrent`), d = ag[0]*(q[0] -
+/// q[1]). `q` holds logical slots 0..k at the element. Asserts 3 <= k <= 6.
+pub fn companionGear(comptime accumulate: bool, k: u8, ag: [7]f64, q: [8]f64, out: f64) f64 {
+    const d = ag[0] * (q[0] - q[1]);
+    const base = if (accumulate) out + d else d;
+    return base - gearHistoryAt(k, ag, q);
+}
+
+/// `integrator.stepBoundGear(method, cur_method, ...)` for one lane:
+/// cktterr.c's divided difference over order + 2 slots, then the order-th
+/// root. `method` is a Gear order code 2..6, `cur_method` any code 0..6
+/// (`LaneScalars.method`); `q[k]` is logical slot k (order(method) + 2
+/// read, and cur_method + 1 at gear-3..6) and `ip` the dynamic current,
+/// `len` entries `stride` apart. `lin.ag0..ag2` are the step's coefficients
+/// (`ag0 = ag[0]` at gear-3..6), `gear` its `ag` and `dts`; `lin`'s dt
+/// fields are not read. NaN as `stepBound`.
+pub fn stepBoundGear(method: u8, cur_method: u8, q: anytype, ip: anytype, len: usize, stride: usize, lin: LteIn, gear: LaneGear) f64 {
+    std.debug.assert(method >= 2 and method <= 6);
+    std.debug.assert(cur_method <= 6);
+    const p: usize = method;
+    const coeff: f64 = switch (method) {
+        2 => 0.2222222222,
+        3 => 0.1363636364,
+        4 => 0.096,
+        5 => 0.07299270073,
+        else => 0.05830903790,
+    };
+    var vmin = std.math.inf(f64);
+    var poison: f64 = 0;
+    for (0..len) |jj| {
+        const j = jj * stride;
+        var h: [8]f64 = @splat(0);
+        const reach: usize = @max(p + 2, if (cur_method >= 3) @as(usize, cur_method) + 1 else 3);
+        for (0..reach) |k| h[k] = q[k][j];
+        const qc = h[0];
+        const qp = h[1];
+        const i_p = ip[j];
+        const d = lin.ag0 * (qc - qp);
+        const i_new = switch (cur_method) {
+            0 => d,
+            1 => d - lin.ag1 * i_p,
+            2 => d - lin.ag2 * (qp - h[2]),
+            else => d - gearHistoryAt(cur_method, gear.ag, h),
+        };
+        const volttol = lin.abstol + lin.reltol * @max(@abs(i_new), @abs(i_p));
+        const chargetol = lin.reltol * @max(@max(@abs(qc), @abs(qp)), lin.chgtol) / gear.dts[0];
+        const tol = @max(volttol, chargetol);
+        const del = lin.trtol * tol / @max(lin.abstol, coeff * @abs(dividedDifference(p, h, gear.dts)));
+        for (h[0 .. p + 2]) |v| poison += v - v;
+        poison += (i_p - i_p) + (i_new - i_new) + if (del == del) 0 else del;
+        vmin = @min(vmin, del);
+    }
+    if (std.math.isNan(poison)) return std.math.nan(f64);
+    // gompute's exp and log: a kernel has no libm to call, and the host
+    // takes the same bodies so both bound the step alike.
+    return if (p == 2) @sqrt(vmin) else gmath.exp(gmath.log(vmin) / @as(f64, @floatFromInt(p)));
+}
+
 /// x = -A^-1 b by LU with partial pivoting, for a lane whose replayed
 /// pivots failed (`arp_lane_peel_dense`). `m` is A row-major, n x n, and
 /// `x` holds b on entry; both are clobbered. False when a pivot is below
@@ -270,7 +370,8 @@ pub fn stepBegin(s: anytype, sc: anytype, sim: anytype, lin: anytype) bool {
     s.attempted_dt = s.dt;
     const t = s.t;
     const dt = s.dt;
-    const t_dev = t + dt;
+    // The time the devices evaluate at; OPtran holds it at 0 (`Sim.begin`).
+    const t_dev = if (s.sources_at_zero != 0) 0 else t + dt;
     sim.* = .{
         .t = t_dev,
         .dt = dt,
@@ -398,15 +499,21 @@ pub fn stepEndA(s: anytype, gate: lk.Gate, query: u32, lte: [2]f64, ops: anytype
         pqt[1] = p0;
     }
     s.dt_next = dt_next;
+    s.step_method = method;
     s.event = step_accept;
 }
 
 /// `Sim.end` after the commit, for an accepted lane: the breakpoint landing
-/// and the next step's clamp. `nb` is `nextBp(t_new + min_break)` at the
-/// committed state (inf for none); the host asks it twice there and its
-/// caches make both answers this one.
-pub fn stepEndB(s: anytype, nb: f64) void {
+/// and the next step's clamp. `src` is the sources' earliest breakpoint
+/// after t_new + min_break at the committed state (inf for none); `nb`
+/// adds `uic_bp` as `Sim.nextBp` adds its `extra`, so it is `nextBp(t_new +
+/// min_break)`. The host asks it twice there and its caches make both
+/// answers this one. With `uic_bp` inf, `nb` is `src`: inf < src never
+/// holds.
+pub fn stepEndB(s: anytype, src: f64) void {
     if (s.event != step_accept) return;
+    const after = s.t_new + s.min_break;
+    const nb = if (s.uic_bp >= after and s.uic_bp < src) s.uic_bp else src;
     const t_new = s.t_new;
     var dt_next = s.dt_next;
     s.t = t_new;
@@ -487,6 +594,33 @@ fn retry(s: anytype, dt: f64, next: f64) void {
     s.dt = next;
     if (s.dt < s.dt_min and dt > s.dt_min and s.t + s.dt_min > s.t) s.dt = s.dt_min;
     if (s.dt < s.dt_min) s.status = step_underflow;
+}
+
+/// `integrator.gearHistory` at one element: g = sum over i = 2..k of
+/// ag[i]*(q[1] - q[i]), from 0 and in its order (slot 0 is not read).
+fn gearHistoryAt(k: u8, ag: [7]f64, q: [8]f64) f64 {
+    std.debug.assert(k >= 3 and k <= 6);
+    var g: f64 = 0;
+    for (2..@as(usize, k) + 1) |i| g += ag[i] * (q[1] - q[i]);
+    return g;
+}
+
+/// `integrator.dividedDifference`: cktterr.c's order-p divided difference
+/// over `diff[0 .. p + 2]`, with its step sums from `dts`, in its rounding
+/// order.
+fn dividedDifference(p: usize, diff_in: [8]f64, dts: [7]f64) f64 {
+    std.debug.assert(p >= 1 and p <= 6);
+    var diff = diff_in;
+    var deltmp: [7]f64 = @splat(0);
+    @memcpy(deltmp[0 .. p + 1], dts[0 .. p + 1]);
+    var k: usize = p;
+    while (true) {
+        for (0..k + 1) |i| diff[i] = (diff[i] - diff[i + 1]) / deltmp[i];
+        if (k == 0) break;
+        k -= 1;
+        for (0..k + 1) |i| deltmp[i] = deltmp[i + 1] + dts[i];
+    }
+    return diff[0];
 }
 
 fn rotateRight(p: anytype, nh: usize) void {

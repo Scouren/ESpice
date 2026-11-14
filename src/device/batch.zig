@@ -9,8 +9,9 @@
 //!
 //! Contents:
 //! - `pub fn DeviceBatch(comptime D: type) type`, with its fields and
-//!   `shares_models`, `hooks`, `of`, `evalSplit`, `model`, `ownsRows`,
-//!   `simAt`, `localX`, `setupRows`, `reprep`, `commitBirth`, `binding`
+//!   `shares_models`, `hooks`, `of`, `evalSplit`, `evalSplitMoved`, `model`,
+//!   `ownsRows`, `simAt`, `localX`, `setupRows`, `reprep`, `commitBirth`,
+//!   `binding`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +26,7 @@ const dual = @import("dual.zig");
 const staging_gpa = @import("proto_store.zig").staging_gpa;
 const Sink = @import("sink.zig").Sink;
 const Bypass = @import("batch_bypass.zig").Bypass;
+const Census = @import("batch_census.zig").Census;
 const Params = @import("batch_params.zig").Params;
 const SmallSignal = @import("batch_ac.zig").SmallSignal;
 const State = @import("batch_state.zig").State;
@@ -116,6 +118,18 @@ pub fn DeviceBatch(comptime D: type) type {
         q_tape: if (has_q) []f64 else void,
         /// Latency bypass records (`Hooks.set_bypass`), null when off.
         bypass: ?*Bp = null,
+        /// N3 (`Hooks.track_charges`): while on, serial host passes record
+        /// the tape and whether they evaluated off the gathered x. Off, the
+        /// pass is the untracked one, cost included.
+        track_q: if (has_q) bool else void = if (has_q) false else {},
+        /// While `track_q`: this batch's last serial host pass left in the
+        /// planes and `q_tape` bitwise the charges `eval_q` writes at that
+        /// pass's x and time (`Hooks.charges_clean`). Untouched while off;
+        /// only a tracked Newton pass sets it, and a bypass replay, `eval_q`,
+        /// `accept_q`, `trackCharges`, `copyState` and `binding` clear it.
+        q_clean: if (has_q) bool else void = if (has_q) false else {},
+        /// N6's census (`Hooks.census`, stats only), null when off.
+        census: ?*Census = null,
 
         const Self = @This();
         const Bp = Bypass(D);
@@ -131,6 +145,7 @@ pub fn DeviceBatch(comptime D: type) type {
             .copy_state = copyState,
             .set_limit_active = if (has_limit) setLimitActive else null,
             .stage = stage,
+            .stage_moved = if (has_q) stageMoved else null,
             .scatter_tapes = scatterTapes,
             .q_tape = if (has_q) qTape else null,
             .charge_identity = if (has_q and layout.lteSites(D).len > 0) chargeIdentity else null,
@@ -157,6 +172,12 @@ pub fn DeviceBatch(comptime D: type) type {
             .update_state = if (stages_update) St.updateState else null,
             .update_range = if (stages_update) St.updateRange else null,
             .set_bypass = if (Bp.bypassable) Bp.setBypass else null,
+            // N3, off until the transient turns it on (`trackCharges`).
+            .track_charges = if (has_q) trackCharges else null,
+            .charges_clean = if (has_q) chargesClean else null,
+            .census = setCensus,
+            .census_counts = censusCounts,
+            .census_accept = censusAccept,
             .update_done = if (stages_update) St.updateDone else null,
             .commit_state = if (@hasDecl(D, "updateState") and traits.hasAbsdelayState(D)) St.updateState else null,
             .state_ctl = if (@hasDecl(D, "stateCtl") and !traits.skipsTimerState(D)) St.stateCtl else null,
@@ -209,18 +230,67 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn evalQInner(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, comptime staged: bool) void {
             const self = of(ctx);
+            if (comptime !staged) if (self.census) |c| c.observe(x, self.gath, first, last);
             var sink = Sink(D, false, false, staged).host(self, pl, x, undefined);
             // Without `always_inline` LLVM moves mos6's charge core out of
             // line, measured +0.9% on devices/mos6_inverter.
             @call(.always_inline, stamp.evalQRange, .{ D, RealFor(@hasDecl(D, "collapse")), &sink, first, last, self.simAt(t), null });
+            // Its planes may be a scratch (`rebaseNarrow`): only a tracked
+            // Newton pass vouches for the circuit's planes.
+            if (comptime has_q and !staged) if (self.track_q) {
+                self.q_clean = false;
+            };
         }
 
         /// `evalQOnly` at `self.sim` plus `updateState`'s staging, one core
         /// run per instance.
         fn acceptQOnly(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64) void {
             const self = of(ctx);
+            if (self.census) |c| c.observe(x, self.gath, first, last);
             var sink = Sink(D, false, false, false).host(self, pl, x, undefined);
             @call(.always_inline, stamp.evalQRange, .{ D, RealFor(@hasDecl(D, "collapse")), &sink, first, last, self.sim, self });
+            if (self.track_q) self.q_clean = false;
+        }
+
+        /// `Hooks.track_charges`: turns N3's tracking on or off; either way
+        /// no pass has been tracked yet.
+        fn trackCharges(ctx: *anyopaque, on: bool) void {
+            const self = of(ctx);
+            self.track_q = on;
+            self.q_clean = false;
+            assert(self.track_q == on);
+            assert(!self.q_clean);
+        }
+
+        /// `Hooks.census`: starts N6's census with fresh snapshots, or stops
+        /// it. False when the snapshots could not be allocated.
+        fn setCensus(ctx: *anyopaque, on: bool) bool {
+            const self = of(ctx);
+            if (self.census) |c| c.destroy();
+            self.census = if (on) Census.create(self.count, n_u, has_q, has_limit) else null;
+            assert(on or self.census == null);
+            return !on or self.census != null;
+        }
+
+        /// `Hooks.census_accept`: `x` is an accepted point.
+        fn censusAccept(ctx: *anyopaque, x: []const f64) void {
+            const self = of(ctx);
+            const c = self.census orelse return;
+            c.accept(x, self.gath);
+        }
+
+        /// `Hooks.census_counts`: zeros while the census is off.
+        fn censusCounts(ctx: *anyopaque) abi.CensusCounts {
+            const self = of(ctx);
+            const c = self.census orelse return .{};
+            return c.counts();
+        }
+
+        /// `Hooks.charges_clean`: false while tracking is off.
+        fn chargesClean(ctx: *anyopaque) bool {
+            const self = of(ctx);
+            assert(self.track_q or !self.q_clean);
+            return self.track_q and self.q_clean;
         }
 
         fn stage(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, mode: abi.StampMode) void {
@@ -229,6 +299,35 @@ pub fn DeviceBatch(comptime D: type) type {
                 .newton => evalInner(ctx, pl, first, last, x, t, true, true),
                 .charge => if (comptime has_q) evalQInner(ctx, pl, first, last, x, t, true),
             }
+        }
+
+        /// `Hooks.stage_moved`: a tracked threaded stage of `.full` or
+        /// `.newton`. Every range stores `q_clean = true` (one value, so
+        /// atomically and order-free); the caller's conjunction of the
+        /// returned verdicts completes it. A replay is not tracked: true.
+        fn stageMoved(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, mode: abi.StampMode) bool {
+            return switch (mode) {
+                .full => evalStagedMoved(ctx, pl, first, last, x, t, false),
+                .newton => evalStagedMoved(ctx, pl, first, last, x, t, true),
+                .charge => unreachable,
+            };
+        }
+
+        fn evalStagedMoved(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, comptime skip_const: bool) bool {
+            const self = of(ctx);
+            assert(first <= last);
+            assert(last <= self.count);
+            assert(self.track_q);
+            const limiting = if (comptime has_limit) self.lim_active else false;
+            var sink = Sink(D, false, skip_const, true).host(self, pl, x, undefined);
+            const sim = self.simAt(t);
+            @atomicStore(bool, &self.q_clean, true, .monotonic);
+            const SinkT = @TypeOf(sink);
+            if (comptime Bp.bypassable and skip_const and !SinkT.skip_g and !(has_q and SinkT.skip_c)) if (self.bypass) |bp| if (!bp.off) {
+                Bp.evalBypass(self, bp, &sink, first, last, sim, limiting, pl, true);
+                return true;
+            } else bp.countPlain(last - first);
+            return self.evalSplitMoved(&sink, first, last, sim, limiting, true);
         }
 
         fn scatterTapes(ctx: *anyopaque) abi.ScatterTapes {
@@ -274,29 +373,47 @@ pub fn DeviceBatch(comptime D: type) type {
             // Once per batch call, outside the per-instance loop.
             assert(first <= last);
             assert(last <= self.count);
+            if (comptime has_q and !staged) if (self.census) |c| c.observe(x, self.gath, first, last);
             const limiting = if (comptime has_limit) self.lim_active else false;
             var sink = Sink(D, false, skip_const, staged).host(self, pl, x, undefined);
             const sim = self.simAt(t);
+            // N3's switch, read once: a threaded (staged) pass is never tracked.
+            const track = if (comptime has_q and !staged) self.track_q else false;
             // A replay needs the recorded Jacobian (and charge Jacobian) to
             // move the residual to the new point.
             const SinkT = @TypeOf(sink);
             if (comptime Bp.bypassable and skip_const and !SinkT.skip_g and !(has_q and SinkT.skip_c)) if (self.bypass) |bp| if (!bp.off) {
+                // A replay's charges are not tracked: N3 re-reads them.
+                if (comptime has_q and !staged) if (track) {
+                    self.q_clean = false;
+                };
                 Bp.evalBypass(self, bp, &sink, first, last, sim, limiting, pl, staged);
                 return;
+            } else bp.countPlain(last - first);
+            const moved = self.evalSplitMoved(&sink, first, last, sim, limiting, track);
+            if (comptime has_q and !staged) if (track) {
+                self.q_clean = !moved;
             };
-            self.evalSplit(&sink, first, last, sim, limiting);
         }
 
         /// `evalRange` over `[first, last)`, the narrow basis on the part
         /// below `narrow_count`: a ParEval slice may straddle the boundary.
         pub inline fn evalSplit(self: *const Self, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool) void {
+            _ = self.evalSplitMoved(sink, first, last, sim, limiting, false);
+        }
+
+        /// `evalSplit` through `stamp.evalRangeMoved`: with `track`, true
+        /// when some instance evaluated off its gathered x; false without.
+        /// `track` is a run-time argument, so both share one instantiation.
+        pub inline fn evalSplitMoved(self: *const Self, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool, track: bool) bool {
             if (comptime narrowable) {
                 const split = std.math.clamp(self.narrow_count, first, last);
-                if (split > first) stamp.evalRange(D, true, stamp.host_pad, sink, first, split, sim, limiting);
-                if (last > split) stamp.evalRange(D, false, stamp.host_pad, sink, split, last, sim, limiting);
-            } else {
-                stamp.evalRange(D, false, stamp.host_pad, sink, first, last, sim, limiting);
+                var moved = false;
+                if (split > first) moved = stamp.evalRangeMoved(D, true, stamp.host_pad, sink, first, split, sim, limiting, track);
+                if (last > split) moved = stamp.evalRangeMoved(D, false, stamp.host_pad, sink, split, last, sim, limiting, track) or moved;
+                return moved;
             }
+            return stamp.evalRangeMoved(D, false, stamp.host_pad, sink, first, last, sim, limiting, track);
         }
 
         /// Instance `id`'s Model.
@@ -347,11 +464,26 @@ pub fn DeviceBatch(comptime D: type) type {
             if (comptime @hasDecl(D, "stateCtl")) _ = St.stateCtl(self, .commit);
         }
 
+        /// The type-erased handle over `self`. Also turns N3's tracking and
+        /// N6's census off:
+        /// every batch passes here once at birth (`ProtoStore.finalize`,
+        /// `duplicate`), and its bytes may be undefined until then.
         pub fn binding(self: *Self) Batch {
+            if (comptime has_q) {
+                self.track_q = false;
+                self.q_clean = false;
+            }
+            self.census = null;
             return .{
                 .ctx = self,
                 .eval = eval,
                 .eval_newton = evalNewton,
+                // `setSimState` stores and nothing more unless the bypass
+                // reviews its hit rate there. A C4-only type keeps the
+                // store, so the lever off costs it nothing.
+                // ponytail: such a batch is never reviewed under C4; the
+                // lever's verdict decides its place in this test.
+                .sim_offset = comptime if (Bp.bypassable and !Bp.c4_only) Batch.sim_none else @offsetOf(Self, "sim"),
                 .count = self.count,
                 .n_u = n_u,
                 .has_charge = has_q,
@@ -388,6 +520,10 @@ pub fn DeviceBatch(comptime D: type) type {
             }
             if (comptime has_bp) dst.bp = src.bp;
             if (comptime has_src_brk) @memcpy(dst.src_brk, src.src_brk);
+            // The planes no longer match the state: N3 re-reads.
+            if (comptime has_q) if (dst.track_q) {
+                dst.q_clean = false;
+            };
             dst.held_initial = src.held_initial;
             dst.committed_initial = src.committed_initial;
             dst.sim.analog_initial = !dst.held_initial;
@@ -406,6 +542,7 @@ pub fn DeviceBatch(comptime D: type) type {
             const self = try gpa.create(Self);
             self.* = template.*;
             self.bypass = null;
+            self.census = null;
             self.owns_tapes = false;
             self.unshared = false;
             self.models_shared = &.{};
@@ -455,6 +592,7 @@ pub fn DeviceBatch(comptime D: type) type {
         fn destroy(ctx: *anyopaque, gpa: Allocator) void {
             const self = of(ctx);
             Bp.freeBypass(self);
+            if (self.census) |c| c.destroy();
             if (self.unshared) {
                 staging_gpa.free(self.models);
                 gpa.free(self.models_shared);

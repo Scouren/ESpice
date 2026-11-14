@@ -50,7 +50,8 @@ const Results = struct {
             .num => |x| x,
             .measure => |k| if (k < s.values.len) s.values[k] else nan,
             .soa_count => s.soa,
-            .vector, .neg, .add, .sub, .mul, .div, .pow => nan,
+            .vector => nan,
+            .neg, .not, .add, .sub, .mul, .div, .pow, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or", .ternary => unreachable,
         };
     }
 };
@@ -434,4 +435,38 @@ test "malformed PARAM postfix reads NaN" {
     const deep: [33]core.MeasureOp = @splat(.{ .num = 1 });
     try std.testing.expect(std.math.isNan(paramValue(&deep, &.{}, nan)));
     try std.testing.expectEqual(-6, paramValue(&.{ .{ .num = 2 }, .{ .measure = 0 }, .pow, .neg, .{ .num = 2 }, .sub }, &.{2}, nan));
+}
+
+test "PARAM comparisons, logic and ?: give 1 or 0 as numparam does; a failed result fails the card" {
+    // Oracle: numparam's operators worked by hand (xpressn.c); a NaN
+    // result is a card ngspice never defined, so a PARAM card reading it
+    // fails (measure.c:459-466), even in ?:'s unpicked branch.
+    const m: core.MeasureOp = .{ .measure = 0 };
+    const pick: []const core.MeasureOp = &.{ m, .{ .num = 1 }, .lt, .{ .num = 10 }, .{ .num = 20 }, .ternary };
+    try std.testing.expectEqual(10, paramValue(pick, &.{0.5}, nan));
+    try std.testing.expectEqual(20, paramValue(pick, &.{1.5}, nan));
+    try std.testing.expect(std.math.isNan(paramValue(pick, &.{nan}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{ .{ .num = 1 }, .{ .num = 3 }, m, .ternary }, &.{nan}, nan)));
+    // m > 0 && !(m >= 1): 1 inside (0, 1), 0 at 1 and at 0.
+    const inside: []const core.MeasureOp = &.{ m, .{ .num = 0 }, .gt, m, .{ .num = 1 }, .ge, .not, .@"and" };
+    for ([_]f64{ 0.5, 1, 0 }, [_]f64{ 1, 0, 0 }) |x, want| try std.testing.expectEqual(want, paramValue(inside, &.{x}, nan));
+    // m <= 2 || m == 5 || m != m: 1 at 2 and 5, 0 at 3.
+    const either: []const core.MeasureOp = &.{ m, .{ .num = 2 }, .le, m, .{ .num = 5 }, .eq, .@"or", m, m, .ne, .@"or" };
+    for ([_]f64{ 2, 5, 3 }, [_]f64{ 1, 1, 0 }) |x, want| try std.testing.expectEqual(want, paramValue(either, &.{x}, nan));
+    try std.testing.expect(std.math.isNan(paramValue(inside, &.{nan}, nan)));
+    // Before NaN failed every operator, pow(NaN, 0) read 1.
+    try std.testing.expect(std.math.isNan(paramValue(&.{ m, .{ .num = 0 }, .pow }, &.{nan}, nan)));
+}
+
+test "a par() waveform reads time as the scale, and compares sample by sample" {
+    // Oracle: on `ramp`, time * v(b) = t (4 - t) peaks at 4 (t = 2), and
+    // v(a) > 2 holds only at t = 3 and 4: 1 there, 0 elsewhere.
+    const cards = [_]core.Measure{
+        .{ .analysis = .tran, .name = "area", .func = .max, .first = .{ .ops = &.{ .{ .vector = "time" }, .{ .vector = "v(b)" }, .mul } } },
+        .{ .analysis = .tran, .name = "high", .func = .max, .first = .{ .ops = &.{ .{ .vector = "v(a)" }, .{ .num = 2 }, .gt } } },
+        .{ .analysis = .tran, .name = "low", .func = .min, .first = .{ .ops = &.{ .{ .vector = "v(a)" }, .{ .num = 2 }, .gt } } },
+    };
+    var values: [cards.len]f64 = undefined;
+    evaluateAll(&cards, .tran, ramp, &values);
+    try std.testing.expectEqualSlices(f64, &.{ 4, 1, 0 }, &values);
 }

@@ -6,8 +6,8 @@ carries its notice; this page is the index.
 
 | Licence | Models |
 |---|---|
-| Apache-2.0 (written for ESPice) | `bsource_q`, `capacitor`, `inductor`, `sparam_1`-`sparam_4`, `vccs_delay`, `vccs_laplace`, `vccs_pole`, `vcvs_delay`, `vcvs_laplace`, `vcvs_pole`, `wline_1`-`wline_4` |
-| BSD-3-Clause: ngspice / SPICE3, Copyright Regents of the University of California and others | `b3soidd`, `b3soifd`, `bsim1`, `bsim2`, `bsim3`, `bsource`, `bsource_i`, `cccs`, `ccvs`, `coupled_ltra` (also built as `coupled_ltra3`, `coupled_ltra4`), `coupled_tlines`, `cswitch`, `diode`, `gummel_poon`, `hfet1`, `hfet2`, `isource`, `jfet`, `jfet2`, `kinduc`, `lossy_tline`, `ltra`, `mes`, `mesa`, `mos1`, `mos2`, `mos3`, `mos6`, `mos9`, `resistor`, `tline`, `txl`, `vccs`, `vcvs`, `vdmos`, `vsource`, `vswitch` |
+| Apache-2.0 (written for ESPice) | `capacitor`, `inductor`, `sparam_1`-`sparam_4`, `vccs_delay`, `vccs_laplace`, `vccs_pole`, `vcvs_delay`, `vcvs_laplace`, `vcvs_pole`, `wline_1`-`wline_4` |
+| BSD-3-Clause: ngspice / SPICE3, Copyright Regents of the University of California and others | `b3soidd`, `b3soifd`, `bsim1`, `bsim2`, `bsim3`, `bsource`, `bsource_i` (also built as `bsource_d`, `bsource_di`), `cccs`, `ccvs`, `coupled_ltra` (also built as `coupled_ltra3`, `coupled_ltra4`), `coupled_tlines`, `cswitch`, `diode`, `gummel_poon`, `hfet1`, `hfet2`, `isource`, `jfet`, `jfet2`, `kinduc`, `lossy_tline`, `ltra`, `mes`, `mesa`, `mos1`, `mos2`, `mos3`, `mos6`, `mos9`, `resistor`, `tline`, `txl`, `vccs`, `vcvs`, `vdmos`, `vsource`, `vswitch` |
 | HiSIM licence (Hiroshima University, STARC) | `hisim2_va` |
 | Not stated in the file; upstream (Dietmar Warning's VA-Models, through VACASK) is mostly ECL-2.0, see below | `vbic13_4t` |
 | **CC-BY-NC 4.0** (Cogenda VA-BSIM48): **no commercial use** | `bsim4va` |

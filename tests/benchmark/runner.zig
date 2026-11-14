@@ -16,6 +16,9 @@
 //!   zig build bench -- --fixtures zig-out/postlayout --out zig-out/postlayout-results.md
 //!   bash tests/conformance/external/spice-bench/fetch.sh zig-out/suites cmcqa
 //!   zig build bench -- --fixtures zig-out/suites/cmcqa --out zig-out/suites-results.md
+//! A deck whose oracle names another dialect is translated once by
+//! `spice2rack` (`--spicerack BIN`, else `$ESPICE_SPICERACK`, else PATH),
+//! outside timing; the espice columns time the translated ngspice deck.
 const std = @import("std");
 const Io = std.Io;
 const ngspice = @import("ngspice.zig");
@@ -23,6 +26,7 @@ const vacask = @import("vacask.zig");
 const xyce = @import("xyce.zig");
 const hspice = @import("hspice.zig");
 const spectre = @import("spectre.zig");
+const spicerack = @import("spicerack.zig");
 const compare = @import("compare.zig");
 const completion = @import("completion.zig");
 const common = @import("job.zig");
@@ -39,6 +43,8 @@ const Config = struct {
     /// Extra command-line words for HSPICE and Spectre (threads, APS).
     hspice_args: []const []const u8 = &.{},
     spectre_args: []const []const u8 = &.{},
+    /// The `spice2rack` that translates a deck in another dialect.
+    spicerack: []const u8 = "spice2rack",
     /// Give HSPICE and Spectre ESPice's tolerances where the deck sets none.
     match_tol: bool = true,
     fixtures: []const u8,
@@ -122,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
         if (vendors.items.len == 2) "HSPICE and Spectre" else vendors.items[0].label(),
         if (cfg.match_tol) " and ESPice's reltol=1e-3 abstol=1e-12 vntol=1e-6 where the deck sets none" else "",
     });
-    try w.print("\nMedian of {d} measured runs after one warm-up; milliseconds include process startup and output. Runs are serial, with engine order rotated each repetition. VACASK conversion is outside timing.\n\n", .{cfg.iters});
+    try w.print("\nMedian of {d} measured runs after one warm-up; milliseconds include process startup and output. Runs are serial, with engine order rotated each repetition. VACASK conversion is outside timing, and so is SpiceRack's translation of a deck in another dialect: the espice columns time the translated ngspice deck, and SpiceRack ms is that one translation's wall time.\n\n", .{cfg.iters});
 
     // Columns: the espice variants, then each reference in use. Agreement:
     // each variant against each reference, then each pair of references.
@@ -136,11 +142,13 @@ pub fn main(init: std.process.Init) !void {
     try w.writeAll("| Fixture |");
     for (labels) |l| try w.print(" {s} ms |", .{l});
     for (vendors.items) |r| try w.print(" {s} run ms | {s} analysis ms |", .{ r.label(), r.label() });
+    try w.writeAll(" SpiceRack ms |");
     if (vendors.items.len > 0) try w.writeAll(" load |");
     for (pairs.items) |p| try w.print(" {s}/{s} |", .{ labels[p[0]], labels[p[1]] });
     try w.writeAll("\n|---|");
     for (labels) |_| try w.writeAll("---:|");
     for (vendors.items) |_| try w.writeAll("---:|---:|");
+    try w.writeAll("---:|");
     if (vendors.items.len > 0) try w.writeAll("---:|");
     for (pairs.items) |_| try w.writeAll("---|");
     try w.writeByte('\n');
@@ -180,16 +188,25 @@ pub fn main(init: std.process.Init) !void {
         // HSPICE deck read as ngspice fails before it runs.
         const dialect = try tokenizerOf(fa, io, source);
         const hspice_dialect = if (dialect) |d| std.mem.eql(u8, d, "hspice") else false;
+        // Another dialect: SpiceRack translates the deck once, here, outside
+        // timing, and every espice column runs the translation as ngspice.
+        const translation: ?spicerack.Translation = if (dialect) |d|
+            if (std.mem.eql(u8, d, "ngspice")) null else try spicerack.translate(fa, io, cfg.spicerack, d, source, absolute)
+        else
+            null;
         // Sampled before the deck's runs, so they do not count themselves.
         const load = loadAverage(io, fa);
         for (labels, 0..) |label, i| {
             const job: common.Job = if (i < nv) blk: {
+                if (translation) |t| if (t.refused.len > 0) break :blk .{ .refused = t.refused };
                 const v = cfg.variants[i];
                 const raw = try std.fmt.allocPrint(fa, "{s}/{s}.raw", .{ absolute, label });
-                const tokenizer: []const []const u8 = if (dialect) |t| &.{ "--tokenizer", t } else &.{};
+                // A named oracle dialect means an ngspice deck by now.
+                const tokenizer: []const []const u8 = if (dialect != null) &.{ "--tokenizer", "ngspice" } else &.{};
+                const deck = if (translation) |t| t.entry else source;
                 const argv = try std.mem.concat(fa, []const u8, &.{
                     if (v.env.len > 0) &.{"env"} else &.{}, v.env,     &.{cfg.espice},
-                    v.flags,                                tokenizer, &.{ "--format=binary", "-b", "-r", raw, source },
+                    v.flags,                                tokenizer, &.{ "--format=binary", "-b", "-r", raw, deck },
                 });
                 break :blk .{ .argv = argv, .cwd = .{ .path = std.fs.path.dirname(source).? }, .raw = raw };
             } else switch (refs.items[i - nv]) {
@@ -219,6 +236,7 @@ pub fn main(init: std.process.Init) !void {
                 try w.print(" {d:.3} | {d:.3} |", .{ t.run_ms, t.analysis_ms });
             } else try w.writeAll(" — | — |");
         }
+        if (translation != null and translation.?.refused.len == 0) try w.print(" {d:.3} |", .{translation.?.ms}) else try w.writeAll(" — |");
         if (vendors.items.len > 0) try w.print(" {s} |", .{load});
         for (pairs.items) |pair| {
             const left = results[pair[0]];
@@ -242,6 +260,7 @@ pub fn main(init: std.process.Init) !void {
                 .engine = label,
                 .samples_ms = if (result) |r| r.samples_ms else &.{},
                 .median_ms = if (result) |r| @as(?f64, r.milliseconds) else null,
+                .spicerack_ms = if (translation) |t| @as(?f64, t.ms) else null,
                 .failure = if (result == null) @as(?[]const u8, reason) else null,
                 .scratch = scratch,
                 .index = index,
@@ -405,7 +424,8 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
     const engine = args.next() orelse return error.MissingEngine;
     var cfg: Config = .{ .espice = try Io.Dir.cwd().realPathFileAlloc(io, engine, a), .fixtures = args.next() orelse return error.MissingFixtures };
     var variants: std.ArrayList(Variant) = .empty;
-    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step, fixtures };
+    if (init.environ_map.get("ESPICE_SPICERACK")) |exe| cfg.spicerack = exe;
+    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step, fixtures, spicerack };
     const flags = std.StaticStringMap(Flag).initComptime(.{
         .{ "--list", .list },                    .{ "--ngspice-klu", .klu },               .{ "--filter", .filter },
         .{ "--iters", .iters },                  .{ "--timeout", .timeout },               .{ "--rtol", .rtol },
@@ -413,7 +433,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
         .{ "--xyce", .xyce },                    .{ "--espice", .espice },                 .{ "--hspice", .hspice },
         .{ "--spectre", .spectre },              .{ "--hspice-args", .hspice_args },       .{ "--spectre-args", .spectre_args },
         .{ "--vendor-tolerances", .native_tol }, .{ "--vacask-tran-fs", .vacask_tran_fs }, .{ "--vacask-tran-step", .vacask_tran_step },
-        .{ "--fixtures", .fixtures },
+        .{ "--fixtures", .fixtures },            .{ "--spicerack", .spicerack },
     });
     while (args.next()) |arg| {
         const flag = flags.get(arg) orelse return error.UnknownArgument;
@@ -432,6 +452,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
             .rtol => cfg.rtol = try std.fmt.parseFloat(f64, value),
             .out => cfg.report = value,
             .fixtures => cfg.fixtures = value,
+            .spicerack => cfg.spicerack = value,
             .ngspice => cfg.refs.set(.ngspice, value),
             .vacask => cfg.refs.set(.vacask, value),
             .vacask_tran_fs => cfg.vacask_tran_fs = try std.fmt.parseFloat(f64, value),

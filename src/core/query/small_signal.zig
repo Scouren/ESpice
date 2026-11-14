@@ -26,25 +26,26 @@ const CardNames = @import("card_names.zig").CardNames;
 
 /// One `.sp` port: the node rows and branch row of its source and its
 /// reference impedance in ohms. The port voltage is v(node) - v(neg).
+/// z0 is already in the circuit, in series between `node` and the source
+/// (ngspice's portnum V), so the port analyses do not terminate the branch
+/// again; only `Sp`'s one-port default at the drive source does.
 pub const Port = struct {
     node: u32,
     branch: u32,
     z0: f64 = 50.0,
     neg: u32 = 0,
-    /// The band `.hblin` reads this port in (an HSPICE P card's
-    /// `hblin=[harmonic, sign]`): sign·f + harmonic·f0 for input frequency f.
+    /// The band `.hblin` reads this port in (the V card's `hblin_h=` and
+    /// `hblin_s=`): sign·f + harmonic·f0 for input frequency f.
     band: Band = .{},
-    /// z0 is already a resistor in the circuit, in series between `node`
-    /// and the source (an HSPICE P card), so the port analyses must not
-    /// terminate the branch again. False for ngspice's ideal portnum source.
-    series_z0: bool = false,
-    /// A mixed-mode (balanced) P card's − leg, against the same `neg`
-    /// reference and z0; `node`/`branch` are then its + leg. Null for a
-    /// single-ended port.
+    /// A balanced port's − leg: the second portnum V card on this port
+    /// number, `node`/`neg`/`branch` being the first card's + leg. Each leg
+    /// has this z0 in series and is read against its own `neg`; the port's
+    /// modes are differential, v+ − v− against 2·z0, and common,
+    /// (v+ + v−)/2 against z0/2 [SA Ch.17]. Null for a single-ended port.
     balanced: ?Leg = null,
 
-    /// Node and branch row of one leg of a balanced port.
-    pub const Leg = struct { node: u32, branch: u32 };
+    /// Node rows and branch row of a balanced port's − leg.
+    pub const Leg = struct { node: u32, neg: u32, branch: u32 };
 
     /// `branch` of a port with no source branch, which `.net` drives with
     /// a current into `node`.
@@ -60,8 +61,7 @@ pub const Ac = struct {
     sweep: FreqSweep,
 };
 
-/// Small-signal noise at one output over a sweep (`.noise`, HSPICE
-/// `.acphasenoise`).
+/// Small-signal noise at one output over a sweep (`.noise`).
 pub const Noise = struct {
     tol: Tolerances = .{},
     out_node: u32,
@@ -85,12 +85,14 @@ pub const Noise = struct {
     /// Card names for the contribution columns. An unnamed instance falls
     /// back to `<type>#<ordinal>`.
     card_names: CardNames = .empty,
+    /// The quiet resistors (`noisy=0`), as an existence table: an instance
+    /// it names publishes no contribution column, as ngspice's resnoise.c:57
+    /// skips it. Its generator is zero (resistor.va scales it by `noisy`),
+    /// so the totals are the same either way.
+    quiet: CardNames = .empty,
     /// HSPICE `.sample`: also publish the output noise folded by a sampler
     /// (`onoise_sampled`); spectrum queries only.
     sample: ?NoiseSample = null,
-    /// HSPICE `.acphasenoise`: the output is a phase in radians, published
-    /// as phase noise `phnoise` in dBc/Hz instead of the noise curves.
-    phase: bool = false,
 };
 
 /// HSPICE `.sample FS= [MAXFLD=] [BETA=]` [CR .SAMPLE]: noise sampled at
@@ -117,6 +119,10 @@ pub const Sp = struct {
     /// Z against each port's z0 (RIN, ROUT). `lin` is set, without group
     /// delay or noise.
     net: bool = false,
+    /// ngspice `.sp ... donoise=1`: after S, the port noise current
+    /// correlation `Cy_i_j` over every port pair and, for exactly two
+    /// ports, NF, SOpt, NFmin and Rn (span.c:111-165). `lin` replaces it.
+    noise: bool = false,
 
     /// What `.lin` adds to the S matrix: Y and Z always, H for two or more
     /// ports (from the port 1-2 block), then the optional group delays and

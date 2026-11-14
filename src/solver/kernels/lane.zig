@@ -14,8 +14,15 @@
 //! - `pub const void_bit: u32 = 1`
 //! - `pub const scaled_bit: u32 = 2`
 //! - `pub const x_plausible = 1e9`
+//! - `pub const force_g = 1e10`
+//! - `pub const ForceRow = extern struct`
+//! - `pub const GminStamp = extern struct`
 //! - `pub const LteIn = lane_step.LteIn`
 //! - `pub const stepBound = lane_step.stepBound`
+//! - `pub const stepBoundGear = lane_step.stepBoundGear`
+//! - `pub const companionGear = lane_step.companionGear`
+//! - `pub const LaneGear = lane_step.LaneGear`
+//! - `pub const gear_run = lane_step.gear_run`
 //! - `pub const dense_peel_max_n = lane_step.dense_peel_max_n`
 //! - `pub const denseSolveNeg = lane_step.denseSolveNeg`
 //! - `pub const LaneScalars = lane_step.LaneScalars`
@@ -32,6 +39,7 @@
 //! - `pub const stepBegin = lane_step.stepBegin`
 //! - `pub const stepEndA = lane_step.stepEndA`
 //! - `pub const stepEndB = lane_step.stepEndB`
+//! - `pub const lteFix = lane_lte.lteFix`, `pub const lte_zero_src = lane_lte.lte_zero_src`
 //! - `pub const Gate = extern struct`
 //! - `pub const NewtonOpts = extern struct`
 //! - `pub const SimState = extern struct`
@@ -39,6 +47,9 @@
 //!     - `pub fn refactor(t: LaneTab, x: P(u32), a: P(f64), lx: P(f64), ux: P(f64), udiag: P(f64), w: P(f64), n_lanes: u32, l: u32) bool`
 //!     - `pub fn solveNeg(t: LaneTab, x: P(u32), lx: P(f64), ux: P(f64), udiag: P(f64), rhs: P(f64), y: P(f64), dx: P(f64), n_lanes: u32, l: u32) void`
 //!     - `pub fn luSolve(comptime neg: bool, t: LaneTab, x: P(u32), lx: P(f64), ux: P(f64), udiag: P(f64), rhs: P(f64), y: P(f64), out: P(f64), n_lanes: usize, l: usize) void`
+//!     - `pub fn gminRow(i: usize, gmin: f64, x: P(f64), rhs: P(f64), a: P(f64), diag: P(u32), n_lanes: u32, l: u32) void`
+//!     - `pub fn loadExtras(n_stamps: u32, stamps: P(GminStamp), gmin: f64, n_force: u32, force: P(ForceRow), scale: f64, x: P(f64), rhs: P(f64), a: P(f64), n_lanes: u32, l: u32) void`
+//!     - `pub fn clampUpdate(n: u32, dx: P(f64), current_row: P(u8), dv: f64, n_lanes: u32, l: u32) bool`
 //!     - `pub fn updateNorm(n: u32, x: P(f64), dx: P(f64), x_old: P(f64), current_row: P(u8), reltol: f64, abstol: f64, vntol: f64, n_lanes: u32, l: u32) f64`
 //!     - `pub fn plausible(n: u32, x: P(f64), limit: f64, n_lanes: u32, l: u32) bool`
 //!     - `pub fn residual(n: u32, opts: NewtonOpts, x: P(f64), rhs: P(f64), vals: P(f64), diag: P(u32), n_lanes: u32, l: u32) bool`
@@ -50,6 +61,7 @@
 
 const std = @import("std");
 const lane_step = @import("lane_step.zig");
+const lane_lte = @import("lane_lte.zig");
 const testing = std.testing;
 
 /// Offsets (u32 words) of a frozen `SparseLu` tape inside one index buffer
@@ -88,6 +100,23 @@ pub const scaled_bit: u32 = 2;
 /// `converger.x_plausible`, the runaway floor. Kept equal by a host test.
 pub const x_plausible = 1e9;
 
+/// `converger.force_g`, a hold's conductance in siemens. Kept equal by a
+/// host test.
+pub const force_g = 1e10;
+
+/// `converger.Force` as the lane kernels read it, lane-uniform: row `row`
+/// held at `value` through `force_g` on slot `slot`.
+pub const ForceRow = extern struct { value: f64, slot: u32, row: u32 };
+
+/// `converger.GminStamp` as the lane kernels read it, lane-uniform.
+pub const GminStamp = extern struct { slot: u32, row: u32, col: u32 };
+
+comptime {
+    // Table rows the extras kernel walks: no padding.
+    std.debug.assert(@sizeOf(ForceRow) == 16);
+    std.debug.assert(@sizeOf(GminStamp) == 12);
+}
+
 // The transient step bodies live in lane_step.zig; re-exported for
 // `solver.lane_kernels` and the kernel root.
 /// See `lane_step.LteIn`.
@@ -95,6 +124,18 @@ pub const LteIn = lane_step.LteIn;
 
 /// See `lane_step.stepBound`.
 pub const stepBound = lane_step.stepBound;
+
+/// See `lane_step.stepBoundGear`.
+pub const stepBoundGear = lane_step.stepBoundGear;
+
+/// See `lane_step.companionGear`.
+pub const companionGear = lane_step.companionGear;
+
+/// See `lane_step.LaneGear`.
+pub const LaneGear = lane_step.LaneGear;
+
+/// See `lane_step.gear_run`.
+pub const gear_run = lane_step.gear_run;
 
 /// See `lane_step.dense_peel_max_n`.
 pub const dense_peel_max_n = lane_step.dense_peel_max_n;
@@ -144,6 +185,12 @@ pub const stepEndA = lane_step.stepEndA;
 /// See `lane_step.stepEndB`.
 pub const stepEndB = lane_step.stepEndB;
 
+/// See `lane_lte.lteFix`.
+pub const lteFix = lane_lte.lteFix;
+
+/// See `lane_lte.lte_zero_src`.
+pub const lte_zero_src = lane_lte.lte_zero_src;
+
 /// Newton per-lane gate state, one record per lane.
 pub const Gate = extern struct {
     /// `plausibleLimit`, set at iteration 0.
@@ -167,11 +214,30 @@ pub const NewtonOpts = extern struct {
     vntol: f64,
     gmin: f64 = 0,
     residual_tol: f64 = std.math.inf(f64),
+    /// `converger.Options.dv` (`.options dv`): the bound on each potential
+    /// row's update; inf leaves the update whole (`clampUpdate`).
+    dv: f64 = std.math.inf(f64),
     /// `converger.Options.max_iter`: `finalize` retires a lane after this
     /// many ticks, unconverged.
     max_iter: u32 = std.math.maxInt(u32),
-    _pad: u32 = 0,
+    /// `converger.Options.force.len`: hold rows in the force table.
+    n_force: u32 = 0,
+    /// `converger.Options.gmin_stamps.len`: with any, `gmin` lands at the
+    /// stamps (`loadExtras`) instead of every diagonal.
+    n_stamps: u32 = 0,
+    /// Nonzero: each lane's gmin and hold scale come from the per-lane
+    /// homotopy plane (`[gmin, scale]` per lane, the operating-point
+    /// ladder's rungs), and `gmin` is only their maximum, which decides
+    /// the launch. Zero: `gmin` for every lane and scale 1.
+    per_lane: u32 = 0,
 };
+
+comptime {
+    // Passed by value to the tick kernels, which compile this same
+    // declaration: six f64 and four u32, no padding.
+    std.debug.assert(@sizeOf(NewtonOpts) == 64);
+    std.debug.assert(@offsetOf(NewtonOpts, "max_iter") == 48);
+}
 
 /// VerA's `contract.SimState` (24 bytes, extern), restated so this file
 /// stays std only; `analysis/gpu/lanes.zig` asserts the two layouts equal.
@@ -296,6 +362,62 @@ pub fn Bodies(comptime P: fn (type) type) type {
                 };
             }
             for (0..t.n) |j| out[@as(usize, x[t.q + j]) * N + L] = y[j * N + L];
+        }
+
+        /// `newton_sys.loadGmin`'s diagonal form for row i of lane l:
+        /// `rhs[i] += gmin * x[i]`, then `gmin` on the row's diagonal. One
+        /// (row, lane) per thread; a gmin that is not positive loads
+        /// nothing, as the host's guard.
+        pub fn gminRow(i: usize, gmin: f64, x: P(f64), rhs: P(f64), a: P(f64), diag: P(u32), n_lanes: u32, l: u32) void {
+            if (!(gmin > 0)) return;
+            const N: usize = n_lanes;
+            const L: usize = l;
+            rhs[i * N + L] += gmin * x[i * N + L];
+            a[@as(usize, diag[i]) * N + L] += gmin;
+        }
+
+        /// `converger.loadExtras` past the diagonal gmin, for lane l, after
+        /// assembly and before the refactor reads A: with `gmin` > 0, gmin
+        /// at each stamp's slot, then its residual gmin * x[col] at its
+        /// row; then each hold's `force_g` at its slot and
+        /// `force_g * (x[row] - value)` at its row. Table order, as the host
+        /// loads them, so a slot two entries share sums in the same order.
+        /// `force_g * (x[row] - value * scale)`: `scale` is source
+        /// stepping's lambda (`op_ladder`'s holds scale with the sources),
+        /// 1 otherwise, and value * 1 is value exactly.
+        pub fn loadExtras(n_stamps: u32, stamps: P(GminStamp), gmin: f64, n_force: u32, force: P(ForceRow), scale: f64, x: P(f64), rhs: P(f64), a: P(f64), n_lanes: u32, l: u32) void {
+            const N: usize = n_lanes;
+            const L: usize = l;
+            if (gmin > 0) {
+                for (0..n_stamps) |k| a[@as(usize, stamps[k].slot) * N + L] += gmin;
+                for (0..n_stamps) |k| rhs[@as(usize, stamps[k].row) * N + L] += gmin * x[@as(usize, stamps[k].col) * N + L];
+            }
+            for (0..n_force) |k| {
+                const f = force[k];
+                a[@as(usize, f.slot) * N + L] += force_g;
+                rhs[@as(usize, f.row) * N + L] += force_g * (x[@as(usize, f.row) * N + L] - f.value * scale);
+            }
+        }
+
+        /// `converger.clampUpdate` at W = 1 for lane l, before `updateNorm`:
+        /// each potential row's update clamped to [-dv, dv], flow rows
+        /// untouched, a NaN passed through. True when a row clamped: the
+        /// tick is limited and never accepted. dv = inf returns false at
+        /// once, one branch per lane per tick, so dx keeps today's bits.
+        pub fn clampUpdate(n: u32, dx: P(f64), current_row: P(u8), dv: f64, n_lanes: u32, l: u32) bool {
+            if (!(dv < std.math.inf(f64))) return false;
+            const N: usize = n_lanes;
+            const L: usize = l;
+            var clamped = false;
+            for (0..n) |i| {
+                if (current_row[i] != 0) continue;
+                const d = dx[i * N + L];
+                const over = d > dv;
+                const under = d < -dv;
+                dx[i * N + L] = if (over) dv else if (under) -dv else d;
+                clamped = clamped or over or under;
+            }
+            return clamped;
         }
 
         /// `converger.updateAndNorm` at W = 1 for lane l: x_old = x,
@@ -554,6 +676,7 @@ test "lane_kernels updateNorm and plausibleLimit at one lane are bitwise converg
     const converger = @import("../converger.zig");
     const B = Bodies(HostP);
     try testing.expectEqual(converger.x_plausible, x_plausible);
+    try testing.expectEqual(converger.force_g, force_g);
     var prng = std.Random.DefaultPrng.init(0x1a7e52);
     const r = prng.random();
     const N = 3;

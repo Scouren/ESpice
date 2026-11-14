@@ -111,8 +111,8 @@ pub fn takeBack(s: *Stream, scans: []const scan.Dev) void {
 
 // ---- private ----
 
-/// `col` as the device reads it; null for a complex column, a power, or a
-/// program past `scan.Program.max` ops.
+/// `col` as the device reads it; null for a complex column, a power, a
+/// comparison, logic op or select, or a program past `scan.Program.max` ops.
 fn source(s: *const Stream, col: columns.Waveform) ?Source {
     var p: scan.Program = .{};
     switch (col) {
@@ -140,7 +140,8 @@ fn source(s: *const Stream, col: columns.Waveform) ?Source {
                 .sub => .{ .code = .sub },
                 .mul => .{ .code = .mul },
                 .div => .{ .code = .div },
-                .pow => return null, // `scan.Program` has no power
+                // `scan.Program` has no power, comparison, logic or select.
+                .pow, .not, .lt, .gt, .le, .ge, .eq, .ne, .@"and", .@"or", .ternary => return null,
             };
             p.len = @intCast(par.ops.len);
             return .{ .unknown = scan.DevColumns.none, .program = p };

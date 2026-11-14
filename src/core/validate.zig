@@ -9,7 +9,7 @@
 //! Contents:
 //! - `pub const mhb_max_tones`, `pub const mhb_max_box: usize`
 //! - `pub const Error = error{InvalidQueryOptions}`
-//! - `pub const DeckError = Error || error{DcSweepSourceNotFound}`
+//! - `pub const DeckError = Error || error{ DcSweepSourceNotFound, UnmodelledNoise, UnreplayedOpVar }`
 //! - `pub fn validate(query: requests.Query, n: u32) Error!void`
 //! - `pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void`
 //! - `pub fn envelopeMaxPoints(options: requests.Envelope) u32`
@@ -39,6 +39,15 @@ pub const Error = error{
 pub const DeckError = Error || error{
     /// A `.dc` sweep names a (type, index) card the deck does not have.
     DcSweepSourceNotFound,
+    /// A `.noise` on a deck whose cards set a noise generator ESPice does
+    /// not model (`Deck.noise_gaps`); the log names the first card and key.
+    UnmodelledNoise,
+    /// A `.tran` on a deck that saves an operating-point variable whose
+    /// transient value only the replay serves (`OpVar.dynamic`), when this
+    /// run's first row is no operating point (uic, TSTART > 0, `.op
+    /// <time>`) or the deck runs no `.tran` its names were resolved for;
+    /// the log names the first such variable.
+    UnreplayedOpVar,
 };
 
 /// Row fields, by name, that every query kind having one must keep below n.
@@ -68,9 +77,11 @@ pub fn validate(query: requests.Query, n: u32) Error!void {
 /// `validate`, plus the checks that need the deck: `error.InvalidQueryOptions`
 /// when the query's `tol.variant`, an `.mc` variant range or a `.dc` tangent
 /// row or a `.tran` one lies past `deck.variants` or among its dropped rows,
-/// and `error.DcSweepSourceNotFound` when a `.dc` sweep names a card the deck
-/// does not have. Asserts that a non-empty `deck.variants` has one `starts`
-/// entry more than rows.
+/// `error.DcSweepSourceNotFound` when a `.dc` sweep names a card the deck
+/// does not have, `error.UnmodelledNoise` for a `.noise` on a deck with
+/// `noise_gaps`, and `error.UnreplayedOpVar` for a `.tran` whose rows no
+/// replay serves a saved operating-point variable over. Asserts that a
+/// non-empty `deck.variants` has one `starts` entry more than rows.
 pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void {
     try validate(query, n);
     // `count` asserts the table's shape, so it runs only for a query that
@@ -87,8 +98,17 @@ pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!
             if (o.target2) |t2| try dcTargetExists(t2, deck);
             for (o.tangents) |row| if (row < rows.base or row >= rows.count()) return error.InvalidQueryOptions;
         },
-        .tran => |o| for (o.tangents) |row| if (row < rows.base or row >= rows.count()) return error.InvalidQueryOptions,
-        .ac, .dcmatch, .disto, .envelope, .four, .hb, .matex, .noise, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => {},
+        .tran => |o| {
+            for (o.tangents) |row| if (row < rows.base or row >= rows.count()) return error.InvalidQueryOptions;
+            try opVarsReplay(o, deck);
+        },
+        // The table's one reader: every other analysis runs on such a deck.
+        .noise => if (deck.noise_gaps.len != 0) {
+            const gap = deck.noise_gaps[0];
+            if (!@import("builtin").is_test) std.log.err("{s}: ESPice does not model its '{s}' noise; .noise refused", .{ gap.card, gap.key });
+            return error.UnmodelledNoise;
+        },
+        .ac, .dcmatch, .disto, .envelope, .four, .hb, .matex, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => {},
     }
 }
 
@@ -146,7 +166,7 @@ fn checkCommon(comptime T: type, o: T, n: u32) Error!void {
         if (o.sweep.kind != .lin and o.sweep.f_start <= 0) return error.InvalidQueryOptions;
         if (o.sweep.points == 0) return error.InvalidQueryOptions;
         if (o.sweep.f_start > 0) try frequency(o.sweep.f_start);
-        try frequency(o.sweep.f_stop);
+        if (o.sweep.f_stop > 0) try frequency(o.sweep.f_stop);
         _ = try elements(&.{ o.sweep.count(), n, 2 });
     }
     inline for (count_fields) |field| if (@hasField(T, field)) {
@@ -188,6 +208,7 @@ fn tolerance(t: Tolerances) Error!void {
     inline for (.{ "reltol", "residual_tol", "trtol" }) |field| try positive(@field(t, field));
     if (t.abstol < 0 or t.vntol < 0 or t.chgtol < 0 or t.gmin < 0 or t.gmin_start < 0) return error.InvalidQueryOptions;
     if (t.itl1 == 0 or t.itl2 == 0 or t.itl4 == 0) return error.InvalidQueryOptions;
+    if (t.dv) |d| if (!(d > 0)) return error.InvalidQueryOptions;
     if (t.temp_c) |c| try kelvin(c);
 }
 
@@ -231,6 +252,7 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             const inner = if (o.points.len > 0) o.points.len else try sweep(o.start, o.stop, o.step);
             const outer = if (!o.hasOuter()) 1 else if (o.points2.len > 0) o.points2.len else try sweep(o.start2, o.stop2, o.step2);
             _ = try elements(&.{ inner, outer, o.tangents.len + 1, @as(u64, n) + 1 });
+            if (o.lane) |k| if (k >= o.segments()) return error.InvalidQueryOptions;
         },
         .temp => |o| {
             // The current temperature driver and numPoints are ascending only.
@@ -281,9 +303,13 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             try frequency(o.sweep.f_stop + @as(f64, @floatFromInt(o.n_harmonics)) * o.f_lo);
         },
         .sp => |o| {
-            for (o.ports) |p| try port(p, n, o.net);
-            const ports = @max(o.ports.len, 1);
-            _ = try elements(&.{ o.sweep.count(), ports, ports, 2 });
+            // A balanced port publishes two modes.
+            var modes: usize = @max(o.ports.len, 1);
+            for (o.ports) |p| {
+                try port(p, n, o.net);
+                modes += @intFromBool(p.balanced != null);
+            }
+            _ = try elements(&.{ o.sweep.count(), modes, modes, 2 });
         },
         .four => |o| {
             if (o.n_harmonics == 0 or o.n_harmonics > requests.Four.max_harmonics) return error.InvalidQueryOptions;
@@ -295,9 +321,10 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             }
         },
         .pss => |o| {
-            if (o.n_samples == std.math.maxInt(u32)) return error.InvalidQueryOptions;
+            if (o.n_samples == std.math.maxInt(u32) or o.steady_coeff < 0) return error.InvalidQueryOptions;
             try timeStep(o.period / @as(f64, @floatFromInt(o.n_samples)));
-            _ = try elements(&.{ @as(u64, o.n_samples) + 1, @as(u64, n) + 1 });
+            // A spectrum's rows follow the period's (`pss.finish`).
+            _ = try elements(&.{ @as(u64, o.n_samples) + 1 + o.harms, @as(u64, n) + 1 });
         },
         .phasenoise => |o| {
             if (o.osc_node == 0 or o.carrier == 0 or o.carrier > o.n_harmonics) return error.InvalidQueryOptions;
@@ -319,7 +346,11 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             _ = try elements(&.{ o.pss_n_samples, n, n });
             try frequency(o.sweep.f_stop + @as(f64, @floatFromInt(o.n_sidebands)) * o.f_fundamental);
         },
-        .hblin => |o| for (o.ports) |p| try port(p, n, false),
+        .hblin => |o| for (o.ports) |p| {
+            // `.hblin` reads each port in its band, with no mode basis.
+            if (p.balanced != null) return error.InvalidQueryOptions;
+            try port(p, n, false);
+        },
         .hb => |o| try hb(o, n),
         .qpss => |o| {
             // Runs as `.hb TONES=f1 f2 NHARMS=k1 k2`: the same box limits.
@@ -377,8 +408,13 @@ fn checkKind(query: requests.Query, n: u32) Error!void {
             if (o.out_pos >= n or o.out_neg >= n) return error.InvalidQueryOptions;
             try validate(.{ .tran = o.tran }, n);
         },
+        // The AC form's sweep takes `.ac`'s checks; its drive rows are rows.
+        .sens => |o| if (o.ac) |grid| {
+            try validate(.{ .ac = .{ .sweep = grid } }, n);
+            for (o.ac_sources) |src| if (src.pos >= n or src.neg >= n) return error.InvalidQueryOptions;
+        },
         // The common checks cover these whole.
-        .ac, .dcmatch, .noise, .op, .sens, .stb, .dcinc, .acmatch, .dcsens => {},
+        .ac, .dcmatch, .noise, .op, .stb, .dcinc, .acmatch, .dcsens => {},
     }
 }
 
@@ -395,11 +431,13 @@ fn sweep(start: f64, stop: f64, step: f64) Error!usize {
     return @intFromFloat(count);
 }
 
-/// Refuses a port whose rows are out of range or whose z0 is not positive.
+/// Refuses a port whose rows (a balanced port's − leg's too) are out of
+/// range or whose z0 is not positive, and a balanced port under `.net`,
+/// whose ports are ideal.
 fn port(p: requests.Port, n: u32, net: bool) Error!void {
     const branch_ok = p.branch < n or (net and p.branch == requests.Port.no_branch);
     if (p.node >= n or p.neg >= n or !branch_ok or !(p.z0 > 0)) return error.InvalidQueryOptions;
-    if (p.balanced) |leg| if (leg.node >= n or leg.branch >= n or net) return error.InvalidQueryOptions;
+    if (p.balanced) |leg| if (net or leg.node >= n or leg.neg >= n or leg.branch >= n) return error.InvalidQueryOptions;
 }
 
 /// A driven or autonomous single-tone HB, or a driven multi-tone one whose
@@ -438,6 +476,19 @@ fn dcTargetExists(target: requests.Dc.SweepTarget, deck: *const Deck) DeckError!
         if (card.index == d.index and card.type == d.type) return;
     }
     return error.DcSweepSourceNotFound;
+}
+
+/// `error.UnreplayedOpVar` when `deck` saves a variable whose `.tran` value
+/// the replay serves (`OpVar.dynamic`) and run `o` cannot have it: its
+/// first row is no operating point to replay from (`analysis/post/
+/// opvars.zig`), or the frontend resolved the variable for a deck that
+/// runs no `.tran`, so it carries neither `charging` nor `companion`.
+fn opVarsReplay(o: requests.Tran, deck: *const Deck) DeckError!void {
+    const from_op = o.t_start <= 0 and !o.uic and !o.snapshot;
+    for (deck.opvars) |v| if (v.dynamic and !(from_op and (v.charging or v.companion != null))) {
+        if (!@import("builtin").is_test) std.log.err("{s}: ESPice reads its .tran value by replaying a .tran the deck runs from its operating point; this .tran refused", .{v.label});
+        return error.UnreplayedOpVar;
+    };
 }
 
 test "an empty circuit validates nothing" {

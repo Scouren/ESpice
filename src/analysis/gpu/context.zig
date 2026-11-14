@@ -40,12 +40,14 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const gompute = @import("gompute");
+const drv = @import("driver.zig");
 const device_ir = @import("device").abi;
 const Knobs = @import("../Circuit.zig").Knobs;
 const devices = @import("devices.zig");
 const hdl = @import("hdl.zig");
 const ctx_batch = @import("context_batch.zig");
 const ctx_cost = @import("context_cost.zig");
+const Machine = @import("../machine.zig").Machine;
 const ctx_eval = @import("context_eval.zig");
 const ctx_matrix = @import("context_matrix.zig");
 const ctx_scatter = @import("context_scatter.zig");
@@ -145,7 +147,7 @@ pub const Driver = struct {
     // ---- private ----
 
     fn warmUp(self: *Driver) void {
-        var compute = gompute.runtime.dynamic.Compute.init(if (backend.? == .cuda) .cuda else .hip) catch return;
+        var compute = drv.compute(if (backend.? == .cuda) .cuda else .hip) catch return;
         compute.deinit();
         self.up.store(true, .monotonic);
         // Every other device's context too: the device table opens each one
@@ -320,6 +322,9 @@ pub const GpuContext = struct {
 
     /// `auto` admitted this query on a price: `Audit` holds the device to it.
     audit: ?Audit = null,
+    /// The device this query's handles opened on (`devices.place`), chosen
+    /// once the price admitted the query; `deinit` releases it.
+    placed: devices.Placement,
     /// `Audit` found the device losing and moved the rest of the query to
     /// the host, state included: every entry point walks on the host,
     /// quietly, and `syncHostState` has nothing left to bring home.
@@ -381,17 +386,19 @@ pub const GpuContext = struct {
     ///
     /// `explicit` (the user named the GPU) skips the cost model and loads
     /// cold images; otherwise `init` prices the query both ways (`Cost`,
-    /// from `evals`, the caller's estimate of its device evals, and
-    /// `threads` host lanes) and declines before the first driver call when
-    /// the CPU wins. The `auto` probe evaluates the eligible batches three
-    /// times on the host, which rewrites their `q_tape`.
+    /// from `evals`, the caller's estimate of its device evals, `threads`
+    /// host lanes and `machine`'s constants) and declines before the first
+    /// driver call when the CPU wins. Asserts `machine` is set unless
+    /// `explicit`: an uncalibrated `auto` never asks. The `auto` probe
+    /// evaluates the eligible batches three times on the host, which
+    /// rewrites their `q_tape`.
     ///
     /// On success the page-locked planes (`planes`) hold `host.planes`'
     /// values, ready for `Circuit.attachGpu`; `restorePlanes` copies them
     /// back. A success marks `driver` up, which later queries' cost models
     /// read; a null `driver` prices the setup every time. Caller owns the
     /// result and frees it with `deinit`.
-    pub fn init(gpa: std.mem.Allocator, host: Host, driver: ?*Driver, explicit: bool, threads: u32, evals: f64) InitError!*Self {
+    pub fn init(gpa: std.mem.Allocator, host: Host, driver: ?*Driver, explicit: bool, threads: u32, evals: f64, machine: ?*const Machine) InitError!*Self {
         if (comptime backend == null) return Error.NoGpuArtifacts;
         const knobs = host.knobs;
         const report = explicit or knobs.gpu_stats != .off;
@@ -401,7 +408,11 @@ pub const GpuContext = struct {
             if (b.hooks.gpu_payload != null) n_gpu += 1;
         }
         if (n_gpu == 0) return Error.CircuitNotEligible;
-        const auto_price: ?ctx_cost.Price = if (explicit) null else try ctx_cost.admit(gpa, host, threads, evals, if (driver) |d| d.started() else false);
+        if (!explicit) assert(machine != null);
+        const auto_price: ?ctx_cost.Price = if (explicit) null else try ctx_cost.admit(gpa, host, threads, evals, if (driver) |d| d.started() else false, machine.?);
+        // Placed only once admitted: reading the device table starts the driver.
+        const placed = devices.place();
+        errdefer placed.release();
 
         const self = try gpa.create(Self);
         errdefer gpa.destroy(self);
@@ -430,7 +441,8 @@ pub const GpuContext = struct {
                 n_cpu += 1;
                 continue;
             }
-            const up = try ctx_batch.loadBatch(gpa, &batches[n_up], b, explicit, report, knobs);
+            // Lever p1: a batch without a model row stays on the host.
+            const up = if (!explicit and knobs.perf.p1 and ctx_cost.unpriced(machine.?, b)) false else try ctx_batch.loadBatch(gpa, &batches[n_up], b, explicit, report, knobs);
             if (!up) {
                 cpu_batches[n_cpu] = b;
                 n_cpu += 1;
@@ -450,7 +462,7 @@ pub const GpuContext = struct {
 
         // Every eligible batch demoted; `batches[0]` below needs one.
         if (n_up == 0) return Error.CircuitNotEligible;
-        if (auto_price == null) _ = ctx_cost.recommend(host);
+        if (auto_price == null) _ = ctx_cost.recommend(host, machine);
         if (knobs.gpu_stats != .off) std.debug.print(
             "gpu-stats: resident batches={d} (host-stepped {d}) host batches={d} charge planes={s} lte tape={s}\n",
             .{ n_up, n_stepped, n_cpu, if (resident_charge) "device" else "host-only", if (tape_ok) "device" else "row-plane" },
@@ -578,7 +590,8 @@ pub const GpuContext = struct {
             .prof = .{ .on = knobs.gpu_stats != .off, .phases = knobs.gpu_stats == .phases },
             .fuse = !knobs.gpu_nofuse,
             .lu_check = knobs.gpu_lu_check,
-            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs } else ctx_cost.CostCache.learn(host, threads, evals, knobs),
+            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs, .demote = !knobs.perf.p1 } else ctx_cost.CostCache.learn(host, threads, evals, knobs),
+            .placed = placed,
         };
         if (driver) |d| d.up.store(true, .monotonic);
         // A failure here unwinds through the errdefers above.
@@ -631,6 +644,7 @@ pub const GpuContext = struct {
     /// Frees every device and pinned buffer and `self`. Detach it first
     /// (`Circuit.detachGpu`, which takes the planes back). Device-side state
     /// is dropped; call `syncStatus` or `syncHostState` first to keep it.
+    /// Releases the device placement last, restoring the thread's ordinal.
     pub fn deinit(self: *Self) void {
         if (comptime backend == null) return;
         self.prof.print();
@@ -659,7 +673,9 @@ pub const GpuContext = struct {
         self.gpa.free(self.base_cells);
         self.gpa.free(self.batches_owned);
         self.gpa.free(self.cpu_owned);
+        const placed = self.placed;
         self.gpa.destroy(self);
+        placed.release();
     }
 
     /// The circuit's analysis state at eval time `t`, as the host batches
@@ -704,7 +720,7 @@ pub fn fallsBack(req: Request, explicit: bool, e: InitError) bool {
 pub fn detectedHardware() []const u8 {
     // wasm has no drivers to load (and gompute's loader lock needs sched_yield).
     if (comptime @import("builtin").cpu.arch.isWasm()) return "none";
-    var compute = gompute.runtime.dynamic.Compute.init(null) catch return "none";
+    var compute = drv.compute(null) catch return "none";
     defer compute.deinit();
     return switch (compute.backend) {
         .cpu => "none",
@@ -769,7 +785,7 @@ test "without kernel images init declines as the machine and auto falls back" {
     if (comptime backend != null) return error.SkipZigTest;
     const empty: Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = &.{} };
     const host: Host = .{ .batches = &.{}, .planes = empty, .n = 0, .trash_slot = 0, .has_charge = false, .knobs = .{} };
-    const got = GpuContext.init(std.testing.allocator, host, null, true, 1, 1e6);
+    const got = GpuContext.init(std.testing.allocator, host, null, true, 1, 1e6, null);
     try std.testing.expectError(Error.NoGpuArtifacts, got);
     try std.testing.expect(!available);
     try std.testing.expect(fallsBack(.auto, false, Error.NoGpuArtifacts));

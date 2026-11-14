@@ -6,7 +6,7 @@
 //! Cites: none (phase 4 of dev/analysis/lane-batched-simulation.md).
 //!
 //! Contents:
-//! - `pub const GpuLane = struct`, with `done`, `kill`, `failAll`
+//! - `pub const GpuLane = struct`, with `done`, `kill`, `keepRow`, `failAll`
 //! - `pub fn deviceStepOk(ckt: *const root.Circuit, opts: Options) bool`
 //! - `pub fn laneStep(s: *const Sim, opts: Options, max_iter: u16) LK.LaneStep`
 //! - `pub fn deviceLoop(p_in: DeviceLanes, nr_opts: converger.Options, progress: anytype) void`
@@ -22,11 +22,13 @@ const root = @import("../types.zig");
 const gpu_lanes = @import("../gpu/lanes.zig");
 const Run = @import("Run.zig");
 const Sim = @import("Sim.zig");
+const integrator = @import("integrator.zig");
 const tran = @import("tran.zig");
 
 const LaneError = tran.LaneError;
 const LaneOutcome = tran.LaneOutcome;
 const Options = tran.Options;
+const Step = @import("types.zig").Step;
 const run = tran.run;
 
 /// `runGpuLanes`' lane outcomes: a lane leaves `live` once, with its
@@ -43,6 +45,13 @@ pub const GpuLane = struct {
         o[l] = err;
         rs[l].deinit();
         on[l] = false;
+    }
+    /// An accepted row's probes into lane `s`'s `cur` under a `.op <time>`
+    /// snapshot: the lanes keep only their probe rows, and `Sim.finish`
+    /// copies `cur` into the x `Run.take` reads at `ctx.probes`, which a
+    /// snapshot run records whole (`Run.init` keeps no subset).
+    pub fn keepRow(s: *Sim, row: []const f64) void {
+        for (s.probes) |p| s.cur[p] = row[p];
     }
     /// Fails every live lane with `err`.
     pub fn failAll(rs: []Run, on: []bool, o: []LaneOutcome, err: LaneError) void {
@@ -88,7 +97,10 @@ const DeviceLanes = struct {
             if (rep.event != LK.step_accept) continue;
             const t_new = rep.t_new;
             const row = p.d.slotRow(r, l);
-            if (t_new >= opts.t_start) s.waveform.record(t_new, row, s.probes) catch |e| {
+            if (opts.snapshot) GpuLane.keepRow(s, row);
+            // The device's method codes are `Method`'s ordinals (`LK.LaneScalars.method`).
+            const step: Step = .{ .h = rep.attempted_dt, .method = @fromBackingInt(@intCast(rep.method)) };
+            if (t_new >= opts.t_start) s.waveform.recordStep(t_new, row, s.probes, step) catch |e| {
                 GpuLane.kill(p.runs, p.live, p.out, l, e);
                 return p.d.requestStop(l);
             };
@@ -144,10 +156,11 @@ const DeviceLanes = struct {
 
 /// Whether `runGpuLanes` hands step control to the device (`LK.LaneStep`):
 /// not under `ESPICE_GPU_HOST_STEP`, its oracle, nor under the step
-/// diagnostics, which print from `Sim` mid-step.
+/// diagnostics, which print from `Sim` mid-step, nor at gear-3..6, whose
+/// order control runs in `Sim.end` over the device's bounds.
 pub fn deviceStepOk(ckt: *const root.Circuit, opts: Options) bool {
     const k = ckt.knobs;
-    return !k.gpu_host_step and !k.tran_stats and !k.tran_lte_trace and opts.tangents.len == 0;
+    return !k.gpu_host_step and !k.tran_stats and !k.tran_lte_trace and opts.tangents.len == 0 and integrator.order(opts.method) <= 2;
 }
 
 /// Lane `s`'s `LK.LaneStep` as `Sim.init` left it.
@@ -167,6 +180,8 @@ pub fn laneStep(s: *const Sim, opts: Options, max_iter: u16) LK.LaneStep {
         .abstol = opts.tol.abstol,
         .chgtol = opts.tol.chgtol,
         .trtol = opts.tol.trtol,
+        .uic_bp = s.uic_bp orelse std.math.inf(f64),
+        .sources_at_zero = @intFromBool(opts.sources_at_zero),
         .t = s.t,
         .dt = s.dt,
         .dt_old = s.dt_old,

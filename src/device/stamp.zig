@@ -10,7 +10,8 @@
 //! - `pub const host_pad: bool`
 //! - `pub inline fn mfactorOf(comptime D: type, inst: anytype) f64`
 //! - `pub fn NoiseFamily(comptime D: type) type`
-//! - `pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void`
+//! - `pub inline fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void`
+//! - `pub fn evalRangeMoved(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool, track: bool) bool`
 //! - `pub fn evalQRange(comptime D: type, comptime S: type, sink: anytype, first: u32, end: u32, sim: SimState, batch: anytype) void`
 //! - `pub inline fn snapLimited(comptime n_u: usize, comptime reads: Mask(n_u), comptime writes: Mask(n_u), lx: *[n_u]f64, cur: [n_u]f64) void`
 //! - `pub fn limitRange(comptime D: type, sink: anytype, first: u32, end: u32, lim_active: bool, sim: SimState) f64`
@@ -65,7 +66,19 @@ pub fn NoiseFamily(comptime D: type) type {
 /// only on maximally collapsed instances, which `ProtoStore.finalize` sorts to
 /// `[0, narrow_count)`. `pad` is `host_pad` on the host and false in
 /// `DeviceKernel`, where pad lanes cost registers.
-pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void {
+pub inline fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void {
+    _ = evalRangeMoved(D, narrow, pad, sink, first, end, sim, limiting, false);
+}
+
+/// `evalRange`'s body, with N3's tracking switch (docs/perf_research/
+/// 09-after-the-levers.md). With `track` false it is `evalRange` exactly and
+/// returns false. With `track` true a host sink with a `tapeQ` also records
+/// the LTE charges on a Newton pass, and the result says whether any
+/// instance evaluated at a limited image that is not bitwise its gathered x
+/// (or carried a live correction); false means the pass's charges and tape
+/// are bitwise `evalQRange`'s at the same x, time and state. `track` is a
+/// run-time argument: one kernel instantiation serves both.
+pub fn evalRangeMoved(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool, track: bool) bool {
     @setEvalBranchQuota(1_000_000);
     const SinkT = @typeInfo(@TypeOf(sink)).pointer.child;
     // Strict float mode, as everywhere here: `.optimized` grants `nnan`,
@@ -105,6 +118,11 @@ pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, si
     // GPU that add is a contended write on one address, measured 2x on 40,000
     // instances (dev/devices/gpu-evaluation.md, "One eval").
     const mask_ground = comptime SinkT.on_device;
+    // Today's tape gate, and the host sinks whose tape N3 tracking adds.
+    const tape_always = comptime !SinkT.on_device and !(@hasDecl(SinkT, "skip_tape") and SinkT.skip_tape);
+    const can_track = comptime !SinkT.on_device and @hasDecl(SinkT, "tapeQ");
+    // Set once any instance's local x is not its gathered x (`track` only).
+    var moved = false;
 
     var id: u32 = first;
     while (id < end) : (id += 1) {
@@ -124,11 +142,17 @@ pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, si
                 const l = sink.lim(id, u);
                 lx[u] = l;
                 corr[lane[u]] = xg - l;
+                if (comptime can_track) if (track) {
+                    moved = moved or @as(u64, @bitCast(xg)) != @as(u64, @bitCast(l));
+                };
             };
         }
         // Near convergence the limiter leaves almost every instance alone, so
         // one test skips the correction dot products.
         const corr_live = use_lim and anyNonzero(W, corr);
+        if (comptime can_track) if (track) {
+            moved = moved or corr_live;
+        };
         const model = sink.model(id);
         const mf = mfactorOf(D, sink.inst(id));
 
@@ -196,7 +220,7 @@ pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, si
                     }
                 }
             };
-            if (comptime !SinkT.on_device and !(@hasDecl(SinkT, "skip_tape") and SinkT.skip_tape)) inline for (comptime layout.lteSites(D), 0..) |k, j| {
+            if (comptime tape_always or can_track) if (tape_always or track) inline for (comptime layout.lteSites(D), 0..) |k, j| {
                 var qv = qs[k].v;
                 if (comptime has_limit and @TypeOf(qs[k]).lanes != 0) {
                     if (corr_live) qv += @reduce(.Add, head(W, qs[k].toLanes(full).grad()) * corr);
@@ -205,6 +229,7 @@ pub fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, si
             };
         }
     }
+    return moved;
 }
 
 /// Restamps `q_vec` and `q_tape` for instances `[first, end)` and leaves the

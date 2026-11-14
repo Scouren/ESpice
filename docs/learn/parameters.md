@@ -36,20 +36,34 @@ between points).
 | Statistics | `agauss gauss unif aunif limit` (nominal value unless Monte Carlo is on; see [chapter 9](monte-carlo.md)) |
 
 `log` is the natural logarithm, like `ln`; use `log10` for base 10.
-`pow(x, y)`, `x^y` and `x**y` use |x|^y in the ngspice dialect,
-including integer exponents. Use `x*x*x` for a signed cube.
-`pwr(x, y)` also uses |x|^y when its arguments are constant; a behavioural
-`pwr` call that reads a probe is currently unsupported.
+
+A power of a negative base means what ngspice 44.2 gives it, which
+depends on where the expression sits:
+
+| Form | In a `.param` or a `{...}` value | In a B, E or G expression |
+|---|---|---|
+| `x^y`, `x**y` | \|x\|^y: `(-2)^3` is 8, `(-2)^2.5` is 5.657 | \|x\|^y, the same |
+| `pow(x, y)` | C's pow: `pow(-2,3)` is -8, and a card that reads `pow(-2,2.5)` stops the deck (`NonFiniteParameter`) | \|x\|^y: 8 and 5.657 |
+| `pwr(x, y)` | \|x\|^y: 8 and 5.657 | sign(x)·\|x\|^y: -8 and -5.657 |
+
+A `.param` keeps its meaning where a B source reads it, and a `.func`
+body takes the meaning of the expression that calls it. Integer
+exponents are no exception: use `x*x*x` for a signed cube anywhere.
 
 In a behavioural `B` source, expressions can also read `v(node)`,
 `v(a,b)`, `i(Vsource)`, `time` and `temper`.
 
-The ngspice dialect also accepts an expression in single quotes
-(`R1 a b '2*rval'`) and a bare parameter name as a value (`R1 a b rval`).
-HSPICE takes only those two forms, and so does the HSPICE dialect: braces
-are name bytes there, as in HSPICE, so `{...}` is no expression (#203; the
-dialect read it as one from #153 until then).
-See [dialects](../using/dialects.md).
+`temper` also works in `R`, `C` and `.model` values and in `F` and `H`
+gains, which follow the temperature as in ngspice. A `V`, `I` or linear
+`E` or `G` value cannot read it, as ngspice cannot. A top-level `.param`
+must evaluate where it stands, as in ngspice: one that reads a name no
+`.param` defines (`hertz`, `time`, `pi`, a probe) is refused even when
+no card reads it. One that reads `temper` is left to the card that reads it.
+
+ESPice also accepts an expression in single quotes (`R1 a b '2*rval'`)
+and a bare parameter name as a value (`R1 a b rval`), the two forms HSPICE
+takes. An HSPICE deck runs through SpiceRack's translation; see
+[dialects](../using/dialects.md).
 
 ## Scope
 

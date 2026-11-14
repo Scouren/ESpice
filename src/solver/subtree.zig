@@ -227,7 +227,18 @@ pub const Plan = struct {
     /// Fails exactly when `refactor` would, leaving `lu`'s factors unusable
     /// as a failed `refactor` does. Asserts that `lu` is factored on the
     /// plan's epoch.
+    /// With lever C1's tables built and admitted (`SparseLu.runs`), every
+    /// column runs `Replay.columnPanels` instead, bitwise the same.
     pub fn run(self: *Plan, lu: *SparseLu, col_ptr: []const u32, vals: []const f64, growth: f64, io: std.Io) error{SingularMatrix}!void {
+        if (lu.runs.admitted) return self.runWith(true, lu, col_ptr, vals, growth, io);
+        return self.runWith(false, lu, col_ptr, vals, growth, io);
+    }
+
+    // ---- private ----
+
+    fn runWith(self: *Plan, comptime panels: bool, lu: *SparseLu, col_ptr: []const u32, vals: []const f64, growth: f64, io: std.Io) error{SingularMatrix}!void {
+        const laneFn = if (panels) lanePanels else lane;
+        const workFn = if (panels) Tail.workPanels else Tail.work;
         assert(lu.factored);
         assert(lu.pattern_epoch == self.epoch);
         assert(lu.tv.items.len == 0);
@@ -243,8 +254,8 @@ pub const Plan = struct {
         var mult: [max_lanes]f64 = @splat(0);
         var futures: [max_lanes - 1]std.Io.Future(void) = undefined;
         for (0..self.phases()) |p| {
-            for (1..nl) |l| futures[l - 1] = io.async(lane, .{ r, self.w[(l - 1) * @as(usize, n) ..][0..n], self.laneSteps(p, l), &failed, &nonfinite[l], &mult[l] });
-            lane(r, lu.w, self.laneSteps(p, 0), &failed, &nonfinite[0], &mult[0]);
+            for (1..nl) |l| futures[l - 1] = io.async(laneFn, .{ r, self.w[(l - 1) * @as(usize, n) ..][0..n], self.laneSteps(p, l), &failed, &nonfinite[l], &mult[l] });
+            laneFn(r, lu.w, self.laneSteps(p, 0), &failed, &nonfinite[0], &mult[0]);
             for (futures[0 .. nl - 1]) |*f| f.await(io);
             if (failed.load(.monotonic)) return error.SingularMatrix;
         }
@@ -254,12 +265,13 @@ pub const Plan = struct {
             self.stamp +%= 1;
             var ticket = std.atomic.Value(u32).init(self.cut);
             const tl: Tail = .{ .r = r, .ticket = &ticket, .failed = &failed, .done = self.done, .cut = self.cut, .stamp = self.stamp };
-            for (1..nl) |l| futures[l - 1] = io.async(Tail.work, .{ tl, self.w[(l - 1) * @as(usize, n) ..][0..n], &nonfinite[l], &mult[l] });
-            tl.work(lu.w, &nonfinite[0], &mult[0]);
+            for (1..nl) |l| futures[l - 1] = io.async(workFn, .{ tl, self.w[(l - 1) * @as(usize, n) ..][0..n], &nonfinite[l], &mult[l] });
+            workFn(tl, lu.w, &nonfinite[0], &mult[0]);
             for (futures[0 .. nl - 1]) |*f| f.await(io);
             if (failed.load(.monotonic)) return error.SingularMatrix;
         } else for (self.cut..n) |k| {
-            if (!r.column(lu.w, k, &bits, &m)) return error.SingularMatrix;
+            const ok = if (panels) r.columnPanels(lu.w, k, &bits, &m, SparseLu.NoWait{}) else r.column(lu.w, k, &bits, &m);
+            if (!ok) return error.SingularMatrix;
         }
         for (nonfinite[0..nl], mult[0..nl]) |b, lm| {
             bits |= b;
@@ -268,8 +280,6 @@ pub const Plan = struct {
         if (bits != 0) return error.SingularMatrix;
         if (growth > 0) lu.replay_mult = m;
     }
-
-    // ---- private ----
 
     /// Phases at most: each costs a spawn and a join.
     const max_phases = 8;
@@ -344,12 +354,21 @@ pub const Plan = struct {
         /// Takes steps until the tickets run out or a step fails. A failed
         /// step still publishes, so no worker waits on it forever.
         fn work(self: Tail, w: []f64, nonfinite: *u64, mult: *f64) void {
+            self.workWith(false, w, nonfinite, mult);
+        }
+
+        fn workPanels(self: Tail, w: []f64, nonfinite: *u64, mult: *f64) void {
+            self.workWith(true, w, nonfinite, mult);
+        }
+
+        fn workWith(self: Tail, comptime panels: bool, w: []f64, nonfinite: *u64, mult: *f64) void {
             var bits: u64 = nonfinite.*;
             var m: f64 = mult.*;
             while (!self.failed.load(.monotonic)) {
                 const k = self.ticket.fetchAdd(1, .monotonic);
                 if (k >= self.r.lp.len - 1) break;
-                if (!self.r.columnAfter(w, k, &bits, &m, self)) self.failed.store(true, .monotonic);
+                const ok = if (panels) self.r.columnPanels(w, k, &bits, &m, self) else self.r.columnAfter(w, k, &bits, &m, self);
+                if (!ok) self.failed.store(true, .monotonic);
                 self.done[k - self.cut].store(self.stamp, .release);
             }
             nonfinite.* = bits;
@@ -366,10 +385,19 @@ pub const Plan = struct {
     /// maxes its multipliers into `mult`, both carried over from the
     /// lane's earlier phases.
     fn lane(r: SparseLu.Replay, w: []f64, steps: []const u32, failed: *std.atomic.Value(bool), nonfinite: *u64, mult: *f64) void {
+        laneWith(false, r, w, steps, failed, nonfinite, mult);
+    }
+
+    fn lanePanels(r: SparseLu.Replay, w: []f64, steps: []const u32, failed: *std.atomic.Value(bool), nonfinite: *u64, mult: *f64) void {
+        laneWith(true, r, w, steps, failed, nonfinite, mult);
+    }
+
+    fn laneWith(comptime panels: bool, r: SparseLu.Replay, w: []f64, steps: []const u32, failed: *std.atomic.Value(bool), nonfinite: *u64, mult: *f64) void {
         var bits: u64 = nonfinite.*;
         var m: f64 = mult.*;
         for (steps) |k| {
-            if (!r.column(w, k, &bits, &m)) {
+            const ok = if (panels) r.columnPanels(w, k, &bits, &m, SparseLu.NoWait{}) else r.column(w, k, &bits, &m);
+            if (!ok) {
                 failed.store(true, .monotonic);
                 break;
             }
@@ -410,7 +438,9 @@ fn find(parent: []u32, x: u32) u32 {
     return i;
 }
 
-test "Plan: lanes plus the serial tail are bitwise refactor, failures included" {
+/// The plan on `a` (lever C1 when `panels`) against the lever-off serial
+/// refactor on `b`, bitwise, over random bordered block systems.
+fn checkPlan(panels: bool) !void {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5b7);
     const rnd = prng.random();
@@ -453,10 +483,15 @@ test "Plan: lanes plus the serial tail are bitwise refactor, failures included" 
     defer a.deinit(gpa);
     var b = try SparseLu.init(gpa, n, col_ptr.items, q);
     defer b.deinit(gpa);
+    a.runs_on = panels;
     fill(col_ptr.items, row_idx.items, vals, rnd);
     try a.factor(gpa, col_ptr.items, row_idx.items, vals, 1e-3);
     try b.factor(gpa, col_ptr.items, row_idx.items, vals, 1e-3);
     try testing.expect(a.tv.items.len == 0);
+    try testing.expectEqual(panels, a.runs.run_ptr.items.len != 0);
+    // Admitted regardless of `lu_runs.admit_share`: the panel lanes are
+    // the code under test.
+    a.runs.admitted = panels;
     var tail_steps: [n]u32 = undefined;
     const seen = try gpa.alloc(bool, n);
     defer gpa.free(seen);
@@ -515,4 +550,13 @@ test "Plan: lanes plus the serial tail are bitwise refactor, failures included" 
             for (a.w) |v| try testing.expectEqual(0, v);
         }
     };
+}
+
+test "Plan: lanes plus the serial tail are bitwise refactor, failures included" {
+    try checkPlan(false);
+}
+
+test "Plan: with C1 panels, lanes plus the serial tail are bitwise refactor, failures included" {
+    // Oracle: `b`, the lever-off serial refactor (`refactorColumns`).
+    try checkPlan(true);
 }

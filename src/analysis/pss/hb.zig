@@ -400,17 +400,19 @@ pub fn solveSpectrum(
 /// Autonomous HB from the DC point `x_dc`: the oscillator's shooting orbit
 /// (`pss.solve` with the same osc node, from the guess `options.f0`) seeds
 /// `x_hat` and f0, then `solveSpectrum` refines both. `ppv` and the
-/// asserts as there. error.HbDidNotConverge when the shooting seed does not
-/// converge, error.OscillatorDidNotStart when the circuit does not
+/// asserts as there. error.NoPeriodicSteadyState when the shooting seed
+/// does not converge, error.OscillatorDidNotStart when the circuit does not
 /// oscillate from its DC point (`pss.solve`).
 pub fn solveOscillator(ckt: *root.Circuit, x_dc: []const f64, x_hat: []f64, ppv: []f64, options: Options, allocator: std.mem.Allocator) !Spectrum {
     // ponytail: HSPICE's HBOSC searches amplitude and frequency from a
     // probe voltage; the shooting orbit is a seed already on the limit
     // cycle, at the cost of one autonomous PSS.
+    std.debug.assert(options.osc_node != root.GROUND);
     const n: usize = ckt.n;
     const orb = try pac.orbit(ckt, x_dc, .{ .tol = options.tol, .period = 1 / options.f0, .osc_node = options.osc_node }, allocator);
     defer allocator.free(orb.wave);
-    if (!orb.converged) return error.HbDidNotConverge;
+    // An autonomous shooting that ends unconverged is error.NoPeriodicSteadyState (Shoot.end).
+    std.debug.assert(orb.converged);
     seed(x_hat, orb, n, options.osc_node);
     var opts = options;
     opts.f0 = 1 / orb.wave[orb.samples(n) * (n + 1)];

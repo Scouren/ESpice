@@ -11,8 +11,8 @@
 //! - `pub const Options = core.query.Dc`
 //! - `pub const LaneOutcome = LaneError!Result`
 //! - `pub fn run(ctx: *const RunCtx, opts: Options) !Result`
-//! - `pub fn runLanes(comptime W: usize, ctxs: []const RunCtx, opts: Options, out: []LaneOutcome) void`
-//! - `pub fn runGpuLanes(ctxs: []const RunCtx, opts: Options, out: []LaneOutcome) void`
+//! - `pub fn runLanes(comptime W: usize, ctxs: []const RunCtx, opts: []const Options, out: []LaneOutcome) void`
+//! - `pub fn runGpuLanes(ctxs: []const RunCtx, opts: []const Options, out: []LaneOutcome) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -90,29 +90,31 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     return s.take();
 }
 
-/// `run` for the lanes of one batch: `.dc` queries on one pattern that sweep
-/// the same values, each from its own operating point and variant row. The
-/// sweep axis stays sequential and every lane keeps its own predictor and
-/// warm start; each point's warm Newton runs as lanes, and a lane it leaves
-/// unconverged takes its own cold ladder, as `run` does. Lane l's result
-/// lands in `out[l]`, bitwise `run` on `ctxs[l]`. Under a JFNK pin or
-/// `-Dcertify` every lane runs `run`. Asserts 1 <= `ctxs.len` <= W and that
-/// `out` matches it.
-pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+/// `run` for the lanes of one batch: `.dc` queries on one pattern, lane l
+/// with options `opts[l]`, which differ at most in the variant row, the
+/// temperature and the segment (`Options.lane`), each from its own
+/// operating point. The sweep axis stays sequential and every lane keeps
+/// its own predictor and warm start; each point's warm Newton runs as
+/// lanes, and a lane it leaves unconverged takes its own cold ladder, as
+/// `run` does. A shorter segment waits once its points are done. Lane l's
+/// result lands in `out[l]`, bitwise `run` on `ctxs[l]`. Under a JFNK pin
+/// or `-Dcertify` every lane runs `run`. Asserts 1 <= `ctxs.len` <= W and
+/// that `opts` and `out` match it.
+pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: []const Options, out: []LaneOutcome) void {
     const g = ctxs.len;
     assert(g >= 1);
     assert(g <= W);
-    assert(out.len == g);
+    assert(out.len == g and opts.len == g);
     if (W == 1 or g == 1 or !op.lanesAllowed(ctxs[0].circuit)) {
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
+        for (ctxs, opts, out) |*c, o, *r| r.* = run(c, o);
         return;
     }
     const L = solver.lanes.Lanes(W);
     const System = solver.lane_system.LaneSystem(W, root.Circuit, root.EvalHook);
     var sweeps: [W]Sweep = undefined;
     var live: L.Mask = 0;
-    for (ctxs, 0..) |*c, l| {
-        sweeps[l].init(c, opts) catch |e| {
+    for (ctxs, opts, 0..) |*c, o, l| {
+        sweeps[l].init(c, o) catch |e| {
             out[l] = e;
             continue;
         };
@@ -140,13 +142,18 @@ pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out
     const xv = gpa.alloc(L.V, lanes[0].n) catch |e| return batch.fail(e);
     defer gpa.free(xv);
 
+    // Segments of one sweep differ in length by a point or two.
+    var n_inner: usize = 0;
+    var lanes_live = L.each(live);
+    while (lanes_live.next()) |l| n_inner = @max(n_inner, sweeps[l].n_inner);
     for (0..sweeps[first].n_outer) |po| {
         var it = L.each(live);
         while (it.next()) |l| sweeps[l].beginBlock(po) catch |e| batch.kill(l, e);
-        for (0..sweeps[first].n_inner) |pt| {
+        for (0..n_inner) |pt| {
             var warm: L.Mask = 0;
             it = L.each(live);
             while (it.next()) |l| {
+                if (pt >= sweeps[l].n_inner) continue;
                 const w = sweeps[l].beginPoint(pt) catch |e| {
                     batch.kill(l, e);
                     continue;
@@ -169,7 +176,7 @@ pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out
                 while (it.next()) |l| System.getLane(sweeps[l].sol(), xv, l);
             }
             it = L.each(live);
-            while (it.next()) |l| sweeps[l].endPoint(pt, converged & bit(L, l) != 0) catch |e| batch.kill(l, e);
+            while (it.next()) |l| if (pt < sweeps[l].n_inner) sweeps[l].endPoint(pt, converged & bit(L, l) != 0) catch |e| batch.kill(l, e);
         }
     }
     var it = L.each(live);
@@ -182,36 +189,40 @@ pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out
 /// recompute, predictor, cold ladder, commit and rows stay on the host, as
 /// `run` does them, and each point moves the lanes' rows to the device and
 /// the accepted lanes' device state back. Within tolerance of `run`, not
-/// bitwise (one LU pivot order). A batch the device cannot take runs each
-/// lane's `run`; a device error part way runs the rest of the warm Newtons
-/// on the host. Asserts that `out` matches `ctxs`.
-pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+/// bitwise (one LU pivot order). Lane l runs `opts[l]`, as in `runLanes`,
+/// and a shorter segment waits once its points are done. A batch the
+/// device cannot take runs each lane's `run`; a device error part way runs
+/// the rest of the warm Newtons on the host. Asserts that `opts` and `out`
+/// match `ctxs`.
+pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: []const Options, out: []LaneOutcome) void {
     const g = ctxs.len;
-    assert(out.len == g);
+    assert(out.len == g and opts.len == g);
     if (g == 0) return;
     const c0 = ctxs[0].circuit;
-    const why: ?[]const u8 = if (g < 2) "one lane" else if (!op.lanesAllowed(c0)) "a JFNK pin or certify" else gpu_lanes.staticRefusal(c0);
+    const why: ?[]const u8 = if (g < 2) "one lane" else if (!op.lanesAllowed(c0)) "a JFNK pin or certify" else if (opts[0].tol.dv != null) "a Newton voltage bound (dv)" else gpu_lanes.staticRefusal(c0);
     if (why) |w| {
         if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: dc lanes on the CPU: {s}\n", .{w});
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
+        for (ctxs, opts, out) |*c, o, *r| r.* = run(c, o);
         return;
     }
     const gpa = ctxs[0].scratch_allocator;
     const t = GpuTables.init(gpa, g) catch |e| return @memset(out, e);
     defer t.deinit(gpa);
 
-    for (t.sweeps, ctxs, 0..) |*s, *c, l| {
-        s.init(c, opts) catch |e| {
+    var n_inner: usize = 0;
+    for (t.sweeps, ctxs, opts, 0..) |*s, *c, so, l| {
+        s.init(c, so) catch |e| {
             // ponytail: a lane that fails its setup sends the batch to `run`.
             for (t.sweeps[0..l]) |*d| d.deinit();
             out[l] = e;
-            for (ctxs, out, 0..) |*cc, *o, k| if (k != l) {
-                o.* = run(cc, opts);
+            for (ctxs, opts, out, 0..) |*cc, oo, *o, k| if (k != l) {
+                o.* = run(cc, oo);
             };
             return;
         };
         t.ckts[l] = c.circuit;
         t.xs[l] = s.sol();
+        n_inner = @max(n_inner, s.n_inner);
     }
     @memset(t.live, true);
     defer for (t.sweeps, t.live) |*s, on| if (on) s.deinit();
@@ -225,11 +236,11 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
     var on_device = true;
     for (0..t.sweeps[0].n_outer) |po| {
         for (t.sweeps, t.live, out) |*s, *on, *o| if (on.*) s.beginBlock(po) catch |e| drop(s, on, o, e);
-        for (0..t.sweeps[0].n_inner) |pt| {
+        for (0..n_inner) |pt| {
             var any = false;
             for (t.sweeps, t.live, t.warm, out) |*s, *on, *w, *o| {
                 w.* = false;
-                if (!on.*) continue;
+                if (!on.* or pt >= s.n_inner) continue;
                 w.* = s.beginPoint(pt) catch |e| {
                     drop(s, on, o, e);
                     continue;
@@ -243,7 +254,7 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
                 on_device = false;
             };
             for (t.sweeps, t.live, t.warm, t.res, out) |*s, *on, w, r, *o| {
-                if (!on.*) continue;
+                if (!on.* or pt >= s.n_inner) continue;
                 var converged = false;
                 if (w and on_device) {
                     converged = r.result.converged and !r.singular and !r.reject;
@@ -357,4 +368,5 @@ fn devicePoint(gpa: Allocator, dev: *?*gpu_lanes.GpuLanes, t: GpuTables) !void {
 
 test {
     _ = Sweep;
+    _ = @import("segments.zig");
 }

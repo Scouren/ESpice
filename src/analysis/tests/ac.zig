@@ -399,7 +399,7 @@ const CircuitTests = struct {
         try t.expectApproxEqRel(ac, gain, 1e-12);
     }
 
-    test "sp: a .net query refuses more than two legs, a balanced port counting twice" {
+    test "sp: a .net query refuses more than two ports" {
         var lib = try Library.init(gpa);
         defer lib.deinit();
         var prepared = try rlc(&lib, 1);
@@ -411,7 +411,8 @@ const CircuitTests = struct {
         @memset(x, 0);
         const Port = @import("core").query.Port;
         const ports = [_]Port{
-            .{ .node = 1, .branch = Port.no_branch, .balanced = .{ .node = 2, .branch = Port.no_branch } },
+            .{ .node = 1, .branch = Port.no_branch },
+            .{ .node = 2, .branch = Port.no_branch },
             .{ .node = 3, .branch = Port.no_branch },
         };
         const ctx: analysis.RunCtx = .{ .circuit = &ckt, .x_op = x, .probes = &.{}, .source_node = 1, .source_branch = 0, .allocator = gpa, .scratch_allocator = gpa };

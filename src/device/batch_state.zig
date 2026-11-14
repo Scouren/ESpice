@@ -156,8 +156,18 @@ pub fn State(comptime D: type) type {
             // pointers, and `undefined` would trap in Debug.
             const no_planes: Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = &.{} };
             var sink = Sink(D, false, false, false).host(self, &no_planes, x, x_old.ptr);
+            // N6's census, where `limitRange` reads its inputs (stats only).
+            if (self.census) |c| c.observeLimit(x, self.gath, &lim_reads, first, last);
             return stamp.limitRange(D, &sink, first, last, self.lim_active, self.sim) != 0;
         }
+
+        /// The unknowns `limit` reads, one flag each, for the census.
+        const lim_reads: [n_u]bool = blk: {
+            const m = layout.limitReadsOf(D);
+            var r: [n_u]bool = undefined;
+            for (&r, 0..) |*f, u| f.* = layout.has(m, u);
+            break :blk r;
+        };
 
         pub fn armLimits(ctx: *anyopaque) void {
             const self = Batch.of(ctx);

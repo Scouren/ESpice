@@ -17,6 +17,7 @@
 //! - `pub const gmres = @import("gmres.zig")`
 //! - `pub const gcrodr = @import("gcrodr.zig")`
 //! - `pub const converger = @import("converger.zig")`
+//! - `pub const confirm = @import("confirm.zig")`
 //! - `pub const lanes = @import("lane/lanes.zig")`
 //! - `pub const lane_system = @import("lane/system.zig")`
 //! - `pub const lane_kernels = @import("kernels/lane.zig")`
@@ -31,6 +32,8 @@ pub const fft = @import("fft.zig");
 pub const gmres = @import("gmres.zig");
 pub const gcrodr = @import("gcrodr.zig");
 pub const converger = @import("converger.zig");
+/// Lever C3's confirm step in the Newton loop (`ESPICE_PERF`).
+pub const confirm = @import("confirm.zig");
 pub const lanes = @import("lane/lanes.zig");
 pub const lane_system = @import("lane/system.zig");
 pub const lane_kernels = @import("kernels/lane.zig");
@@ -52,6 +55,7 @@ test {
     _ = @import("kernels/frequency.zig");
     _ = @import("kernels/gmres.zig");
     _ = @import("kernels/periodic.zig");
+    _ = @import("kernels/lu_lever_tests.zig");
     _ = @import("tridiag.zig");
     _ = @import("order.zig");
     _ = @import("bbd.zig");

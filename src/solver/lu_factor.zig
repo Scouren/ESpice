@@ -119,7 +119,10 @@ pub fn factorPass(
     // after the column loop. x - x is +0 for a finite x and NaN
     // otherwise, so OR-ing its bits costs two ops and no compare.
     var nonfinite: u64 = 0;
-    for (want, self.prev, 0..) |*a, p, i| a.* = if (keep_prev) p else @intCast(i);
+    // `want_prev` (lever C8's retry): start from `prev` under the usual
+    // threshold test rather than `keep_min`.
+    const from_prev = keep_prev or self.want_prev;
+    for (want, self.prev, 0..) |*a, p, i| a.* = if (from_prev) p else @intCast(i);
     for (want, 0..) |r, c| want_of[r] = @intCast(c);
     // Two copies of the column loop. The plain one runs until an L
     // column reaches lu_panel.panel_min_rows, which typical circuit matrices
@@ -372,6 +375,17 @@ pub fn factorPass(
             self.li.items.len, self.ui.items.len,
             @as(f64, @floatFromInt(self.li.items.len + self.ui.items.len)) /
                 @as(f64, @floatFromInt(col_ptr[n])),
+        });
+        // C8 step 1's table: multiply-subtract pairs, L plus U entries, and
+        // the share of columns pivoted off their own row.
+        var pairs: u64 = 0;
+        for (self.ui.items) |i| pairs += self.lp[i + 1] - self.lp[i];
+        var off_diag: u64 = 0;
+        for (self.pinv, 0..) |step, r| off_diag += @intFromBool(self.q[step] != r);
+        std.debug.print("lu-stats: pairs={d} fill={d} off_diagonal={d:.4}\n", .{
+            pairs,
+            self.li.items.len + self.ui.items.len,
+            @as(f64, @floatFromInt(off_diag)) / @as(f64, @floatFromInt(@max(n, 1))),
         });
         lu_census.census(self, gpa, col_ptr, row_idx) catch |e| std.debug.print("lu-census: {s}\n", .{@errorName(e)});
     }

@@ -93,11 +93,14 @@ fn writeEmir(out: *std.Io.Writer, deck: []const u8, lib: *const frontend.Library
         var first = true;
         for (e.terminals) |term| {
             const b = ckt.batches[term.batch];
+            const t = ckt.batch_types[term.batch];
+            // A portnum V's z0, an internal add, is inside its port as in
+            // ngspice's vsrc: no entry of its own (`portNet`).
+            if (d.card_names.internal(t, term.instance)) continue;
             const source = std.mem.eql(u8, b.type_name, "vsource") or std.mem.eql(u8, b.type_name, "isource");
             if (source != sources) continue;
             try out.writeAll(if (first) "\n    {\"instance\": " else ",\n    {\"instance\": ");
             first = false;
-            const t = ckt.batch_types[term.batch];
             try std.json.Stringify.encodeJsonString(d.card_names.get(t, term.instance) orelse b.type_name, .{}, out);
             if (!sources) {
                 try out.writeAll(", \"model\": ");
@@ -107,7 +110,8 @@ fn writeEmir(out: *std.Io.Writer, deck: []const u8, lib: *const frontend.Library
             const ports = lib.vtable(t).unknown_names;
             if (term.port < ports.len) try std.json.Stringify.encodeJsonString(ports[term.port], .{}, out) else try out.print("\"{d}\"", .{term.port});
             try out.writeAll(", \"net\": ");
-            try std.json.Stringify.encodeJsonString(if (term.row == core.GROUND or term.row >= ckt.n) "0" else ckt.nodeName(term.row), .{}, out);
+            const row = if (sources) portNet(e.terminals, d.card_names, ckt.batch_types, term.row) else term.row;
+            try std.json.Stringify.encodeJsonString(if (row == core.GROUND or row >= ckt.n) "0" else ckt.nodeName(row), .{}, out);
             const em_avg = if (span == 0) @abs(term.avg) else (@max(term.pos, term.neg) - d.em_recovery * @min(term.pos, term.neg)) / span;
             for ([_][]const u8{ "avg", "em_avg", "rms", "peak" }, [_]f64{ term.avg, em_avg, term.rms, term.peak }) |key, v| {
                 try out.print(", \"{s}\": ", .{key});
@@ -117,4 +121,20 @@ fn writeEmir(out: *std.Io.Writer, deck: []const u8, lib: *const frontend.Library
         }
     }
     try out.writeAll("\n  ]\n}\n");
+}
+
+/// The row a source terminal at `row` is written at: a portnum V's inner
+/// `<card>#res` node, its z0's n (port 1), reads as that z0's p, the card's
+/// n+, so the port is one device between n+ and n- as ngspice's vsrc is,
+/// and every net's currents still sum to zero. `row` for any other node.
+// ponytail: a scan of the terminals per source entry; index the internal
+// adds' rows once a deck has thousands of ports.
+fn portNet(terms: []const core.EmirTerminal, names: requests.CardNames, types: []const core.DeviceType, row: u32) u32 {
+    for (terms) |inner| {
+        if (inner.port != 1 or inner.row != row or !names.internal(types[inner.batch], inner.instance)) continue;
+        for (terms) |outer| {
+            if (outer.batch == inner.batch and outer.instance == inner.instance and outer.port == 0) return outer.row;
+        }
+    }
+    return row;
 }

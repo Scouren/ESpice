@@ -1,0 +1,70 @@
+--- a/src/device/batch_bypass.zig
++++ b/src/device/batch_bypass.zig
+@@ -63,6 +63,10 @@
+ 
+         const Bp = @This();
+         const Batch = DeviceBatch(D);
++        /// CENSUS (throwaway): first-iterate evaluations, then misses by cause.
++        const Cen = struct {
++            var c: [6]std.atomic.Value(usize) = @splat(.init(0));
++        };
+         /// A recording's iteration class (0: none), its segment lengths,
+         /// and the key of the planes its cells address.
+         const Meta = struct { class: u16 = 0, n_res: u16 = 0, n_jac: u16 = 0, n_qjac: u16 = 0, plane: u64 = 0 };
+@@ -119,14 +123,20 @@
+             const h = bp.hits.load(.monotonic);
+             const total = h + bp.misses.load(.monotonic);
+             if (total < 4 * @as(u64, count)) return;
+-            if (h * 5 < total) bp.off = true;
+-            // CENSUS (throwaway): the hit rate at the decision and at each power-of-two review after it.
++            // CENSUS (throwaway): the bypass is never turned off here, so the
++            // transient's own hit rate and the miss causes can be read. `would_off`
++            // is the first review at which the shipped rule turns it off.
+             const S = struct {
+                 var calls: u64 = 0;
++                var would_off: u64 = 0;
+             };
+             S.calls += 1;
+-            if (bp.off or std.math.isPowerOfTwo(S.calls))
+-                std.debug.print("census-bypass: {s} count={d} hits={d} total={d} off={} reviews={d}\n", .{ @typeName(D), count, h, total, bp.off, S.calls });
++            if (h * 5 < total and S.would_off == 0) S.would_off = S.calls;
++            if (std.math.isPowerOfTwo(S.calls)) {
++                var c: [6]usize = undefined;
++                for (&c, &Cen.c) |*o, *v| o.* = v.load(.monotonic);
++                std.debug.print("census-bypass: {s} count={d} hits={d} total={d} would_off_at_review={d} reviews={d} first_iter={d} miss_corr={d} miss_norec={d} miss_plane={d} miss_inst={d} miss_tol={d}\n", .{ @typeName(D), count, h, total, S.would_off, S.calls, c[0], c[1], c[2], c[3], c[4], c[5] });
++            }
+         }
+ 
+         /// `Hooks.set_bypass`: sets the tolerances, clearing every
+@@ -169,7 +179,14 @@
+             // The first iterate neither replays nor records (Meyer models
+             // branch on it), so a later iterate's recording reaches the next
+             // timepoint.
+-            if (sim.iteration <= 1) return self.evalSplit(sink, first, last, sim, limiting);
++            if (sim.iteration <= 1) {
++                _ = Cen.c[0].fetchAdd(last - first, .monotonic);
++                return self.evalSplit(sink, first, last, sim, limiting);
++            }
++            var cen: [6]usize = @splat(0);
++            defer for (&Cen.c, cen) |*g, v| {
++                _ = g.fetchAdd(v, .monotonic);
++            };
+             // Which planes the recorded pointers address.
+             var key = std.hash.Wyhash.init(@intFromBool(staged));
+             key.update(std.mem.asBytes(&[_]usize{ @intFromPtr(pl.g_vals.ptr), @intFromPtr(pl.c_vals.ptr), @intFromPtr(pl.rhs.ptr), @intFromPtr(pl.q_vec.ptr) }));
+@@ -210,6 +227,15 @@
+                     continue;
+                 }
+                 misses += 1;
++                if (corr) {
++                    cen[1] += 1;
++                } else if (m.class != class) {
++                    cen[2] += 1;
++                } else if (m.plane != plane_key) {
++                    cen[3] += 1;
++                } else if (!std.mem.eql(u8, inst_now, inst_rec)) {
++                    cen[4] += 1;
++                } else cen[5] += 1;
+                 // Full evaluation, recorded, keyed on the bytes it read.
+                 @memcpy(inst_rec, inst_now);
+                 var rec: RecordSink(SinkT, rec_cap, &res_rows) = .{

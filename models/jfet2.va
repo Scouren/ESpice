@@ -43,6 +43,7 @@ module jfet2(d, g, s);
     // ---- channel -----------------------------------------------------------
     parameter real beta   = 1e-4 from (0:inf);   // A/V^Q
     parameter real vto    = -2.0;                // V
+    aliasparam vt0 = vto;                    // ngspice jfet2parm.h:49-50 IOPR spelling
     parameter real lambda = 0.0;                 // 1/V (ngspice accepts < 0)
     parameter real p      = 2.0  from (0:inf);   // triode-region power law
     parameter real q      = 2.0  from [1:inf);   // saturated-region power law

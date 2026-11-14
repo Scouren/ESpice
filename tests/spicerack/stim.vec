@@ -1,0 +1,8 @@
+; stim.vec: a decoy in the working directory of the spicerack/vec check,
+; named as files_spice2rack.sh's vector file. Read in its place, a holds
+; VIH = 3 V, not 1 V.
+radix 1
+vname a
+io i
+vih 3
+0 1

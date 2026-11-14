@@ -7,7 +7,9 @@
 //! Cites: phase4-gpu-lanes.md G6; `LaneSolver`'s peel and lead rules.
 //!
 //! Contents:
+//! - `pub const Each = struct { fix, homotopy }`
 //! - `pub fn newton(self: *GpuLanes, opts: converger.Options, out: []LaneNewton) !void`
+//! - `pub fn newtonEach(self: *GpuLanes, opts: converger.Options, each: Each, out: []LaneNewton) !void`
 //! - `pub fn newtonOpts(opts: converger.Options) lk.NewtonOpts`
 //! - `pub fn ticks(self: *GpuLanes, nopts: lk.NewtonOpts, max_iter: u16, active_in: u64) !void`
 //! - `pub fn prepareGraphs(self: *GpuLanes, opts: lk.NewtonOpts) void`
@@ -32,20 +34,48 @@ const Stream = lanes_batch.Stream;
 const GraphExec = lanes_batch.GraphExec;
 const arg = gompute.interface.arg;
 
+/// What the operating-point ladder sets per lane (`newtonEach`): INITFIX
+/// (`fix[l]`, else `opts.init_fix`) and `[gmin, hold scale]`
+/// (`homotopy[l]`, else `opts.gmin` and 1). Slices hold one row per lane.
+pub const Each = struct {
+    fix: ?[]const bool = null,
+    homotopy: ?[]const [2]f64 = null,
+};
+
 /// Newton for the round lanes, every lane its own `converger.newton`
-/// at its own t (`sims`), with `opts` (lane-uniform). Fills `out[l]`
-/// for the round lanes. `clearLimits` at the end.
+/// at its own t (`sims`), with `opts` (lane-uniform, its `force` holds and
+/// `gmin_stamps` included). Fills `out[l]` for the round lanes.
+/// `clearLimits` at the end.
 pub fn newton(self: *GpuLanes, opts: converger.Options, out: []LaneNewton) !void {
-    std.debug.assert(opts.gmin_stamps.len == 0 and opts.force.len == 0);
-    const nopts = newtonOpts(opts);
+    return newtonEach(self, opts, .{}, out);
+}
+
+/// `newton` with the per-lane INITFIX and homotopy of `each`.
+pub fn newtonEach(self: *GpuLanes, opts: converger.Options, each: Each, out: []LaneNewton) !void {
+    if (comptime !lanes.available) return error.BackendUnavailable;
+    try putTables(self, opts);
+    var nopts = newtonOpts(opts);
+    if (each.homotopy) |h| {
+        assert(h.len == self.n_lanes);
+        // The gmin launch reads the plane; `gmin` only says whether any
+        // round lane has one.
+        nopts.per_lane = 1;
+        nopts.gmin = 0;
+        for (h, self.round) |hl, r| if (r != 0) {
+            nopts.gmin = @max(nopts.gmin, hl[0]);
+        };
+        try self.put(self.buf(.homotopy), h);
+    }
     prepareGraphs(self, nopts);
     var active: u64 = 0;
     for (self.round) |r| active += @intFromBool(r != 0);
     self.prof.lane_rounds += active;
     // `predictRound`'s queued copies still read `sims`.
     try self.stream.synchronize();
-    const fix: u32 = if (opts.init_fix) 2 else 0;
-    for (self.gate, self.round, self.sims) |*g, r, *s| {
+    if (each.fix) |f| assert(f.len == self.n_lanes);
+    for (self.gate, self.round, self.sims, 0..) |*g, r, *s, l| {
+        const on = if (each.fix) |f| f[l] else opts.init_fix;
+        const fix: u32 = if (on) 2 else 0;
         g.* = .{ .limit = 0, .scaled = 0, .iterations = opts.max_iter, .bits = if (r != 0) r | fix else 0 };
         // `beginSolve`.
         s.iteration = 1;
@@ -73,7 +103,7 @@ pub fn newton(self: *GpuLanes, opts: converger.Options, out: []LaneNewton) !void
 
 /// The lane-uniform tolerances the tick kernels take, from `opts`.
 pub fn newtonOpts(opts: converger.Options) lk.NewtonOpts {
-    return .{ .reltol = opts.reltol, .abstol = opts.abstol, .vntol = opts.vntol, .gmin = opts.gmin, .residual_tol = opts.residual_tol, .max_iter = opts.max_iter };
+    return .{ .reltol = opts.reltol, .abstol = opts.abstol, .vntol = opts.vntol, .gmin = opts.gmin, .residual_tol = opts.residual_tol, .dv = opts.dv, .max_iter = opts.max_iter, .n_force = @intCast(opts.force.len), .n_stamps = @intCast(opts.gmin_stamps.len) };
 }
 
 /// Newton's ticks for the lanes in `d_active` (`active` of them, or an
@@ -184,6 +214,34 @@ pub fn retapeFrom(self: *GpuLanes, first: u32) !void {
 }
 
 // ---- private ----
+
+/// `opts.force` and `opts.gmin_stamps` into their lane-uniform device
+/// tables (`.force`, `.stamps`). A table that outgrows its buffer moves,
+/// which drops the captured graphs: their launches hold the old address.
+fn putTables(self: *GpuLanes, opts: converger.Options) !void {
+    if (opts.force.len == 0 and opts.gmin_stamps.len == 0) return;
+    const gpa = self.gpa;
+    try self.stream.synchronize();
+    const rows = try gpa.alloc(lk.ForceRow, opts.force.len);
+    defer gpa.free(rows);
+    for (rows, opts.force) |*r, f| r.* = .{ .value = f.value, .slot = f.slot, .row = f.row };
+    try putTable(self, .force, std.mem.sliceAsBytes(rows));
+    const stamps = try gpa.alloc(lk.GminStamp, opts.gmin_stamps.len);
+    defer gpa.free(stamps);
+    for (stamps, opts.gmin_stamps) |*s, g| s.* = .{ .slot = g.slot, .row = g.row, .col = g.col };
+    try putTable(self, .stamps, std.mem.sliceAsBytes(stamps));
+}
+
+fn putTable(self: *GpuLanes, id: lanes.Dev, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const b = self.buf(id);
+    if (bytes.len <= b.bytes) return b.upload(bytes.ptr, bytes.len);
+    const grown = try lanes_batch.upload(&self.k.refactor, bytes);
+    b.free();
+    b.* = grown;
+    clearGraphs(self);
+    self.graph_opts = null;
+}
 
 fn createGraphs(self: *GpuLanes, opts: lk.NewtonOpts) !void {
     try self.stream.synchronize();

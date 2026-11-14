@@ -6,19 +6,19 @@
 //   modified BSD license.
 //
 // Temperature (restemp.c):
-//   dt     = (temp + dtemp) - tnom
+//   dt     = T - tnom,  T = temp when given, else circuit T + dtemp
 //   factor = 1 + tc1*dt + tc2*dt^2,  or 1.01^(tce*dt) when tce is given
-// tce REPLACES the polynomial. Instance `temp` is an absolute override of the
-// circuit temperature; `dtemp` is added to whichever wins. `tnom` is the host's
-// `.options tnom`.
+// tce REPLACES the polynomial. A given instance `temp` overrides the circuit
+// temperature and dtemp is then ignored (restemp.c:35-48). `tnom` is the
+// host's `.options tnom`.
 //
-// Geometry (rsh, narrow, short, defw) and the `scale`/`m` factors are resolved
-// by the host (frontend builder addPassive) before the value reaches `r`;
-// declaring them here would apply `scale`/`m` twice.
+// Geometry (rsh, narrow/dw, short/dlr, defw/w, l, res) and the `scale`/`m`
+// factors are resolved by the host (frontend builder addPassive) before the
+// value reaches `r`; declaring them here would apply `scale`/`m` twice.
 //
 // Noise (resnoise.c): thermal S_i = 4kT/R across the terminals.
-// `noisy=0` (ngspice; `noise=0` there and in HSPICE, through the host's
-// alias table in device/bind.zig) turns the generator off.
+// `noisy=0` (ngspice; `noise=0` there and in HSPICE, its aliasparam
+// below) turns the generator off.
 //
 // ponytail: no flicker noise (resnoise.c, gated on KF, default 0). Add it
 // when a deck names it.
@@ -35,18 +35,21 @@ module resistor(p, n);
     parameter real r     = 1000.0 from (0:inf);  // ohm       resistance
     parameter real tnom  = $simparam("tnom");    // degC      nominal temperature
     parameter real temp  = 27.0;                 // degC      absolute override
-    parameter real dtemp = 0.0;                  // degC      offset on the above
+    parameter real dtemp = 0.0;                  // degC      offset on the circuit T
     parameter real tc1   = 0.0;                  // 1/degC    linear tempco
     parameter real tc2   = 0.0;                  // 1/degC^2  quadratic tempco
     parameter real tce   = 0.0;                  // %/degC    exponential tempco
     parameter integer noisy = 1 from [0:1];      // -         0: noiseless
+    // res.c's IOPR spellings (ngspice 44.2: tc1r/tc2r give tc1/tc2's current).
+    aliasparam tc1r = tc1;
+    aliasparam tc2r = tc2;
+    aliasparam noise = noisy;                    // res.c:30 IOPR
 
     real tdev, dt, rt;
 
     analog begin
-        tdev = $temperature - 273.15;
+        tdev = $temperature - 273.15 + dtemp;
         if ($param_given(temp)) tdev = temp;
-        tdev = tdev + dtemp;
         dt = tdev - tnom;
         if ($param_given(tce)) rt = r * pow(1.01, tce * dt);
         else rt = r * (1.0 + dt * (tc1 + tc2 * dt));

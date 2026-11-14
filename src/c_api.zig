@@ -335,13 +335,14 @@ fn create(gpa: std.mem.Allocator, options: *const CreateOptions) !*Token {
     const live_params = try strings(gpa, live_bytes);
     defer gpa.free(live_params);
     if (source.len == 0 or options.explicit_gpu > 1) return error.InvalidArgument;
+    // The library reads ngspice only; spice2rack translates the rest first.
+    if (options.dialect != header.ESPICE_NGSPICE) return error.UnsupportedDialect;
     const config: api.Options = .{
         .source = switch (options.source_kind) {
             0 => .{ .file = source },
             1 => .{ .bytes = .{ .data = source, .origin = origin } },
             else => return error.InvalidArgument,
         },
-        .dialect = std.enums.fromInt(api.Dialect, options.dialect) orelse return error.InvalidArgument,
         .backend = .{
             .backend = std.enums.fromInt(api.Request, options.backend) orelse return error.InvalidArgument,
             .gpu_explicit = options.explicit_gpu == 1,

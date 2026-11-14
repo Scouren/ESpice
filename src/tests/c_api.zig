@@ -222,7 +222,7 @@ test "C entry points reject NULL handles and malformed options" {
         var bad = good;
         switch (case) {
             0 => bad.source_kind = 2,
-            1 => bad.dialect = 3,
+            1 => bad.dialect = 1, // HSPICE's old tag: spice2rack translates it
             2 => bad.output_format = 9,
             3 => bad.explicit_gpu = 2,
             4 => bad.max_parallel = 0,
@@ -236,6 +236,13 @@ test "C entry points reject NULL handles and malformed options" {
         try t.expectEqual(invalid, c.espice_create(&bad, &handle, null, 0));
         try t.expect(handle == null);
     }
+    // Oracle: include/espice.h, which names the refusal of a dialect other
+    // than ngspice. Red before it: dialect 2 read the deck as Spectre.
+    var refused = good;
+    refused.dialect = 2;
+    var name: [32]u8 = undefined;
+    try t.expectEqual(invalid, c.espice_create(&refused, &handle, &name, name.len));
+    try t.expectEqualStrings("UnsupportedDialect", std.mem.sliceTo(&name, 0));
     // A caller built before the toolchain fields: they are never read.
     var old = good;
     old.struct_size = @offsetOf(c.espice_create_options, "zig_path");
@@ -718,7 +725,6 @@ test "C points: copy_point_tangents gives d(measure)/d(live parameter), and NaN 
 /// An RC step response: v(in) ramps to 1 V in 10 ps through r1 = rv into
 /// c1 = cv; vdd holds 1 V across rl. tpd is RC ln 2 shifted by the ramp,
 /// e the energy vin delivers (about cv · 1 V²), leak vdd's current (-1 mA).
-/// Bare parameter names, which both dialects read.
 const rc_deck =
     \\points rc
     \\.param rv=1k cv=1p
@@ -744,18 +750,12 @@ fn rcGrid() [16][2]f64 {
     return rows;
 }
 
-/// A problem over `deck` with `live` declared live.
+/// A problem over `deck`, `live` declared live and four parallel workers;
+/// prints the create diagnostic when it fails.
 fn createLive(deck: []const u8, live: []const c.espice_bytes) !*c.espice_problem {
-    return createDialect(deck, live, c.ESPICE_NGSPICE);
-}
-
-/// A problem over `deck` in `dialect`, `live` declared live and four
-/// parallel workers; prints the create diagnostic when it fails.
-fn createDialect(deck: []const u8, live: []const c.espice_bytes, dialect: u32) !*c.espice_problem {
     var options: c.espice_create_options = undefined;
     c.espice_default_options(&options);
     options.source_kind = c.ESPICE_BYTES;
-    options.dialect = dialect;
     options.source = .{ .data = deck.ptr, .len = deck.len };
     options.live_params = live.ptr;
     options.live_param_count = live.len;
@@ -796,8 +796,7 @@ test "C points: 16 points measure tpd, energy and leakage analytically, and matc
     const t = std.testing;
     const grid = rcGrid();
     const rows: []const f64 = @ptrCast(&grid);
-    // HSPICE, the dialect of the .data deck below.
-    const h = try createDialect(rc_deck, &rc_live, c.ESPICE_HSPICE);
+    const h = try createLive(rc_deck, &rc_live);
     defer _ = c.espice_destroy(h);
     var lane: u32 = 0;
     try t.expectEqual(@as(u32, c.ESPICE_OK), c.espice_lane_width(h, &lane));
@@ -828,7 +827,7 @@ test "C points: 16 points measure tpd, energy and leakage analytically, and matc
     for (grid) |p| try swept.print(t.allocator, "+ {e} {e}\n", .{ p[0], p[1] });
     try swept.appendSlice(t.allocator, ".enddata\n.tran 10p 40n sweep data=pts\n");
     try swept.appendSlice(t.allocator, rc_deck[std.mem.indexOf(u8, rc_deck, ".meas").?..]);
-    const handle = try createDialect(swept.items, &.{}, c.ESPICE_HSPICE);
+    const handle = try createLive(swept.items, &.{});
     defer _ = c.espice_destroy(handle);
     try t.expectEqual(@as(u32, c.ESPICE_OK), c.espice_run_all(handle));
     const first = try firstRequested(handle);
@@ -858,7 +857,7 @@ test "C points: the per-lane stimulus rows (#212) equal their .data sweep bit fo
     var data: [4 * 3]f64 = undefined;
     var data_reasons: [4]u32 = undefined;
     {
-        const h = try createDialect(source, &.{}, c.ESPICE_HSPICE);
+        const h = try createLive(source, &.{});
         defer _ = c.espice_destroy(h);
         try t.expectEqual(@as(u32, c.ESPICE_OK), c.espice_run_all(h));
         try t.expectEqual(@as(u32, c.ESPICE_OK), c.espice_copy_point_measures(h, try firstRequested(h), 4, &names, 3, &data, &data_reasons));
@@ -870,7 +869,7 @@ test "C points: the per-lane stimulus rows (#212) equal their .data sweep bit fo
     defer t.allocator.free(spliced);
     const template = try std.mem.replaceOwned(u8, t.allocator, spliced, " sweep data=lanes", "");
     defer t.allocator.free(template);
-    const h = try createDialect(template, &.{ .{ .data = "sel", .len = 3 }, .{ .data = "pol", .len = 3 } }, c.ESPICE_HSPICE);
+    const h = try createLive(template, &.{ .{ .data = "sel", .len = 3 }, .{ .data = "pol", .len = 3 } });
     defer _ = c.espice_destroy(h);
     const rows = [_]f64{ 0, 1, 0, 0, 1, 1, 1, 0 };
     var got: [4 * 3]f64 = undefined;
@@ -998,13 +997,14 @@ const reason_cases = [_]ReasonCase{
         .bad = &.{ 1e200, 1e-200 },
         .reason = c.ESPICE_REASON_DEVICE_REFUSED,
     },
-    // A lossless txl (r = 0) has no fit: UnsupportedTransmissionLineParameters.
+    // A txl with r = 0 is ReadTxL's lossless line while g < 1e-2; past it
+    // the Pade fit would divide by R/L: UnsupportedTransmissionLineParameters.
     .{
-        .deck = "lossless\n.param rv=1\nv1 a 0 dc 1\nr1 b 0 50\ny1 a 0 b 0 line\n.model line txl r={rv} l=1n g=0 c=1p length=1\n.op\n.meas op vb find v(b)\n.end\n",
-        .live = &.{"rv"},
+        .deck = "lossless\n.param gv=0\nv1 a 0 dc 1\nr1 b 0 50\ny1 a 0 b 0 line\n.model line txl r=0 l=1n g={gv} c=1p length=1\n.op\n.meas op vb find v(b)\n.end\n",
+        .live = &.{"gv"},
         .names = &.{"vb"},
-        .good = &.{1},
-        .bad = &.{0},
+        .good = &.{0},
+        .bad = &.{0.02},
         .reason = c.ESPICE_REASON_OTHER,
     },
 };

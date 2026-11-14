@@ -80,6 +80,11 @@ pub const RunCtx = struct {
     /// `.ac`, `.acxf`, `.stb` and `.noise` replay them (`freq.Stream.pre`).
     /// Empty: solve live.
     freq_pre: []const f64 = &.{},
+    /// A `.dc` segment's (`Dc.lane`) seam solutions, `2 * circuit.n`
+    /// values the sweep writes: its point `Dc.overlap - 1`'s full x, then
+    /// its last point's, NaN where a point did not converge. `Session.assemble`
+    /// compares them across segments (dc/segments.zig). Empty otherwise.
+    seam: []f64 = &.{},
 };
 
 /// Returns the error set `f` returns, so a module boundary can name an

@@ -7,10 +7,11 @@
 //!
 //! Contents:
 //! - `pub const MonoKrylovCtx = struct`, `MonoKrylovCtx.matvec(ctx: *MonoKrylovCtx, v: []const f64, w: []f64) void`
+//! - `pub const Alternating = struct`
 //! - `pub fn init(gpa: std.mem.Allocator, ckt: *const root.Circuit, steps: usize, autonomous: bool) !?Mono`
 //! - `pub fn deinit(m: *Mono, gpa: std.mem.Allocator) void`
 //! - `pub fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void`
-//! - `pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: Options, blk: []f64, r: usize, period_col: ?usize) error{OutOfMemory}!bool`
+//! - `pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: Options, blk: []f64, r: usize, period_col: ?usize, alt: Alternating) error{OutOfMemory}!bool`
 
 const std = @import("std");
 const num = @import("core").numerics;
@@ -28,7 +29,8 @@ const stepTime = period.stepTime;
 /// there once per shooting iteration, and each product Φ·v is then one
 /// linear solve per step on A_k = G_k + αC_k, no device evaluation:
 ///
-///   s_0 = v, dq_0 = C_0 v, σ_0 = -mask·G_0 v (the i_prev seed's derivative)
+///   s_0 = v, dq_0 = C_0 v, σ_0 = -P G_0 v (the i_prev seed's derivative,
+///   P its `period.seamCut`)
 ///   A_k s_k = α dq_{k-1} + σ_{k-1}
 ///   dq_k = C_k s_k,  σ_k = α (dq_k - dq_{k-1}) - σ_{k-1}
 ///
@@ -57,13 +59,18 @@ q: []f64 = &.{},
 ft: []f64 = &.{},
 /// dq, σ, the right-hand side and C s: n each per column; grown.
 work: []f64 = &.{},
+/// Each unknown's zero-charge island at the period's start
+/// (`period.markIslands` on C_0), which σ_0's cut reads.
+island: []u32,
 slv: direct.Solver,
 /// The trajectory of the last base period was recorded and `build` ran.
 ready: bool = false,
 
 /// GMRES operator on the recorded monodromy: w = (Φ - I) v, the
-/// autonomous period column from `dphi_dlnt`. A singular step Jacobian
-/// sets `singular` and returns w = 0; the caller then falls back.
+/// autonomous period column from `dphi_dlnt`, each of the `free` rows
+/// its alternating sum instead (`Alternating`), the period column's from
+/// `dalt`. A singular step Jacobian sets `singular` and returns w = 0;
+/// the caller then falls back.
 pub const MonoKrylovCtx = struct {
     mono: *Mono,
     gpa: std.mem.Allocator,
@@ -71,6 +78,11 @@ pub const MonoKrylovCtx = struct {
     options: Options,
     n: usize,
     dphi_dlnt: []const f64,
+    /// The free rows (`period.freeRows`), `sums` their scratch (one
+    /// each) and `dalt` the period column's sums (zero when driven).
+    free: []const u32,
+    sums: []f64,
+    dalt: []const f64,
     singular: bool = false,
     failure: ?error{OutOfMemory} = null,
 
@@ -81,7 +93,7 @@ pub const MonoKrylovCtx = struct {
         const osc = ctx.options.osc_node;
         @memcpy(w[0..n], v[0..n]);
         if (osc != root.GROUND) w[osc] = 0;
-        const ok = ctx.mono.apply(ctx.gpa, ctx.ckt, ctx.options, w[0..n], 1, null) catch |err| blk: {
+        const ok = ctx.mono.apply(ctx.gpa, ctx.ckt, ctx.options, w[0..n], 1, null, .{ .rows = ctx.free, .sums = ctx.sums }) catch |err| blk: {
             ctx.failure = err;
             break :blk false;
         };
@@ -91,9 +103,17 @@ pub const MonoKrylovCtx = struct {
             return;
         }
         for (w[0..n], v[0..n], 0..) |*wi, vi, i| wi.* -= if (i == osc and osc != root.GROUND) 0 else vi;
-        if (osc != root.GROUND) num.axpy(w[0..n], v[osc], ctx.dphi_dlnt);
+        const ln_t = if (osc != root.GROUND) v[osc] else 0;
+        if (osc != root.GROUND) num.axpy(w[0..n], ln_t, ctx.dphi_dlnt);
+        for (ctx.free, ctx.sums, ctx.dalt) |row, a, d| w[row] = a + ln_t * d;
     }
 };
+
+/// `apply`'s request for the alternating step sums of the unknowns
+/// `rows`: for row a and column j, (1/N) Σ_{k<N} (-1)^k s_k[rows[a]]
+/// into `sums[a * r + j]`, the derivative of that unknown's Nyquist
+/// component over the period (`period.nyquist`).
+pub const Alternating = struct { rows: []const u32, sums: []f64 };
 
 const Mono = @This();
 
@@ -125,10 +145,12 @@ pub fn init(gpa: std.mem.Allocator, ckt: *const root.Circuit, steps: usize, auto
     errdefer gpa.free(q);
     const ft = try gpa.alloc(f64, if (autonomous) steps * n else 0);
     errdefer gpa.free(ft);
+    const island = try gpa.alloc(u32, n);
+    errdefer gpa.free(island);
     var slv = try direct.Solver.init(gpa, ckt.n, ckt.col_ptr, ckt.row_idx, null, ckt.knobs.lu);
     // Each step's values differ; the bypass copy never matches.
     slv.dropBypass();
-    return .{ .rows = rows, .traj = traj, .g0 = g0, .c = c, .a = a, .q = q, .ft = ft, .slv = slv };
+    return .{ .rows = rows, .traj = traj, .g0 = g0, .c = c, .a = a, .q = q, .ft = ft, .island = island, .slv = slv };
 }
 
 /// Frees what `init` and `apply` allocated on `gpa`.
@@ -136,6 +158,7 @@ pub fn deinit(m: *Mono, gpa: std.mem.Allocator) void {
     m.slv.deinit();
     inline for (.{ m.traj, m.g0, m.c, m.a, m.q, m.ft, m.work }) |b| gpa.free(b);
     gpa.free(m.rows);
+    gpa.free(m.island);
 }
 
 /// Evaluates G and C at every recorded x_k of the base period, and for
@@ -147,17 +170,18 @@ pub fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void {
     const dt = opts.period / @as(f64, @floatFromInt(steps));
     for (0..steps + 1) |k| {
         const x = m.traj[k * (n + 1) + 1 ..][0..n];
+        // From the period's start; the sources see `t_origin` plus it.
         const t = if (k == 0) 0 else stepTime(opts, k - 1);
         const ft: []f64 = if (m.ft.len != 0 and k != 0) m.ft[(k - 1) * n ..][0..n] else &.{};
         if (ft.len != 0) {
             // f at t(1 + ε): the stretched period's step time.
-            const t_eps = t * (1 + opts.fd_epsilon);
+            const t_eps = opts.t_origin + t * (1 + opts.fd_epsilon);
             ckt.setSimState(.{ .t = t_eps, .dt = dt, .kind = .tran });
             ckt.eval(x, t_eps);
             @memcpy(ft, ckt.rhs[0..n]);
         }
-        ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
-        ckt.eval(x, t);
+        ckt.setSimState(.{ .t = opts.t_origin + t, .dt = dt, .kind = .tran });
+        ckt.eval(x, opts.t_origin + t);
         if (ft.len != 0) for (ft, ckt.rhs[0..n]) |*d, f| {
             d.* = (d.* - f) / opts.fd_epsilon;
         };
@@ -168,6 +192,7 @@ pub fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void {
         @memcpy(m.c[k * nnz ..][0..nnz], ckt.c_vals[0..nnz]);
         if (k == 0) {
             @memcpy(m.g0, ckt.g_vals[0..nnz]);
+            period.markIslands(ckt, m.c[0..nnz], m.island);
         } else {
             ckt.combineGC(2.0 / dt, m.a[(k - 1) * nnz ..][0..nnz]);
         }
@@ -177,9 +202,10 @@ pub fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void {
 
 /// Replaces each of the r columns of `blk` (column-major, n each) by
 /// Φ times it; column `period_col`, which must enter zero, receives
-/// d x_N / d(ln T) instead (autonomous `Mono` only). False when some
-/// A_k is singular (`blk` is garbage then).
-pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: Options, blk: []f64, r: usize, period_col: ?usize) error{OutOfMemory}!bool {
+/// d x_N / d(ln T) instead (autonomous `Mono` only). `alt` receives its
+/// rows' alternating sums. False when some A_k is singular (`blk` and
+/// `alt` are garbage then).
+pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: Options, blk: []f64, r: usize, period_col: ?usize, alt: Alternating) error{OutOfMemory}!bool {
     std.debug.assert(m.ready);
     const n: usize = ckt.n;
     const nnz: usize = ckt.nnz;
@@ -187,6 +213,7 @@ pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: O
     const alpha = 2.0 * @as(f64, @floatFromInt(steps)) / opts.period;
     std.debug.assert(blk.len == n * r);
     if (period_col) |pc| std.debug.assert(pc < r and m.q.len != 0);
+    std.debug.assert(alt.sums.len == alt.rows.len * r);
     if (m.work.len < 2 * n * r + 2 * n) {
         gpa.free(m.work);
         m.work = &.{};
@@ -199,15 +226,17 @@ pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: O
     const c0 = m.c[0..nnz];
     for (0..r) |j| {
         const s = blk[j * n ..][0..n];
+        for (alt.rows, 0..) |row, a| alt.sums[a * r + j] = s[row];
         spmv(ckt, c0, s, dq[j * n ..][0..n]);
         const sg = sig[j * n ..][0..n];
         spmv(ckt, m.g0, s, sg);
-        // As `periodStart` seeds i_prev = -rhs on rows with a diagonal C.
-        sg[0] = 0;
-        for (1..n) |i| sg[i] = if (c0[ckt.diag_slots[i]] != 0) -sg[i] else 0;
+        // As `periodStart` seeds i_prev = -rhs, cut by `period.seamCut`.
+        for (sg) |*g| g.* = -g.*;
+        period.seamCut(ckt, c0, m.island, sg);
         if (!ckt.has_charge) @memset(sg, 0);
     }
     for (1..steps + 1) |k| {
+        const sign: f64 = if (k % 2 == 0) 1 else -1;
         m.slv.factor(m.a[(k - 1) * nnz ..][0..nnz], .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return false, // else: a singular step Jacobian
@@ -223,6 +252,9 @@ pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: O
                 b.* += alpha * (qk - qp) - f;
             };
             m.slv.solve(rhs, s);
+            if (k < steps) for (alt.rows, 0..) |row, a| {
+                alt.sums[a * r + j] += sign * s[row];
+            };
             spmv(ckt, ck, s, cs);
             for (sg, cs, dqj) |*g, c, d| g.* = alpha * (c - d) - g.*;
             if (drive) for (sg, m.q[k * n ..][0..n], m.q[(k - 1) * n ..][0..n]) |*g, qk, qp| {
@@ -231,6 +263,7 @@ pub fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: O
             @memcpy(dqj, cs);
         }
     }
+    for (alt.sums) |*v| v.* /= @as(f64, @floatFromInt(steps));
     return true;
 }
 

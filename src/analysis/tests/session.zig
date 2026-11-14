@@ -1,7 +1,8 @@
 //! Query-boundary validation and Session scheduling tests. Oracles: the
 //! named refusal each invalid query must get (the frontend's own refusals
 //! for `validate`), the dependency order a Session must keep, and the
-//! columns a run publishes for `schemaOf`'s prediction.
+//! columns a run publishes for `schemaOf`'s prediction, and the lane gate's
+//! decision table.
 
 const Deck = @import("core").Deck;
 const builtin = @import("device").Library.builtin;
@@ -131,6 +132,22 @@ test "backend validation rejects zero thread counts" {
     try t.expectError(error.InvalidThreadCount, validateBackend(.{ .device_threads = 0 }));
 }
 
+test "a query past only the nnz gate borrows lanes but stamps serially" {
+    // Oracle: the gate's decision table. ParEval pays from the device-weight
+    // gate; a circuit that reaches only the nnz gate borrows for the
+    // multicore LU and must not stamp on the lanes.
+    const executor = @import("../executor.zig");
+    const lanePlan = executor.lanePlan;
+    const w = executor.borrow_min_weight;
+    const nnz = executor.borrow_min_nnz;
+    const lanes = executor.ThreadPool.per_query;
+    try t.expectEqual(executor.LanePlan{ .want = 1, .eval = false }, lanePlan(w - 1, nnz - 1));
+    try t.expectEqual(executor.LanePlan{ .want = lanes, .eval = false }, lanePlan(w - 1, nnz));
+    try t.expectEqual(executor.LanePlan{ .want = lanes, .eval = false }, lanePlan(0, std.math.maxInt(u32)));
+    try t.expectEqual(executor.LanePlan{ .want = lanes, .eval = true }, lanePlan(w, 0));
+    try t.expectEqual(executor.LanePlan{ .want = lanes, .eval = true }, lanePlan(w, nnz));
+}
+
 test "backend validation refuses an explicit GPU this build has no kernels for" {
     const validateBackend = @import("../executor.zig").validateBackend;
     const requestSupported = @import("../gpu/context.zig").requestSupported;
@@ -151,7 +168,7 @@ const models = @import("models");
 const GROUND = @import("../types.zig").GROUND;
 
 /// A deck with nothing in it but `probes`, for driving a Session by hand.
-fn bareDeck(probes: []const u32, labels: []const []const u8) Deck {
+pub fn bareDeck(probes: []const u32, labels: []const []const u8) Deck {
     return .{
         .probes = probes,
         .probe_labels = labels,
@@ -180,7 +197,7 @@ fn paramRef(params: []const @import("../types.zig").ParamRef, ty: @import("devic
 
 /// An executor config with lane batching `lanes` and bypass off: lanes
 /// never bypass, so the oracle is the plain scalar run.
-fn laneConfig(lanes: bool) @import("../executor.zig").Config {
+pub fn laneConfig(lanes: bool) @import("../executor.zig").Config {
     var config: @import("../executor.zig").Config = .{};
     config.knobs.lanes = lanes;
     config.knobs.bypass = false;
@@ -371,6 +388,59 @@ test "schemaOf predicts the columns envelope and noise publish (#83)" {
         const res = try s.result(ids[0]);
         const schema = try @import("../session.zig").schemaOf(t.allocator, &prepared, &deck, q);
         try t.expectEqual(res.varnames.len, schema.columns);
+    }
+}
+
+test "schemaOf predicts the .sens, .dcmatch, .dcsens and .acmatch columns without an internal add's rows" {
+    // Oracle: the columns each run publishes, and the same query with no
+    // card names, which counts every resistor's. Red before: `.sens`
+    // published fewer columns than its schema counted.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const vin = try b.addNode();
+    const out = try b.addNode();
+    try b.addDevice(models.vsource, "v1", &.{ .dc = 1 }, &.{}, .{ vin, GROUND });
+    // A portnum V's z0, which no card names.
+    try b.addDevice(models.resistor, "", &.{ .r = 50 }, &.{}, .{ vin, out });
+    try b.addDevice(models.resistor, "r1", &.{ .r = 1000 }, &.{}, .{ out, GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const names = try requests.CardNames.init(arena.allocator(), &.{
+        .{ .type = builtin("vsource"), .index = 0, .name = "v1" },
+        .{ .type = builtin("resistor"), .index = 1, .name = "r1" },
+    });
+    var deck = bareDeck(&.{ vin, out }, &.{ "v(vin)", "v(out)" });
+    // A unit AC current into `out`, so `.acmatch`'s output is not zero.
+    const drive = try arena.allocator().alloc(f64, 2 * @as(usize, prepared.n));
+    @memset(drive, 0);
+    drive[out] = 1;
+    deck.ac_drive = drive;
+    const sweep: requests.FreqSweep = .{ .f_start = 1, .f_stop = 1e3 };
+    const queries = [_]requests.Query{
+        .{ .sens = .{ .output_node = out, .card_names = names } },
+        .{ .dcmatch = .{ .output_node = out, .card_names = names } },
+        .{ .dcsens = .{ .output_node = out, .card_names = names } },
+        .{ .acmatch = .{ .sweep = sweep, .output_node = out, .card_names = names } },
+    };
+    const schemaOf = @import("../session.zig").schemaOf;
+    for (queries) |q| {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [1]requests.QueryId = undefined;
+        _ = try s.append(&.{q}, &ids);
+        while (!(try s.info(ids[0])).status.terminal()) _ = try s.advance(ids[0]);
+        const res = try s.result(ids[0]);
+        try t.expectEqual(res.varnames.len, (try schemaOf(t.allocator, &prepared, &deck, q)).columns);
+        for (res.varnames) |name| try t.expect(!std.mem.startsWith(u8, name, "resistor#0"));
+        var all = q;
+        switch (all) {
+            inline .sens, .dcmatch, .dcsens, .acmatch => |*o| o.card_names = .empty,
+            else => unreachable, // else: `queries` holds only these four
+        }
+        try t.expect((try schemaOf(t.allocator, &prepared, &deck, all)).columns > res.varnames.len);
     }
 }
 
@@ -1313,5 +1383,50 @@ test "a .four and .fft read a matching .tran's rows bitwise as their own runs, a
     for (fail_ids[1..]) |id| {
         try t.expectEqual(fail_ids[0], failing.rows.items(.reads)[@backingInt(id)]);
         try t.expectEqual(error.TransientFailed, (try failing.info(id)).failure.?);
+    }
+}
+
+test "a .pss spectrum reads its card's period rows, bitwise its own shooting, and shoots alone beside any other .pss" {
+    // Oracle: the spectrum query appended alone, which shoots its own orbit
+    // (`pss.finish`), the path a read period replaces. Red before
+    // `linkReaders` took `.pss`: every spectrum shot its own orbit.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const vin = try b.addNode();
+    const out = try b.addNode();
+    try b.addDevice(models.vsource, "", &.{ .dc = 0, .waveform = 2, .sin_vo = 0, .sin_va = 1, .sin_freq = 1e3 }, &.{}, .{ vin, GROUND });
+    try b.addDevice(models.resistor, "", &.{ .r = 1e3 }, &.{}, .{ vin, out });
+    try b.addDevice(models.capacitor, "", &.{ .c = 1e-7 }, &.{}, .{ out, GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    const deck = bareDeck(&.{ vin, out }, &.{ "v(in)", "v(out)" });
+    const spectrum: requests.Pss = .{ .period = 1e-3, .n_samples = 64, .harms = 5 };
+    var period = spectrum;
+    period.harms = 0;
+    // Another orbit: the spectrum must not read it.
+    var finer = period;
+    finer.n_samples = 128;
+    const own = blk: {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [1]requests.QueryId = undefined;
+        _ = try s.append(&.{.{ .pss = spectrum }}, &ids);
+        try s.runAll(.{ .quantum = .completion });
+        break :blk try t.allocator.dupe(f64, (try s.result(ids[0])).data);
+    };
+    defer t.allocator.free(own);
+    try t.expectEqual(@as(usize, 5 * 3), own.len);
+    for ([_]requests.Pss{ period, finer }, [_]bool{ true, false }) |source, reads| {
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, .{});
+        defer s.deinit();
+        var ids: [2]requests.QueryId = undefined;
+        _ = try s.append(&.{ .{ .pss = source }, .{ .pss = spectrum } }, &ids);
+        try s.runAll(.{ .max_parallel = 2, .quantum = .completion });
+        try t.expectEqual(null, s.failure());
+        const i = @backingInt(ids[1]);
+        try t.expectEqual(reads, s.rows.items(.reads)[i] == ids[0]);
+        try t.expectEqual(reads, s.rows.items(.executor)[i].?.source != null);
+        try t.expectEqualSlices(u64, @ptrCast(own), @ptrCast((try s.result(ids[1])).data));
     }
 }

@@ -159,7 +159,7 @@ pub fn loadBatch(gpa: std.mem.Allocator, bg: *BatchGpu, b: device_ir.Batch, expl
     };
     const heavy = image.len >= ctx_cost.heavy_image_bytes;
     const cold = heavy and !ctx_cost.imageWarm(image, knobs);
-    if (cold and !explicit) {
+    if (cold and !explicit and !knobs.perf.p1) {
         std.debug.print(
             "note: GPU kernel for '{s}' is not compiled yet ({d} MB of PTX), so this run stays on the CPU; `--backend cuda` compiles it once per build\n",
             .{ b.type_name, image.len >> 20 },

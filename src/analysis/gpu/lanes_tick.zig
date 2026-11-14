@@ -45,6 +45,7 @@ pub fn predictRound(self: *GpuLanes) !void {
     try self.put(self.buf(.sc), self.sc);
     try self.put(self.buf(.sims), self.sims);
     try self.put(self.buf(.lte_in), self.lte_in);
+    if (self.gear.len != 0) try self.put(self.buf(.gear), self.gear);
     try self.put(self.buf(.round), self.round);
     try predictKernels(self);
 }
@@ -99,17 +100,22 @@ pub fn linearTick(self: *GpuLanes, opts: lk.NewtonOpts) !void {
     try evalAll(self, self.buf(.active), self.buf(.x));
     try tickLap(self, &mark, .eval);
     try self.launch(&self.k.assemble, (self.n + self.nnz) * N, &.{
-        arg(&nl),                 arg(&nn),                   arg(&nnz),             arg(&d0),                arg(&charge),
-        self.buf(.sc).argPtr(),   self.buf(.active).argPtr(), self.buf(.x).argPtr(), self.buf(.rhs).argPtr(), self.buf(.q).argPtr(),
-        self.buf(.ring).argPtr(), self.buf(.perm_q).argPtr(), arg(&nh),              self.buf(.ip).argPtr(),  self.buf(.g).argPtr(),
-        self.buf(.c).argPtr(),    self.buf(.a).argPtr(),
+        arg(&nl),                 arg(&nn),                   arg(&nnz),                arg(&d0),                arg(&charge),
+        self.buf(.sc).argPtr(),   self.buf(.active).argPtr(), self.buf(.x).argPtr(),    self.buf(.rhs).argPtr(), self.buf(.q).argPtr(),
+        self.buf(.ring).argPtr(), self.buf(.perm_q).argPtr(), arg(&nh),                 self.buf(.ip).argPtr(),  self.buf(.g).argPtr(),
+        self.buf(.c).argPtr(),    self.buf(.a).argPtr(),      self.buf(.gear).argPtr(),
     });
-    if (opts.gmin > 0) {
-        var value = opts.gmin;
+    // With stamps gmin lands only at them (`extras`), as `loadGmin`. Under
+    // `per_lane` `gmin` is the lanes' largest, so any positive one launches.
+    var nopts = opts;
+    if (opts.gmin > 0 and opts.n_stamps == 0) {
         try self.launch(&self.k.gmin, self.n * N, &.{
-            arg(&nl),                arg(&nn),              arg(&value),              self.buf(.active).argPtr(), self.buf(.x).argPtr(),
-            self.buf(.rhs).argPtr(), self.buf(.a).argPtr(), self.buf(.diag).argPtr(),
+            arg(&nl),              arg(&nn),                arg(&nopts),           self.buf(.homotopy).argPtr(), self.buf(.active).argPtr(),
+            self.buf(.x).argPtr(), self.buf(.rhs).argPtr(), self.buf(.a).argPtr(), self.buf(.diag).argPtr(),
         });
+    }
+    if (opts.n_stamps + opts.n_force > 0) {
+        try self.launch(&self.k.extras, N, &.{ arg(&nl), arg(&nopts), self.buf(.homotopy).argPtr(), self.buf(.active).argPtr(), self.buf(.stamps).argPtr(), self.buf(.force).argPtr(), self.buf(.x).argPtr(), self.buf(.rhs).argPtr(), self.buf(.a).argPtr() });
     }
     try tickLap(self, &mark, .assemble);
     try self.buf(.fails).fillAsync(0, 4, &self.stream);

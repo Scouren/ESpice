@@ -7,8 +7,9 @@
 //! hfet1 rules, and dev/devices/gpu-evaluation.md for the GPU rules.
 //!
 //! Contents:
-//! - `pub const bypass_models`, `pub const load_check`
+//! - `pub const bypass_models`, `bypass_models_c4`, `pub const charge_only`, `pub const load_check`
 //! - `pub const GpuRefusal = enum`
+//! - `pub fn chargeOnlyFields(comptime D: type) []const []const u8`
 //! - `pub fn skipsTimerState(comptime D: type) bool`, `hasSpiceBreaks`,
 //!   `predictsOverDeltaOld2`, `hasAbsdelayState`, `walksPending`,
 //!   `holdsOnlyHeld`, `hasInstanceField`, `gpuEligible`, `gpuHostStepped`,
@@ -27,19 +28,44 @@ const layout = @import("layout.zig");
 /// Models whose evaluation reads no time (`sim.t`, `sim.dt`) beyond the
 /// flags the bypass class keys on (the MOS levels test `t > 0` on the
 /// initial step), so a recording stays valid across timepoints. An unlisted
-/// model, a runtime `.hdl` one included, always evaluates.
+/// model, a runtime `.hdl` one included, always evaluates. Names are the
+/// registry's (build.zig `.name`, the `models` decl), not the `.va` file's.
 // ponytail: hand-kept list (grep of the generated sources); a VerA flag for time reads would replace it.
 pub const bypass_models = std.StaticStringMap(void).initComptime(.{
-    .{"asmesd"},         .{"asmesd_dio"},   .{"asmhemt"},     .{"b3soidd"},        .{"b3soifd"},
-    .{"bjt505"},         .{"bjt505t"},      .{"bsim1"},       .{"bsim2"},          .{"bsim3"},
-    .{"bsim4va"},        .{"bsimbulk"},     .{"bsimcmg_std"}, .{"bsimimg"},        .{"bsimsoi"},
-    .{"diode_cmc"},      .{"diode"},        .{"gummel_poon"}, .{"hfet1"},          .{"hfet2"},
-    .{"hicumL0_v2p1p0"}, .{"hicumL2_v320"}, .{"hisim2_va"},   .{"hisimhv"},        .{"hisimsoi_std"},
-    .{"hisimsotb_std"},  .{"jfet2"},        .{"jfet"},        .{"juncap200"},      .{"L_UTSOI_102"},
-    .{"mesa"},           .{"mes"},          .{"mosvar"},      .{"mvsg_cmc_5.0.0"}, .{"psp103"},
-    .{"psp103t"},        .{"psp104"},       .{"psp104t"},     .{"r2_cmc"},         .{"r3_cmc"},
-    .{"vbic13_4t"},      .{"vdmos"},        .{"mos1"},        .{"mos2"},           .{"mos3"},
-    .{"mos6"},           .{"mos9"},
+    .{"asmesd"},  .{"asmesd_dio"}, .{"asmhemt"}, .{"b3soidd"},     .{"b3soifd"},
+    .{"bsim1"},   .{"bsim2"},      .{"bsim3"},   .{"bsim4va"},     .{"bsimbulk"},
+    .{"bsimimg"}, .{"diode_cmc"},  .{"diode"},   .{"gummel_poon"}, .{"hfet1"},
+    .{"hfet2"},   .{"hisim2_va"},  .{"jfet2"},   .{"jfet"},        .{"mesa"},
+    .{"mes"},     .{"mosvar"},     .{"psp103"},  .{"psp103t"},     .{"psp104"},
+    .{"psp104t"}, .{"r3_cmc"},     .{"vdmos"},   .{"mos1"},        .{"mos2"},
+    .{"mos3"},    .{"mos6"},       .{"mos9"},
+});
+
+/// Models that qualify as `bypass_models` do but bypass only with the C4
+/// lever on, because they never bypassed before it: the first eleven were
+/// listed by `.va` file stem until C4 wave 2 and matched no model, the last
+/// three have no `u_kinds` (only node potentials), which the shipped
+/// bypass refused. The lever's verdict merges this set into
+/// `bypass_models` or deletes it.
+pub const bypass_models_c4 = std.StaticStringMap(void).initComptime(.{
+    .{"mextram"},  .{"mextram_t"},  .{"bsimsoi_va"}, .{"hisimhv_va"}, .{"l_utsoi"}, .{"bsimcmg"},
+    .{"hisimsoi"}, .{"hicumL2_va"}, .{"hisimsotb"},  .{"mvsg"},       .{"hicumL0"}, .{"juncap200"},
+    .{"r2_cmc"},   .{"vbic13_4t"},
+});
+
+/// Per model, the Instance fields that enter only a charge value, added
+/// with a coefficient that does not depend on x (bsim4va's path latches,
+/// `q = pq + (t(x) - pb) * r`): no residual, no Jacobian, no dq/dx and no
+/// branch reads them, so a bypass hit, which re-reads the charges, stays
+/// exact when the commit moves them, and C4 drops them from the
+/// recording's key. Traced in the generated source (finding 25 of
+/// docs/perf_research/06-open-issues.md: `mos2`'s latches enter a product
+/// and do not qualify; `psp103`'s row holds none). The #256 generator in
+/// tests/bypass.zig checks every entry with a commit between a recording
+/// and its replay.
+// ponytail: hand-kept until VerA emits `charge_only_fields` (the VerA request of C4's wave-2 report).
+pub const charge_only = std.StaticStringMap([]const []const u8).initComptime(.{
+    .{ "bsim4va", &[_][]const u8{ "pb__0", "pb__1", "pb__2", "pb__3", "pb__4", "pq__0", "pq__1", "pq__2", "pq__3", "pq__4" } },
 });
 
 /// Models whose ngspice load flags non-convergence itself when a branch
@@ -82,6 +108,11 @@ const timer_only_state = std.StaticStringMap(void).initComptime(.{
 /// tran/device_mesa_oscillator away from ngspice (52.5x -> 57.7x), and
 /// hfet2 reads its gate port directly.
 const delta_old2_predict = std.StaticStringMap(void).initComptime(.{.{"hfet1"}});
+
+/// D's `charge_only` entry, empty when it has none.
+pub fn chargeOnlyFields(comptime D: type) []const []const u8 {
+    return charge_only.get(comptime baseName(D)) orelse &.{};
+}
 
 pub fn skipsTimerState(comptime D: type) bool {
     if (timer_only_state.get(comptime baseName(D)) == null) return false;

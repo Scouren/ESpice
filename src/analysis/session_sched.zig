@@ -41,6 +41,7 @@ const progress = @import("worker.zig");
 const types = @import("types.zig");
 const session = @import("session.zig");
 const jobs_mod = @import("session_jobs.zig");
+const dc_segments = @import("dc/segments.zig");
 const Session = session.Session;
 const Status = session.Status;
 const Scope = session.Scope;
@@ -330,11 +331,16 @@ pub fn laneDone(self: *Session, i: usize) void {
         self.rows.items(.status)[g] = .failed;
         self.rows.items(.failure)[g] = err;
     };
+    // A `.dc` reads its OP for a whole rerun (`addRow`); ended here, it never will.
+    if (self.kindAt(g) == .dc and self.rows.items(.status)[g].terminal()) self.readerDone(g);
 }
 
 /// Ends split query `g`, whose lanes all ended: as its first lane (in
 /// lane order) that did not complete, else complete with the lanes'
-/// rows in lane order, as the query run whole publishes them.
+/// rows in lane order, as the query run whole publishes them. A `.dc`'s
+/// segments join only where every seam agrees (dc/segments.zig); else `g`
+/// says which seam did not, gets the executor of its sweep run whole, from
+/// its OP, and queues to run as any query does.
 pub fn assemble(self: *Session, g: usize) !void {
     const first = g - self.rows.items(.lanes)[g];
     var npoints: usize = 0;
@@ -348,16 +354,30 @@ pub fn assemble(self: *Session, g: usize) !void {
         npoints += self.rows.items(.executor)[l].?.result().?.npoints;
     }
     const job = self.jobAt(g);
+    // Each `.dc` segment but the first leads with its overlap rows.
+    if (job == .dc) npoints -= (g - first - 1) * requests.Dc.overlap;
     const e = try execution.Executor.create(self.allocator, self.io, self.templateOf(g), self.deck, job, null, false, self.config);
     self.rows.items(.executor)[g] = e;
     var res = self.rows.items(.executor)[first].?.result().?;
     const ncols = res.varnames.len;
     const data = try e.results.allocator().alloc(f64, npoints * ncols);
-    var at: usize = 0;
-    for (first..g) |l| {
-        const part = self.rows.items(.executor)[l].?.result().?.data;
-        @memcpy(data[at..][0..part.len], part);
-        at += part.len;
+    if (job == .dc) {
+        if (try stitchSegments(self, first, g, data, ncols)) |seam| {
+            const at = self.rows.items(.executor)[first + seam].?.result().?.data[0];
+            dc_segments.note(self.deck.card_names, job.dc, seam, at);
+            e.destroy();
+            self.rows.items(.executor)[g] = null;
+            try self.makeExecutor(g);
+            self.urgent.appendAssumeCapacity(@intCast(g));
+            return;
+        }
+    } else {
+        var at: usize = 0;
+        for (first..g) |l| {
+            const part = self.rows.items(.executor)[l].?.result().?.data;
+            @memcpy(data[at..][0..part.len], part);
+            at += part.len;
+        }
     }
     // A plain `.mc` numbers its converged trials.
     if (job == .mc and job.mc.variants.count == 0) {
@@ -549,4 +569,24 @@ pub fn advanceDone(self: *Session) void {
     while (self.done_rows < self.rows.len and self.effectiveStatus(self.done_rows).terminal()) self.done_rows += 1;
     const outputs = self.outputs.items;
     while (self.done_outputs < outputs.len and self.effectiveStatus(@backingInt(outputs[self.done_outputs])).terminal()) self.done_outputs += 1;
+}
+
+// ---- private ----
+
+/// `dc_segments.stitch` of split `.dc` `g`'s segment rows `first..g` into
+/// `out`: null once joined, else the seam that disagrees.
+fn stitchSegments(self: *Session, first: usize, g: usize, out: []f64, ncols: usize) !?u32 {
+    const k = g - first;
+    var parts: [requests.Dc.split.max][]const f64 = undefined;
+    var seams: [requests.Dc.split.max][]const f64 = undefined;
+    assert(k <= parts.len);
+    for (first..g, parts[0..k], seams[0..k]) |l, *p, *s| {
+        const e = self.rows.items(.executor)[l].?;
+        p.* = e.result().?.data;
+        s.* = e.seam;
+    }
+    const ckt = self.templateOf(g);
+    const scratch = try self.allocator.alloc(f64, 3 * ckt.n);
+    defer self.allocator.free(scratch);
+    return dc_segments.stitch(out, parts[0..k], seams[0..k], ncols, self.jobAt(g).dc, ckt.current_row, scratch);
 }

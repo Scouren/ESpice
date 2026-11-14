@@ -1,18 +1,20 @@
 //! Periodic steady state by shooting Newton: a circuit at its DC point and
-//! `Options` in, one period of the probes out, as point-major rows. Finds
+//! `Options` in, one period of the probes out, as point-major rows (or,
+//! with `Options.harms`, ngspice's spectrum of that period). Finds
 //! x0 with phi(x0) = x(T; x0) - x0 = 0, integrating one period with
 //! fixed-step trapezoid (`period.zig`) under the shooting state machine
 //! (`Shoot.zig`). This file is the query spine: one solve, the CPU lane
 //! batch and the GPU lane batch.
 //!
-//! An autonomous circuit (an oscillator, `Options.osc_node` set) has no
-//! period to impose. There T joins the unknowns and the oscillator node's
-//! x0 leaves them: its value stays pinned at t = 0, which fixes the phase
+//! An autonomous circuit (an oscillator, `Options.osc_node` set or picked
+//! by `Options.phase_node`) has no period to impose. There T joins the
+//! unknowns and the oscillator node's x0 leaves them: its value stays
+//! pinned at t = 0 of the period, which fixes the phase
 //! the time shift would otherwise leave free. The Jacobian keeps its n x n
 //! shape, the osc column holding d(phi)/d(ln T) instead of d(phi)/d(x0[osc]).
 //!
 //! Cites: Verilog-A LRM §4.6.1 (sources follow their waveform only in the
-//! transient phase).
+//! transient phase); ngspice-45 dcpss.c:993-1068, 1522-1590 (the spectrum).
 //!
 //! Contents:
 //! - `pub const Options = @import("core").query.Pss`
@@ -71,10 +73,14 @@ pub const test_access = if (@import("builtin").is_test) .{
 /// error.OscillatorDidNotStart when the circuit does not oscillate.
 /// Allocates O(n^2) below `krylov_threshold` unknowns, O(n * gmres_restart)
 /// past it, and O(n * n_samples) more to start an oscillator, all freed
-/// before return. Asserts `wave` is empty or that size. A period whose
-/// integration fails ends the solve unconverged with an infinite residual,
-/// not an error; the errors are OutOfMemory, QueryCancelled, error.Singular
-/// from the dense Jacobian, and error.OscillatorDidNotStart.
+/// before return. Asserts `wave` is empty or that size. A driven solve
+/// whose period integration fails ends unconverged with an infinite
+/// residual, not an error; an autonomous solve that ends unconverged found
+/// no periodic orbit (a decaying oscillation has none) and is
+/// error.NoPeriodicSteadyState. The errors are those, OutOfMemory,
+/// QueryCancelled, error.Singular from the dense Jacobian,
+/// error.OscillatorDidNotStart, and the settling transient's
+/// (`tran.simulate`; error.TimestepTooSmall when it stops short).
 pub fn solve(
     ckt: *root.Circuit,
     x_dc: []const f64,
@@ -90,9 +96,18 @@ pub fn solve(
 }
 
 /// Contract entry: shoot from ctx.x_op and return one period as point-major
-/// rows (time, probes...), n_samples+1 of them. Non-convergence prints a
-/// warning and still returns the last period.
+/// rows (time, probes...), n_samples+1 of them, or with `opts.harms` its
+/// spectrum, rows (frequency, probes...), harms of them, taken from
+/// `ctx.source` when that holds the card's period (`Session.linkReaders`)
+/// with no shooting of its own. A driven solve's non-convergence prints a
+/// warning and still returns the last period; an oscillator's is
+/// error.NoPeriodicSteadyState (`solve`).
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    if (opts.harms != 0) if (ctx.source) |src| {
+        const names = try root.probeNames(ctx, "frequency");
+        std.debug.assert(src.npoints == @as(usize, opts.n_samples) + 1 and src.varnames.len == names.len);
+        return spectrum(src.data, names, opts, try ctx.allocator.alloc(f64, @as(usize, opts.harms) * names.len));
+    };
     var shot: Shoot = undefined;
     var names: []const []const u8 = undefined;
     var data: []f64 = undefined;
@@ -234,26 +249,74 @@ fn LaneSys(comptime W: usize) type {
 }
 
 /// `run`'s setup, shared with the lane drivers: the refusals, names and row
-/// buffer, then the shooting state in `shot`.
+/// buffer (a spectrum's rows after the period's), then the shooting state
+/// in `shot`.
 fn start(ctx: *const root.RunCtx, opts: Options, shot: *Shoot, names: *[]const []const u8, data: *[]f64) !void {
     try ctx.circuit.refuseDigital("pss");
-    names.* = try root.probeNames(ctx, "time");
-    data.* = try ctx.allocator.alloc(f64, (@as(usize, opts.n_samples) + 1) * names.len);
+    names.* = try root.probeNames(ctx, if (opts.harms == 0) "time" else "frequency");
+    const period_len = (@as(usize, opts.n_samples) + 1) * names.len;
+    data.* = try ctx.allocator.alloc(f64, period_len + @as(usize, opts.harms) * names.len);
     errdefer ctx.allocator.free(data.*);
-    try shot.init(ctx.circuit, ctx.x_op, ctx.probes, data.*, opts, ctx.scratch_allocator);
+    try shot.init(ctx.circuit, ctx.x_op, ctx.probes, data.*[0..period_len], opts, ctx.scratch_allocator);
 }
 
-/// The published period. Non-convergence prints a warning and still
-/// returns the last period.
+/// The published period, or with `opts.harms` its spectrum (`spectrum`).
+/// Non-convergence (a driven solve's: an autonomous one's is an error by
+/// now) prints a warning and still returns the last period.
 fn finish(res: SolveResult, names: []const []const u8, data: []f64, opts: Options) root.Result {
     if (!res.converged)
         std.debug.print("Warning: pss: shooting did not converge (residual {e})\n", .{res.residual_norm});
-    return .{
+    const period_len = (@as(usize, opts.n_samples) + 1) * names.len;
+    if (opts.harms == 0) return .{
         .plotname = "Periodic Steady State",
         .varnames = names,
         .is_complex = false,
         .npoints = @as(usize, opts.n_samples) + 1,
         .data = data,
+    };
+    return spectrum(data[0..period_len], names, opts, data[period_len..]);
+}
+
+/// ngspice's PSS spectrum plot (ngspice-45 dcpss.c:1015-1032, its DFT
+/// 1522-1590), written to `out`: row j is [j·f, |X_j| of each probe],
+/// f = 1/T with T the period's last time (`opts.period` when that
+/// integration failed and zeroed `wave`), over the period's first
+/// `n_samples` rows of `wave` (the last repeats the first): |X_0| the
+/// signed mean, |X_j| hypot(2/N Σ x sin, 2/N Σ x cos). Each sum runs in
+/// sample order, as ngspice's. ngspice then relaunches when another
+/// harmonic outweighs the first (dcpss.c:1049-1068): its frequency guess
+/// was wrong. ESPice's shooting solves for the period, so there is no
+/// guess to correct.
+/// ponytail: O(harms · probes · n_samples) sin/cos, as ngspice; a table of
+/// one period's sin/cos if wide spectra get slow.
+fn spectrum(wave: []const f64, names: []const []const u8, opts: Options, out: []f64) root.Result {
+    const cols = names.len;
+    const steps: usize = opts.n_samples;
+    std.debug.assert(wave.len == (steps + 1) * cols and out.len == @as(usize, opts.harms) * cols);
+    const n: f64 = @floatFromInt(steps);
+    const t_end = wave[steps * cols];
+    const f = 1 / (if (t_end > 0) t_end else opts.period);
+    for (0..opts.harms) |j| {
+        const h: f64 = @floatFromInt(j);
+        const row = out[j * cols ..][0..cols];
+        row[0] = h * f;
+        for (1..cols) |c| {
+            var s: f64 = 0;
+            var co: f64 = 0;
+            for (0..steps) |i| {
+                const a = h * 2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / n;
+                s += wave[i * cols + c] * @sin(a);
+                co += wave[i * cols + c] * @cos(a);
+            }
+            row[c] = if (j == 0) co / n else std.math.hypot(s * 2.0 / n, co * 2.0 / n);
+        }
+    }
+    return .{
+        .plotname = "Frequency Domain Periodic Steady State Analysis",
+        .varnames = names,
+        .is_complex = false,
+        .npoints = opts.harms,
+        .data = out,
     };
 }
 
@@ -291,7 +354,8 @@ fn integrateLanes(
             const o = reqs[l].opts;
             const ckt = shots[l].ckt;
             const dt = o.period / @as(f64, @floatFromInt(steps));
-            times[l] = stepTime(o, k);
+            // The sources' time, as `integrateOnePeriod` steps it.
+            times[l] = o.t_origin + stepTime(o, k);
             hooks[l] = periodHook(&shots[l].sc, 2.0 / dt, ckt.has_charge);
             sys.hooks[l] = hooks[l];
             ckt.setSimState(.{ .t = times[l], .dt = dt, .kind = .tran });
@@ -299,10 +363,7 @@ fn integrateLanes(
         }
         sys.active = live;
         const o0 = reqs[@ctz(live)].opts;
-        const res = converger.newtonLanes(W, sys, lws, xv, times, .{
-            .max_iter = o0.max_newton_iter,
-            .abstol = o0.newton_tol,
-        }, S.LaneHook{});
+        const res = converger.newtonLanes(W, sys, lws, xv, times, period.stepOptions(o0), S.LaneHook{});
         // As `converger.run` ends each lane's solve.
         it = L.each(live);
         while (it.next()) |l| shots[l].ckt.clearLimits();
@@ -312,7 +373,7 @@ fn integrateLanes(
             S.getLane(reqs[l].x, xv, l);
             const bit = @as(L.Mask, 1) << @intCast(l);
             const ok = r.converged & bit != 0 and r.singular & bit == 0;
-            if (!periodAccept(shots[l].ckt, &hooks[l], reqs[l].x, reqs[l].probes, reqs[l].wave, k, times[l], ok)) live &= ~bit;
+            if (!periodAccept(shots[l].ckt, &hooks[l], reqs[l].x, reqs[l].probes, reqs[l].wave, k, stepTime(reqs[l].opts, k), ok)) live &= ~bit;
         }
     }
     return live;
@@ -389,6 +450,7 @@ fn gpuShots(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) LaneEr
                     .q_prev = s.sc.q_prev,
                     .i_prev = s.sc.i_prev,
                     .period = req.opts.period,
+                    .t_origin = req.opts.t_origin,
                     .n_samples = req.opts.n_samples,
                     .probes = req.probes,
                     .wave = req.wave,
@@ -401,7 +463,7 @@ fn gpuShots(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) LaneEr
             }
         }
         if (count == 0) break;
-        const options: converger.Options = .{ .max_iter = opts.max_newton_iter, .abstol = opts.newton_tol };
+        const options = period.stepOptions(opts);
         gpu_lanes.integrateFixed(gpa, periods[0..count], options, ok[0..count]) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => |e| return e,
             else => {
@@ -418,4 +480,21 @@ fn gpuShots(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) LaneEr
             live[l] = false;
         };
     }
+}
+
+test "pss step options: dv absent is the old literal field by field, and dv present is the transient step's reading" {
+    // Oracles: the literal the three call sites built before `dv`
+    // (`expectEqualDeep`, every field, so the absent case keeps its bits);
+    // and `converger.optionsFromTolerances`, the reading `Sim.newtonOptions`
+    // gives a transient step, for the dv field.
+    const absent: Options = .{ .period = 1e-6 };
+    try std.testing.expectEqualDeep(converger.Options{ .max_iter = absent.max_newton_iter, .abstol = absent.newton_tol }, period.stepOptions(absent));
+    var bounded = absent;
+    bounded.tol.dv = 0.5;
+    const got = period.stepOptions(bounded);
+    try std.testing.expectEqual(converger.optionsFromTolerances(bounded.tol, null).dv, got.dv);
+    try std.testing.expectEqual(@as(f64, 0.5), got.dv);
+    var rest = got;
+    rest.dv = std.math.inf(f64);
+    try std.testing.expectEqualDeep(period.stepOptions(absent), rest);
 }

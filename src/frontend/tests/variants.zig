@@ -4,8 +4,8 @@
 //! their seed/trial/site independence and LHS stratum coverage.
 const std = @import("std");
 const t = std.testing;
-const input = @import("../prepare.zig");
-const variants = @import("../variants.zig");
+const input = @import("../Jobs.zig");
+const variants = @import("../Jobs/variants.zig");
 const netlist = @import("netlist");
 const device = @import("device");
 
@@ -55,7 +55,7 @@ fn expectFastMatchesRebuild(src: []const u8, want: Want) !void {
     defer pa.deinit();
     var lib = try device.Library.init(t.allocator);
     defer lib.deinit();
-    var nl = try netlist.parse(pa.allocator(), src, .ngspice);
+    var nl = try netlist.parse(pa.allocator(), src);
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), nl);
     defer prepared.deinit();
     var planner = try variants.Planner.init(&lib, sa.allocator(), pa.allocator(), &nl, &prepared.circuit, prepared.deck.cards, "");
@@ -206,11 +206,11 @@ test "a top-level .if on a swept parameter holds only while its branch does" {
         \\.op
         \\.end
     ;
-    const same = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"2"}), .ngspice);
+    const same = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"2"}));
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), same);
     defer prepared.deinit();
     try t.expectEqual(@as(usize, 2), prepared.deck.variants.count());
-    const flips = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"3"}), .ngspice);
+    const flips = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"3"}));
     try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), flips));
 }
 
@@ -228,13 +228,13 @@ test "a MONTE run whose trial numbers pass u32 is refused, not wrapped" {
         \\.tran 1n 10n sweep monte=3 firstrun={s}
         \\.end
     ;
-    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"4294967293"}), .hspice);
+    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"4294967293"}));
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
     defer prepared.deinit();
     // The nominal run is no row; the three trials are.
     try t.expectEqual(@as(u32, 3), prepared.deck.variants.count());
     try t.expectEqualStrings("monte=4294967295", prepared.deck.variants.labels[2]);
-    const past = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"4294967294"}), .hspice);
+    const past = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{"4294967294"}));
     try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), past));
 }
 
@@ -255,7 +255,7 @@ test "SIGMA_SCALE plans MONTE trials per scale, numbered on from FIRSTRUN; LHS, 
         \\.meas tran m max v(in)
         \\.end
     ;
-    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ "", "5" }), .hspice);
+    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ "", "5" }));
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
     defer prepared.deinit();
     try t.expectEqual(@as(u32, 6), prepared.deck.variants.count());
@@ -272,7 +272,7 @@ test "SIGMA_SCALE plans MONTE trials per scale, numbered on from FIRSTRUN; LHS, 
         .{ "", "1", true },
         .{ "", "4294967291", false },
     }) |c| {
-        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ c[0], c[1] }), .hspice);
+        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ c[0], c[1] }));
         // `frontend.prepare` splits the `.alter` runs off the text.
         if (c[2]) refused.deck.alters = &.{"alter\nr1 in 0 2k\n.end\n"};
         try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), refused));
@@ -309,7 +309,7 @@ test ".wcd (#240): a coordinate per local-variation device, global-variation mod
         \\.meas dc m find v(a) at=10u
         \\.wcd m '<= 1'
         \\.end
-    , .hspice);
+    );
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
     defer prepared.deinit();
     const w = &prepared.wcd.?;
@@ -342,7 +342,7 @@ test ".wcd (#240): a coordinate per local-variation device, global-variation mod
         .{ "1", false },
         .{ "agauss(1, 0.1, 1)", true },
     }) |c| {
-        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{c[0]}), .hspice);
+        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{c[0]}));
         // `frontend.prepare` splits the `.alter` runs off the text.
         if (c[1]) refused.deck.alters = &.{"alter\nr1 in 0 2k\n.end\n"};
         try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), refused));
@@ -363,7 +363,7 @@ test "a MONTE sweep draws a distribution written in a .model card per trial (#10
         \\d1 a 0 dm
         \\.dc monte=2
         \\.end
-    , .ngspice);
+    );
     try t.expect(nl.live.site_keys.len != 0);
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), nl);
     defer prepared.deinit();
@@ -402,7 +402,7 @@ test "points a B source reads rebuild as runs of their own, at their own values"
         \\.step param g list 1 2 3
         \\.op
         \\.end
-    , .ngspice);
+    );
     var stepped = try input.build(&lib, sa.allocator(), pa.allocator(), step);
     defer stepped.deinit();
     // The nominal point stays a row; the two others rebuild.
@@ -425,7 +425,7 @@ test "points a B source reads rebuild as runs of their own, at their own values"
         \\.step param g list 2 3
         \\.op
         \\.end
-    , .ngspice);
+    );
     var rebuilt_all = try input.build(&lib, sa.allocator(), pa.allocator(), all);
     defer rebuilt_all.deinit();
     try t.expectEqual(@as(usize, 0), rebuilt_all.deck.queries.len);
@@ -448,7 +448,7 @@ test "mismatch groups from the probe's map match one rebuild per site, zero slot
         \\.model dm d is='1e-14*(1+agauss(0,0.1,1))' tt='agauss(0,1n,1)'
         \\.dcmatch v(a)
         \\.end
-    , .ngspice);
+    );
     var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), nl);
     defer prepared.deinit();
     var fast = try variants.Planner.init(&lib, sa.allocator(), pa.allocator(), &nl, &prepared.circuit, prepared.deck.cards, "");

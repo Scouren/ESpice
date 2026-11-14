@@ -7,12 +7,14 @@
 //! - `pub const QuerySchema = struct`
 //! - `pub const Schema = struct`
 //! - `pub const Result = struct`
+//! - `pub const Step = struct`
 //! - `pub const Emir = struct`
 //! - `pub const EmirTerminal = struct`
 //! - `pub const Measured = struct`, `Measured.Found = struct`
 
 const std = @import("std");
 const Kind = @import("query.zig").Kind;
+const Method = @import("query.zig").Method;
 
 /// What a query will publish, known before it runs: enough for an output
 /// format to refuse it up front (`analysis.schemaOf`, `output.validateQuery`).
@@ -61,10 +63,27 @@ pub const Result = struct {
     /// A transient's device terminal currents under `PointOptions.emir`
     /// (#237); no terminals without it.
     emir: Emir = .{},
+    /// A transient's step to each row of `data` (`Tran.point.steps`):
+    /// device operating-point variables replay the integrator over them
+    /// (#236). Empty without them.
+    steps: []const Step = &.{},
     /// The excursions `.option soa` found over this result's rows (#238),
     /// which a `.meas` PARAM `soa_count()` reads; NaN where none was
     /// counted (no limit, or a result the check does not read).
     soa_count: f64 = std.math.nan(f64),
+};
+
+/// The accepted transient step that reached a row: its size in seconds and
+/// the method the integrator took it with. A run's first row, which no
+/// step reached, has `h` 0. One per recorded row, kept only for a run
+/// whose deck saves device operating-point variables.
+pub const Step = struct {
+    h: f64,
+    method: Method,
+
+    comptime {
+        std.debug.assert(@sizeOf(Step) == 16);
+    }
 };
 
 /// `--emir` (#237): the window a transient's terminal currents were read

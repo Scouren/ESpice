@@ -18,9 +18,15 @@
     nix-bundle.inputs.utils.follows = "flake-utils";
     # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
     # a git flake leaves submodules out of its source.
-    conformance.url = "github:OpenFAT/VAMS-Conformance-Suite";
+    # git+https, not github: GitHub's tarball of one commit gave two NAR hashes.
+    conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=dev/perf-oracles&rev=c0348882ff257bef9ff85a35a398559a7271073d";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
+    # SpiceRack's source, for spice2rack (`--to espice --kit`): the CLI runs it
+    # on every non-ngspice deck. Its own flake pulls two ESPice revs, so this
+    # takes the source alone and builds the one binary below.
+    spicerack.url = "git+https://github.com/Scouren/SpiceRack?ref=espice-kit&rev=231d9c9c34ac142c55d06a9a985739afb160b1ab";
+    spicerack.flake = false;
   };
 
   outputs =
@@ -31,6 +37,7 @@
       zig-overlay,
       nix-bundle,
       conformance,
+      spicerack,
       ...
     }:
     {
@@ -121,7 +128,7 @@
             cp -r "$TMPDIR/zgc/p" "$out"
           '';
           outputHashMode = "recursive";
-          outputHash = "sha256-0xTxuzM+MrMyXFzwbB65XsPOoepj/8qZLoidVetVqzA=";
+          outputHash = "sha256-7LmNaPR4saH1PfSFLQU2cgZltfLCGlj+chCDcZVArMI=";
         };
 
         gpuPkgs = lib.optionals pkgs.stdenv.isLinux (
@@ -136,11 +143,26 @@
         # The reference simulators come from the conformance suite's flake.
         refPkgs = conformance.packages.${system};
 
+        # SpiceRack's translator, which the CLI finds on PATH or by ESPICE_SPICERACK.
+        spice2rack = pkgs.rustPlatform.buildRustPackage {
+          pname = "spice2rack";
+          version = (lib.importTOML "${spicerack}/Cargo.toml").package.version;
+          src = spicerack;
+          cargoLock.lockFile = "${spicerack}/Cargo.lock";
+          buildNoDefaultFeatures = true;
+          cargoBuildFlags = [ "--bin" "spice2rack" ];
+          # Its suites need the reference simulators; SpiceRack's CI runs them.
+          doCheck = false;
+          meta.mainProgram = "spice2rack";
+        };
+        version = builtins.head (builtins.match ''.*\.version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon));
+
         devShells = rec {
           ci = pkgs.mkShell {
             packages = [
               zig
               pkgs.python3
+              spice2rack
             ];
             # One global cache per Zig store path: two builds of the same Zig version
             # sharing ~/.cache/zig evict each other's build runner on every `zig build`.
@@ -181,6 +203,14 @@
           ) (builtins.filter (backend: builtins.elem system backend.systems) releaseTargets.backends)
         ) (builtins.filter (host: host.system == system) releaseTargets.hosts);
 
+        # In a .run bundle (`bundlers`), the caller's directory: relative
+        # decks and outputs resolve there, never in the bundle's /.
+        callerDir = ''
+          if [ -n "''${ESPICE_CALLER_PWD-}" ]; then
+            cd "$ESPICE_CALLER_PWD" || { echo "espice: the bundle cannot see $ESPICE_CALLER_PWD; run it from under /home or /tmp, or pass absolute paths" >&2; exit 1; }
+            unset ESPICE_CALLER_PWD
+          fi
+        '';
         mkEspice =
           {
             name ? "espice",
@@ -191,8 +221,7 @@
           }:
           pkgs.stdenv.mkDerivation {
             pname = name;
-            version = "0.3.0";
-            inherit src;
+            inherit version src;
             nativeBuildInputs = [
               zig
               pkgs.makeWrapper
@@ -209,6 +238,8 @@
                 -Dhip-arch=${hip} -Dcuda-arch=${cuda} \
                 -j$NIX_BUILD_CORES --prefix "$out"
               wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig \
+                --set-default ESPICE_SPICERACK ${lib.getExe spice2rack} \
+                --run ${lib.escapeShellArg callerDir} \
                 ${lib.optionalString (hip != "none")
                   "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.rocmPackages.clr ]}"
                 }
@@ -249,7 +280,7 @@
 
         packages = {
           default = espice;
-          inherit espice;
+          inherit espice spice2rack;
         }
         // releases
         // lib.optionalAttrs (latest != null) { inherit latest; }
@@ -274,8 +305,19 @@
           "espice-${baselineName}-cuda-sm_75" = espiceCuda;
         };
 
+        # nix-bundle's launcher cds into its cache before it runs anything,
+        # so the .run records the caller's directory first and espice's
+        # wrapper returns there (`callerDir`).
         bundlers = lib.optionalAttrs pkgs.stdenv.isLinux {
-          default = nix-bundle.bundlers.${system}.default;
+          default =
+            drv:
+            pkgs.runCommand "${drv.name}.run" { } ''
+              {
+                printf '#!/bin/sh\nESPICE_CALLER_PWD=$PWD; export ESPICE_CALLER_PWD\n'
+                cat ${nix-bundle.bundlers.${system}.default drv}
+              } > $out
+              chmod +x $out
+            '';
         };
 
         checks = {

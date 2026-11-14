@@ -8,6 +8,8 @@
 //!
 //! Contents:
 //! - `pub const Coeffs = struct { ag0: f64, ag2: f64, ag1: f64 = 1 }`
+//! - `pub const StepCoeffs = struct { c: Coeffs, ag: [7]f64 }`
+//! - `pub const Companion = struct` (`applyRows`)
 //! - `pub const LteIn = struct`
 //! - `pub const LteDiagnostic = struct`
 //! - `pub fn coeffs(method: Method, dt: f64, dt_prev: f64, xmu: f64) Coeffs`
@@ -15,6 +17,7 @@
 //! - `pub fn gear(k: u8) Method`
 //! - `pub fn maxGrowth(method: Method) f64`
 //! - `pub fn gearAg(k: u8, dts: []const f64) [7]f64`
+//! - `pub fn stepCoeffs(method: Method, dts: []const f64, xmu: f64) StepCoeffs`
 //! - `pub fn gearHistory(g: []f64, q: []const []f64, ag: [7]f64) void`
 //! - `pub fn lteCoeff(method: Method) f64`
 //! - `pub fn advanceCurrent(method: Method, i_cur: []f64, q0: []const f64, q1: []const f64, q2: []const f64, c: Coeffs) void`
@@ -25,10 +28,14 @@
 //! - `pub fn diagnoseBound(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) LteDiagnostic`
 //! - `pub fn stepBound(comptime w: usize, method: Method, cur_method: Method, q: [4][]const f64, i_prev: []const f64, c: Coeffs, lte: LteIn) f64`
 //! - `pub fn stepBoundGear(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) f64`
+//! - `pub fn stepBoundGearLanes(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) f64`
+//! - `pub fn stepBoundMin(comptime w: usize, method: Method, cur_method: Method, q: [4][]const f64, i_prev: []const f64, c: Coeffs, lte: LteIn) f64`
+//! - `pub fn boundRoot(method: Method, min_del: f64) f64`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
+const gmath = @import("gompute").math;
 const Method = @import("types.zig").Method;
 
 /// Integration coefficients, ngspice `CKTag[]` (nicomcof.c). `ag0` multiplies
@@ -41,6 +48,36 @@ const Method = @import("types.zig").Method;
 ///   gear-2:  ag0*(q - q1) - ag2*(q1 - q2)
 ///   gear-k:  ag0*(q - q1) - g, g = `gearHistory` of the step (k = 3..6)
 pub const Coeffs = struct { ag0: f64, ag2: f64, ag1: f64 = 1 };
+
+/// One step's companion coefficients: `c`, and at gear-3..6 `gearAg`'s `ag`
+/// (`c.ag0 = ag[0]`), zeros below (`stepCoeffs`).
+pub const StepCoeffs = struct { c: Coeffs, ag: [7]f64 };
+
+/// One step's companion operands, as `Hook(null).assemble` passes them to
+/// `companionAt`: lever C7 hands them to ParEval, whose reduce adds each
+/// row's companion term once the row's rhs and q are summed.
+pub const Companion = struct {
+    method: Method,
+    q1: []const f64,
+    q2: []const f64,
+    i_prev: []const f64,
+    c: Coeffs,
+
+    /// `companionAt(method, true, ...)` over rows `[lo, hi)` of `rhs`, with
+    /// `q0` the summed charge plane: bitwise the rows a whole-plane call
+    /// writes there, since `companionAt` rounds every element alike
+    /// wherever it sits in the slice. A history the method does not read
+    /// may be shorter than `hi`.
+    pub fn applyRows(self: Companion, rhs: []f64, q0: []const f64, lo: usize, hi: usize) void {
+        assert(lo <= hi);
+        assert(hi <= rhs.len and hi <= q0.len);
+        const q2 = if (self.q2.len >= hi) self.q2[lo..hi] else &.{};
+        const ip = if (self.i_prev.len >= hi) self.i_prev[lo..hi] else &.{};
+        switch (self.method) {
+            inline else => |m| companionAt(m, true, rhs[lo..hi], q0[lo..hi], self.q1[lo..hi], q2, ip, self.c),
+        }
+    }
+};
 
 /// Step history and tolerances for one `stepBound`: `dt` is the step just
 /// taken, `dt1`/`dt2` the two before it, all in seconds.
@@ -192,6 +229,20 @@ pub fn gearAg(k: u8, dts: []const f64) [7]f64 {
     return ag;
 }
 
+/// The coefficients of a step of `method` whose history is `dts` = [dt,
+/// dt_prev, ...] (seconds, newest first): `gearAg` at gear-3..6, which reads
+/// `order(method)` of them, else `coeffs`, which reads two. `Sim.begin`
+/// takes its attempt's here and `post/opvars.zig` replays a run's.
+pub fn stepCoeffs(method: Method, dts: []const f64, xmu: f64) StepCoeffs {
+    const k = order(method);
+    if (k >= 3) {
+        const ag = gearAg(k, dts);
+        return .{ .c = .{ .ag0 = ag[0], .ag2 = 0 }, .ag = ag };
+    }
+    assert(dts.len >= 2);
+    return .{ .c = coeffs(method, dts[0], dts[1], xmu), .ag = @splat(0) };
+}
+
 /// Writes the constant part of an order-k Gear step's dynamic current over
 /// one index space, g = sum over i = 2..k of ag[i]*(q[1] - q[i]), so that
 /// i = ag[0]*(q[0] - q[1]) - g. `q` is the history [cur, prev, ...] of k + 1
@@ -302,7 +353,19 @@ pub fn Hook(comptime fixed: ?Method) type {
         /// Stamps the planes at `x` and adds the companion's dynamic current
         /// to the residual rows.
         pub fn assemble(self: *const Self, ckt: anytype, x: []const f64, t: f64) void {
-            if (fixed == null and self.has_charge) ckt.evalNewtonGC(x, t, self.c.ag0) else ckt.evalNewton(x, t);
+            if (comptime fixed == null) {
+                if (self.has_charge) {
+                    // C7: the threaded reduce adds the companion rows too.
+                    if (ckt.reduce_a) return ckt.evalNewtonGCWith(x, t, self.c.ag0, .{
+                        .method = self.method,
+                        .q1 = self.q_prev,
+                        .q2 = self.q_prev2,
+                        .i_prev = self.i_prev,
+                        .c = self.c,
+                    });
+                    ckt.evalNewtonGC(x, t, self.c.ag0);
+                } else ckt.evalNewton(x, t);
+            } else ckt.evalNewton(x, t);
             if (!self.has_charge) return;
             const n: usize = ckt.n;
             if (fixed) |m| {
@@ -444,11 +507,56 @@ pub fn stepBound(comptime w: usize, method: Method, cur_method: Method, q: [4][]
 /// `gearHistory` when `cur_method` is gear-3..6. NaN as `stepBound`.
 /// Asserts order(method) + 2 history slots and order(method) + 1 steps.
 pub fn stepBoundGear(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) f64 {
+    return stepBoundGearMin(false, method, cur_method, q, i_prev, g, c, lte, dts);
+}
+
+/// `stepBoundGear` bit for bit, with the minimum over states kept in `W`
+/// running lanes instead of one chain (N7, docs/perf_research/
+/// 09-after-the-levers.md). Each state's del rounds as before, in index
+/// order; only the min is regrouped, which is exact: a NaN del already
+/// returns NaN through the poison, and no del is -0 (trtol, the
+/// tolerances and the steps are positive), so the min of the rest is one
+/// value in any order.
+pub fn stepBoundGearLanes(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) f64 {
+    return stepBoundGearMin(true, method, cur_method, q, i_prev, g, c, lte, dts);
+}
+
+/// `stepBound` before its root: the min over the states of del_j, or NaN
+/// as `stepBound` gives it; `boundRoot(method, stepBoundMin(...))` is
+/// `stepBound`'s bits. Over a sub-range of the states it is that range's
+/// min (N7 on lanes, `bound_lanes.zig`): each state rounds alike wherever
+/// it sits, so a range split at a multiple of `w` changes no del.
+pub fn stepBoundMin(comptime w: usize, method: Method, cur_method: Method, q: [4][]const f64, i_prev: []const f64, c: Coeffs, lte: LteIn) f64 {
+    for (q) |h| assert(h.len == i_prev.len);
+    assert(order(method) <= 2 and order(cur_method) <= 2);
+    return switch (method) {
+        inline .backward_euler, .trapezoidal, .gear_2 => |m| switch (cur_method) {
+            inline .backward_euler, .trapezoidal, .gear_2 => |cm| minDel(w, m, cm, q, i_prev, c, lte),
+            .gear_3, .gear_4, .gear_5, .gear_6 => unreachable,
+        },
+        .gear_3, .gear_4, .gear_5, .gear_6 => unreachable,
+    };
+}
+
+/// `stepBound`'s last step: the order-2 root of the min, none at BE.
+pub fn boundRoot(method: Method, min_del: f64) f64 {
+    assert(order(method) <= 2);
+    assert(!(min_del < 0));
+    return if (method == .backward_euler) min_del else @sqrt(min_del);
+}
+
+// ---- private ----
+
+/// The body of `stepBoundGear`; `lanes` picks `stepBoundGearLanes`' min.
+fn stepBoundGearMin(comptime lanes: bool, method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) f64 {
     const p = order(method);
     assert(q.len >= p + 2);
     assert(dts.len >= p + 1);
     const coeff = lteCoeff(method);
     var min_del = std.math.inf(f64);
+    // `lanes`: state j's del joins running min j % W.
+    var mins: [W]f64 = @splat(std.math.inf(f64));
+    var lane: usize = 0;
     // NaN once a read entry is NaN or inf, as in `minDel`.
     var poison: f64 = 0;
     for (0..q[0].len) |j| {
@@ -470,17 +578,22 @@ pub fn stepBoundGear(method: Method, cur_method: Method, q: []const []const f64,
         const del = lte.trtol * tol / @max(lte.abstol, coeff * @abs(dividedDifference(p, diff, dts)));
         for (q[0 .. p + 2]) |h| poison += h[j] - h[j];
         poison += (ip - ip) + (i_new - i_new) + if (del == del) 0 else del;
-        min_del = @min(min_del, del);
+        if (lanes) {
+            mins[lane] = @min(mins[lane], del);
+            lane = if (lane + 1 == W) 0 else lane + 1;
+        } else min_del = @min(min_del, del);
     }
     if (std.math.isNan(poison)) return std.math.nan(f64);
+    if (lanes) min_del = @reduce(.Min, @as(@Vector(W, f64), mins));
+    assert(lane < W);
     return switch (p) {
         1 => min_del,
         2 => @sqrt(min_del),
-        else => @exp(@log(min_del) / @as(f64, @floatFromInt(p))),
+        // gompute's exp and log, as the lane kernels take (kernels/lane_step.zig):
+        // the two bounds agree bitwise (tran/gpu_gear_test.zig).
+        else => gmath.exp(gmath.log(min_del) / @as(f64, @floatFromInt(p))),
     };
 }
-
-// ---- private ----
 
 inline fn companionLane(
     comptime w: usize,

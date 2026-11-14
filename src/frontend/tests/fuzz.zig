@@ -5,16 +5,14 @@
 //! no leak, no error outside the set; the same digest on a second parse
 //! (determinism); the same digest after a transform the grammar says
 //! changes nothing (a comment line inserted, the deck uppercased, a card
-//! split onto a `+` continuation); the same raw tables, ids and order with
-//! the device cards scanned on 8 threads as read whole (#230); and an
+//! split onto a `+` continuation); and an
 //! injected allocation failure that surfaces as `OutOfMemory`, never as a
 //! panic or another error.
 //! `fuzz_corpus/` holds the seed decks and every input a fuzz run found;
 //! plain `zig build test` replays it.
 const std = @import("std");
-const netlist = @import("../netlist.zig");
+const netlist = @import("../Netlist.zig");
 const Smith = std.testing.Smith;
-const Dialect = netlist.Dialect;
 const Netlist = netlist.Netlist;
 const Value = netlist.Value;
 /// Drives the structured generator from a seeded PRNG, so the merge gate
@@ -47,11 +45,32 @@ const Outcome = union(enum) {
     }
 };
 
-fn outcome(gpa: std.mem.Allocator, src: []const u8, dialect: Dialect) Outcome {
+fn outcome(gpa: std.mem.Allocator, src: []const u8) Outcome {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const nl = netlist.parse(arena.allocator(), src, dialect) catch |err| return .{ .err = err };
+    const nl = netlist.parse(arena.allocator(), src) catch |err| return .{ .err = err };
     return .{ .digest = digest(&nl) };
+}
+
+/// `outcome` with the reader's `k`-th allocation failing. The failing
+/// allocator sits above the arena, so `k` counts the reader's own
+/// requests and names the same one on every run; under the arena it
+/// counted the arena's, which follow the backing allocator's state.
+fn outcomeFailing(gpa: std.mem.Allocator, src: []const u8, k: usize) struct { Outcome, bool } {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = k, .resize_fail_index = k });
+    const got: Outcome = if (netlist.parse(failing.allocator(), src)) |nl| .{ .digest = digest(&nl) } else |err| .{ .err = err };
+    return .{ got, failing.has_induced_failure };
+}
+
+/// The reader's allocation requests for a clean parse of `src`.
+fn allocations(gpa: std.mem.Allocator, src: []const u8) usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var counting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    _ = netlist.parse(counting.allocator(), src) catch {};
+    return counting.allocations;
 }
 
 /// Hashes the devices (name, letter, pins by net name, values, model),
@@ -124,98 +143,6 @@ fn digest(nl: *const Netlist) u64 {
     return h.final();
 }
 
-/// `outcome` reading device cards per `opts`, digested by `exactDigest`.
-fn exactOutcome(gpa: std.mem.Allocator, src: []const u8, dialect: Dialect, opts: netlist.ParseOptions) Outcome {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const nl = netlist.parseWith(arena.allocator(), src, dialect, opts) catch |err| return .{ .err = err };
-    return .{ .digest = exactDigest(&nl) };
-}
-
-/// Hashes the raw tables a parse builds, ids and row order included: the
-/// name pool, each net's name id, each device's columns and pin vertex
-/// ids, the value, key-value, op and constant rows, the models and the
-/// live tables. `digest` hashes pins by net name, so it cannot tell two
-/// parses that number the same nets differently apart (#230).
-fn exactDigest(nl: *const Netlist) u64 {
-    var h: std.hash.Wyhash = .init(0);
-    const D = struct {
-        fn int(hh: *std.hash.Wyhash, x: u64) void {
-            hh.update(std.mem.asBytes(&x));
-        }
-        fn blob(hh: *std.hash.Wyhash, b: []const u8) void {
-            int(hh, b.len);
-            hh.update(b);
-        }
-        fn val(hh: *std.hash.Wyhash, v: Value) void {
-            int(hh, @backingInt(std.meta.activeTag(v)));
-            switch (v) {
-                .num => |x| int(hh, @bitCast(x)),
-                .name => |s| blob(hh, s),
-                .expr => |span| {
-                    int(hh, span.start);
-                    int(hh, span.len);
-                },
-                .group => |g| {
-                    int(hh, g.items.len);
-                    for (g.items) |item| val(hh, item);
-                },
-            }
-        }
-        fn kvs(hh: *std.hash.Wyhash, items: []const netlist.Kv) void {
-            int(hh, items.len);
-            for (items) |kv| {
-                blob(hh, kv.key);
-                val(hh, kv.value);
-            }
-        }
-    };
-    const edges = &nl.graph.edges;
-    D.blob(&h, nl.pool.bytes.items);
-    D.blob(&h, std.mem.sliceAsBytes(nl.pool.offs.items));
-    D.blob(&h, std.mem.sliceAsBytes(nl.graph.vertices.items(.name)));
-    D.blob(&h, edges.items(.kind));
-    D.blob(&h, std.mem.sliceAsBytes(edges.items(.name)));
-    D.blob(&h, std.mem.sliceAsBytes(edges.items(.model)));
-    D.blob(&h, std.mem.sliceAsBytes(edges.items(.positional)));
-    D.blob(&h, std.mem.sliceAsBytes(edges.items(.kv)));
-    D.blob(&h, std.mem.sliceAsBytes(edges.items(.subckt_instance)));
-    D.blob(&h, std.mem.sliceAsBytes(nl.graph.offsets));
-    D.blob(&h, std.mem.sliceAsBytes(nl.graph.members));
-    D.blob(&h, std.mem.sliceAsBytes(nl.order));
-    D.blob(&h, std.mem.asBytes(&nl.kind_starts));
-    D.int(&h, nl.values.len);
-    for (nl.values) |v| D.val(&h, v);
-    D.kvs(&h, nl.kvs);
-    D.int(&h, nl.ops.len);
-    for (nl.ops) |op| {
-        D.int(&h, @backingInt(op.code));
-        D.int(&h, op.a);
-        D.int(&h, op.b);
-    }
-    D.blob(&h, std.mem.sliceAsBytes(nl.consts));
-    D.int(&h, nl.models.len);
-    for (nl.models) |m| {
-        D.blob(&h, m.name);
-        D.blob(&h, m.kind);
-        D.kvs(&h, m.kv);
-    }
-    D.int(&h, nl.live.slots.len);
-    for (nl.live.slots) |at| {
-        D.int(&h, at.row);
-        D.int(&h, at.arg);
-        D.int(&h, @backingInt(at.table));
-    }
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.ops));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.scale));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.site_ops));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.site_keys));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.pool_rows));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.bins.edges));
-    D.blob(&h, std.mem.sliceAsBytes(nl.live.bins.rows));
-    return h.final();
-}
-
 /// Three `outer` instances of two `inner` instances each, whose cards read
 /// literals, instance parameters, defaults and shadowed globals. `copies`
 /// gives every instance its own textual copy of its subcircuit.
@@ -251,23 +178,17 @@ fn instancedDeck(a: std.mem.Allocator, copies: bool) ![]const u8 {
 }
 
 /// The full oracle on one deck. `src` drives the transforms' choices.
-fn check(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8, dialect: Dialect) !void {
-    const base = outcome(gpa, deck_text, dialect);
-    try expectSame("a second parse", base, outcome(gpa, deck_text, dialect), deck_text, deck_text);
-    // Every card read whole is the oracle of the scan (#230): on 8 threads
-    // it must build the same tables, ids and order.
-    const whole = exactOutcome(gpa, deck_text, dialect, .{ .threads = 0 });
-    try expectSame("device cards scanned on 8 threads", whole, exactOutcome(gpa, deck_text, dialect, .{ .threads = 8, .scan_min = 0 }), deck_text, deck_text);
+fn check(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8) !void {
+    const base = outcome(gpa, deck_text);
+    try expectSame("a second parse", base, outcome(gpa, deck_text), deck_text, deck_text);
     var buf: [transformed_max]u8 = undefined;
-    if (withComment(src, deck_text, dialect, &buf)) |t|
-        try expectSame("an inserted comment line", base, outcome(gpa, t, dialect), deck_text, t);
-    if (dialect != .spectre) {
-        const t = uppercased(deck_text, &buf);
-        try expectSame("the deck uppercased", base, outcome(gpa, t, dialect), deck_text, t);
-    }
-    if (dialect == .ngspice) if (withContinuation(src, deck_text, &buf)) |t|
-        try expectSame("a card split onto a `+` line", base, outcome(gpa, t, dialect), deck_text, t);
-    try failOnce(gpa, src, deck_text, dialect, base);
+    if (withComment(src, deck_text, &buf)) |t|
+        try expectSame("an inserted comment line", base, outcome(gpa, t), deck_text, t);
+    const upper = uppercased(deck_text, &buf);
+    try expectSame("the deck uppercased", base, outcome(gpa, upper), deck_text, upper);
+    if (withContinuation(src, deck_text, &buf)) |t|
+        try expectSame("a card split onto a `+` line", base, outcome(gpa, t), deck_text, t);
+    try failOnce(gpa, src, deck_text, base);
 }
 
 fn expectSame(what: []const u8, want: Outcome, got: Outcome, before: []const u8, after: []const u8) !void {
@@ -279,23 +200,21 @@ fn expectSame(what: []const u8, want: Outcome, got: Outcome, before: []const u8,
 /// Parses once with the `k`-th allocation failing, `k` drawn below the
 /// count a clean parse makes: the parse must fail with `OutOfMemory`, or
 /// with the clean parse's own error when it stops before reaching `k`.
-fn failOnce(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8, dialect: Dialect, base: Outcome) !void {
-    var counting = std.testing.FailingAllocator.init(gpa, .{});
-    _ = outcome(counting.allocator(), deck_text, dialect);
-    if (counting.allocations == 0) return;
-    const k = src.index(counting.allocations);
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = k, .resize_fail_index = k });
-    const got = outcome(failing.allocator(), deck_text, dialect);
+fn failOnce(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8, base: Outcome) !void {
+    const n = allocations(gpa, deck_text);
+    if (n == 0) return;
+    const k = src.index(n);
+    const got, const induced = outcomeFailing(gpa, deck_text, k);
     if (got == .err and got.err == error.OutOfMemory) return;
-    if (!failing.has_induced_failure and base.eql(got)) return;
+    if (!induced and base.eql(got)) return;
     std.debug.print("allocation {d} failing gave {any}, clean parse {any}:\n{s}\n", .{ k, got, base, deck_text });
     return error.TestUnexpectedResult;
 }
 
 /// `text` with a `* fuzz` comment line after a random line past the
-/// title; null when the line continues onto the next (`\\`, or HSPICE's
-/// and Spectre's trailing `\`), where a comment would end the card.
-fn withComment(src: anytype, text: []const u8, dialect: Dialect, buf: []u8) ?[]const u8 {
+/// title; null when the line continues onto the next (`\\`), where a
+/// comment would end the card.
+fn withComment(src: anytype, text: []const u8, buf: []u8) ?[]const u8 {
     const count = std.mem.countScalar(u8, text, '\n');
     if (count == 0) return null;
     const after = 1 + src.index(count); // 1-based line, never before the title
@@ -309,14 +228,14 @@ fn withComment(src: anytype, text: []const u8, dialect: Dialect, buf: []u8) ?[]c
         w.writeByte('\n') catch return null;
         if (k != after) continue;
         const t = std.mem.trimEnd(u8, line, " \t\r");
-        if (std.mem.endsWith(u8, t, "\\") and (dialect != .ngspice or std.mem.endsWith(u8, t, "\\\\"))) return null;
+        if (std.mem.endsWith(u8, t, "\\\\")) return null;
         w.writeAll("* fuzz\n") catch return null;
     }
     return w.buffered();
 }
 
-/// `text` with every byte past the title uppercased: the ngspice and
-/// HSPICE dialects fold case before reading a card.
+/// `text` with every byte past the title uppercased: the reader folds case
+/// before reading a card.
 fn uppercased(text: []const u8, buf: []u8) []const u8 {
     const title = (std.mem.indexOfScalar(u8, text, '\n') orelse text.len);
     @memcpy(buf[0..text.len], text);
@@ -382,23 +301,22 @@ fn withContinuation(src: anytype, text: []const u8, buf: []u8) ?[]const u8 {
 }
 
 fn rawBytes(_: void, s: *Smith) anyerror!void {
-    const dialect = s.value(Dialect);
     var buf: [deck_max]u8 = undefined;
     const text = buf[0..s.slice(&buf)];
     // Raw bytes rarely parse; the transforms need a deck that does.
-    _ = outcome(std.testing.allocator, text, dialect);
+    _ = outcome(std.testing.allocator, text);
 }
 
 fn structured(_: void, s: *Smith) anyerror!void {
     var buf: [deck_max]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    const dialect = deck(s, &w);
-    try check(std.testing.allocator, s, w.buffered(), dialect);
+    deck(s, &w);
+    try check(std.testing.allocator, s, w.buffered());
 }
 
-/// One raw-mode corpus entry: what `rawBytes` reads back as `dialect`, `text`.
-fn raw(comptime dialect: Dialect, comptime text: []const u8) []const u8 {
-    return std.mem.toBytes(@as(u64, @backingInt(dialect))) ++ std.mem.toBytes(std.mem.nativeToLittle(u32, text.len)) ++ text;
+/// One raw-mode corpus entry: what `rawBytes` reads back as `text`.
+fn raw(comptime text: []const u8) []const u8 {
+    return std.mem.toBytes(std.mem.nativeToLittle(u32, text.len)) ++ text;
 }
 
 const seeds = [_][]const u8{
@@ -410,12 +328,10 @@ const seeds = [_][]const u8{
     @embedFile("fuzz_corpus/step_param_divider.sp"),    @embedFile("fuzz_corpus/subckt_params.sp"),
 };
 
-/// Every seed in every dialect.
+/// Every seed as a raw-mode entry.
 const raw_corpus = blk: {
-    var out: [seeds.len * 3][]const u8 = undefined;
-    for (seeds, 0..) |text, i| {
-        for (std.enums.values(Dialect), 0..) |d, k| out[i * 3 + k] = raw(d, text);
-    }
+    var out: [seeds.len][]const u8 = undefined;
+    for (seeds, &out) |text, *o| o.* = raw(text);
     break :blk out;
 };
 
@@ -437,19 +353,36 @@ test "netlist.parse holds every oracle on 1000 seeded generated decks" {
     var parsed: usize = 0;
     for (0..1000) |_| {
         var w: std.Io.Writer = .fixed(&buf);
-        const dialect = deck(&src, &w);
-        try check(std.testing.allocator, &src, w.buffered(), dialect);
-        parsed += @intFromBool(outcome(std.testing.allocator, w.buffered(), dialect) == .digest);
+        deck(&src, &w);
+        try check(std.testing.allocator, &src, w.buffered());
+        parsed += @intFromBool(outcome(std.testing.allocator, w.buffered()) == .digest);
     }
     // The generator is only worth its oracles while most decks parse.
     try std.testing.expect(parsed > 300);
 }
 
-test "the seed decks hold every oracle in every dialect" {
+test "a read that stops with no refusal fails with OutOfMemory at every allocation, the unreadable note's included" {
+    // Oracle: the contract, every induced failure is `OutOfMemory`. The
+    // `.if` over a probe stops the read with no refusal naming the card,
+    // so its errdefer records the "cannot read the card" note last. Red
+    // before the reserved row: that note's allocation failed under
+    // `catch {}` and the parse returned the clean `ParseError`.
+    const text = "t\n.if (v(a))\nr1 a 0 1\n.endif\n.end\n";
+    try std.testing.expectEqual(Outcome{ .err = error.ParseError }, outcome(std.testing.allocator, text));
+    const n = allocations(std.testing.allocator, text);
+    try std.testing.expect(n > 0);
+    for (0..n) |k| {
+        const got, const induced = outcomeFailing(std.testing.allocator, text, k);
+        try std.testing.expect(induced);
+        try std.testing.expectEqual(Outcome{ .err = error.OutOfMemory }, got);
+    }
+}
+
+test "the seed decks hold every oracle" {
     std.testing.log_level = .err;
     var prng: std.Random.DefaultPrng = .init(0xc0de);
     var src: Seeded = .{ .r = prng.random() };
-    for (seeds) |text| for (std.enums.values(Dialect)) |d| try check(std.testing.allocator, &src, text, d);
+    for (seeds) |text| try check(std.testing.allocator, &src, text);
 }
 
 test "a body card replayed per instance digests as the same card read once per copy" {
@@ -462,64 +395,9 @@ test "a body card replayed per instance digests as the same card read once per c
     const a = arena.allocator();
     const one = try instancedDeck(a, false);
     const copies = try instancedDeck(a, true);
-    const shared = outcome(std.testing.allocator, one, .ngspice);
+    const shared = outcome(std.testing.allocator, one);
     try std.testing.expect(shared == .digest);
-    try expectSame("one body copy per instance", shared, outcome(std.testing.allocator, copies, .ngspice), one, copies);
-}
-
-test "device cards scanned on 1 or 8 threads build the tables a whole read builds" {
-    // Oracle: a second implementation. With `threads = 0` `readDevice`
-    // reads every card whole, as before the scan (#230); a scan on 1 or 8
-    // threads must leave every table, id and row order as that read does.
-    // The cards mix scanned forms (literals, braces, names, `(` nodes,
-    // terminals `splitTerminals` moves) with ones the scan leaves whole
-    // (a named kv value, a group, X, B, E, a behavioural R), and `cv` is
-    // swept, so the read of each scanned card still appends ops.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(a,
-        \\scan
-        \\.param rv=2k cv=1p wp=1u
-        \\.model nch nmos level=1
-        \\.model rm r
-        \\.model dm d
-        \\.model qm npn
-        \\.subckt cell p q
-        \\r1 p q 1k
-        \\.ends
-        \\
-    );
-    for (0..300) |k| try text.print(a,
-        \\r{[k]d} na{[k]d} nb{[k]d} 1k
-        \\rb{[k]d} nb{[k]d} 0 {{rv*2}}
-        \\rc{[k]d} nb{[k]d} 0 rv
-        \\rd{[k]d} nb{[k]d} 0 2k rm
-        \\ry{[k]d} nb{[k]d} 0 {{1000*(1+v(na{[k]d}))}}
-        \\c{[k]d} na{[k]d} 0 cv m=2
-        \\m{[k]d} nd{[k]d} na{[k]d} 0 0 nch w=1u l=0.18u
-        \\mb{[k]d} nd{[k]d} na{[k]d} 0 nch w=2u
-        \\mc{[k]d} nd{[k]d} na{[k]d} 0 0 0 nch
-        \\me{[k]d} nd{[k]d} na{[k]d} 0 0 nch w=wp
-        \\d{[k]d} na{[k]d} 0 dm
-        \\q{[k]d} (nc{[k]d} na{[k]d} 0) qm area=2
-        \\l{[k]d} na{[k]d} 0 1u
-        \\k{[k]d} l{[k]d} l{[k]d} 0.5
-        \\v{[k]d} na{[k]d} 0 dc 1 pulse(0 1 0 1n 1n 5n 10n)
-        \\i{[k]d} 0 na{[k]d} 1m
-        \\x{[k]d} na{[k]d} nb{[k]d} cell
-        \\b{[k]d} na{[k]d} 0 i={{v(na{[k]d})*0.001}}
-        \\e{[k]d} na{[k]d} 0 nb{[k]d} 0 2
-        \\
-    , .{ .k = k });
-    try text.appendSlice(a, ".step param cv list 1p 2p\n.tran 1n 10n\n.end\n");
-    const whole = exactOutcome(std.testing.allocator, text.items, .ngspice, .{ .threads = 0 });
-    try std.testing.expect(whole == .digest);
-    for ([_]u32{ 1, 8 }) |threads| {
-        const got = exactOutcome(std.testing.allocator, text.items, .ngspice, .{ .threads = threads, .scan_min = 0 });
-        try expectSame("device cards scanned", whole, got, "(threads = 0)", text.items);
-    }
+    try expectSame("one body copy per instance", shared, outcome(std.testing.allocator, copies), one, copies);
 }
 
 // The generator. `src` is a `*Smith` or a `*Seeded`. Writes past `deck_max`
@@ -632,38 +510,6 @@ const templates = [_][]const u8{
     "X# @ @ cell",
 };
 
-/// Spectre statements: one deck in eight is read as Spectre, and SPICE
-/// cards alone would mostly test its refusals.
-const spectre_templates = [_][]const u8{
-    "r# (@ @) resistor r=?",
-    "c# (@ @) capacitor c=?",
-    "l# (@ @) inductor l=?",
-    "v# (@ @) vsource dc=? mag=?",
-    "v# (@ @) vsource type=pulse val0=? val1=? period=?",
-    "i# (@ @) isource dc=?",
-    "e# (@ @ @ @) vcvs gain=?",
-    "d# (@ @) dmod",
-    "model dmod diode is=?",
-    "parameters %=? %=?",
-    "parameters %=~",
-    "subckt cell a b\nparameters w=1\nr1 (a b) resistor r=w\nends cell\nx# (@ @) cell w=?",
-    "subckt cell a b",
-    "ends cell",
-    "x# (@ @) cell",
-    "tr# tran stop=?",
-    "op# dc",
-    "ac# ac start=? stop=? dec=?",
-    "simulator lang=spice",
-    "R# @ @ ?",
-    "simulator lang=spectre",
-    "global @",
-    "// comment",
-    "* comment",
-    "ic @=?",
-    "r# (@ @) resistor r=? \\\n  m=?",
-    "save @",
-};
-
 /// Cards that fail out of context (an unclosed `.subckt`, a stray `.endif`,
 /// an unsupported card), drawn one card in eight.
 const fragments = [_][]const u8{
@@ -709,31 +555,22 @@ const suffixes = [_][]const u8{ "1", "2", "x", "1a", "" };
 const ops = [_][]const u8{ "+", "-", "*", "/", "**", "^", "<", ">=", "==", "!=", "&&", "||", "%" };
 const funcs = [_][]const u8{ "sin", "exp", "sqrt", "abs", "log", "pow", "max", "min", "limit", "pwr", "agauss", "gauss", "if", "u", "p" };
 
-/// Writes a title line and up to `cards_max` cards; returns the dialect to
-/// parse them in.
-fn deck(src: anytype, w: *std.Io.Writer) Dialect {
-    // The templates are SPICE syntax: Spectre gets one deck in eight.
-    const dialect: Dialect = if (src.eosWeightedSimple(7, 1)) .spectre else if (src.eosWeightedSimple(1, 1)) .hspice else .ngspice;
+/// Writes a title line and up to `cards_max` cards.
+fn deck(src: anytype, w: *std.Io.Writer) void {
     // Defines every name `params` holds, so a bare `%` value resolves.
-    put(w, if (dialect == .spectre) "fuzz deck\nparameters p=1 w0=1u k=2 base=3 r=1k\n" else "fuzz deck\n.param p=1 w0=1u k=2 base=3 r=1k\n");
+    put(w, "fuzz deck\n.param p=1 w0=1u k=2 base=3 r=1k\n");
     // Swarm testing: half the decks leave out the fragments and the
     // malformed atoms, so they mostly parse and the transforms have
     // something to compare.
     const clean = src.eosWeightedSimple(1, 1);
-    if (dialect != .spectre and src.eosWeightedSimple(3, 1)) hierarchy(src, w, clean);
+    if (src.eosWeightedSimple(3, 1)) hierarchy(src, w, clean);
     for (0..cards_max) |_| {
         if (src.eosWeightedSimple(7, 1)) break;
-        const template = if (!clean and src.eosWeightedSimple(7, 1))
-            pick(src, &fragments)
-        else if (dialect == .spectre and src.eosWeightedSimple(1, 3))
-            pick(src, &spectre_templates)
-        else
-            pick(src, &templates);
-        // Case is folded before a SPICE card is read; Spectre keeps it.
-        card(src, w, template, dialect != .spectre and src.eosWeightedSimple(7, 1), clean);
+        const template = if (!clean and src.eosWeightedSimple(7, 1)) pick(src, &fragments) else pick(src, &templates);
+        // Case is folded before a card is read.
+        card(src, w, template, src.eosWeightedSimple(7, 1), clean);
         put(w, if (src.eosWeightedSimple(15, 1)) "\r\n" else "\n");
     }
-    return dialect;
 }
 
 /// Subcircuits `h0..h(n-1)`, each instancing the ones before it and some
@@ -763,7 +600,7 @@ fn hierarchy(src: anytype, w: *std.Io.Writer, clean: bool) void {
             }
         }
         if (k + 1 < n and src.eosWeightedSimple(3, 1)) {
-            // `h(k+1)` sits inside `h(k)`, as HSPICE and ngspice allow.
+            // `h(k+1)` sits inside `h(k)`, as ngspice allows.
             nested = true;
             continue;
         }
@@ -879,3 +716,4 @@ fn put(w: *std.Io.Writer, bytes: []const u8) void {
 fn print(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
     w.print(fmt, args) catch {};
 }
+

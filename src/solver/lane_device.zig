@@ -72,6 +72,7 @@ comptime {
         gompute.exportRaw("arp_lane_update", &update);
         gompute.exportRaw("arp_lane_gates", &gates);
         gompute.exportRaw("arp_lane_gmin", &gmin);
+        gompute.exportRaw("arp_lane_extras", &extras);
         gompute.exportRaw("arp_lane_clear_q", &clearQ);
         gompute.exportRaw("arp_lane_hub_reduce", &hubReduce);
         gompute.exportRaw("arp_lane_meas", &meas);
@@ -81,6 +82,7 @@ comptime {
         gompute.exportRaw("arp_lane_accept", &step.accept);
         gompute.exportRaw("arp_lane_rebase", &step.rebase);
         gompute.exportRaw("arp_lane_gather", &step.gather);
+        gompute.exportRaw("arp_lane_lte_fix", &step.lteFix);
     }
 }
 
@@ -344,7 +346,7 @@ fn gmresAdvanceOnly(shape: gmres_lanes.Shape, layout: gmres_lanes.Layout, states
 /// the rest slot (t - n N) / N. Row 0 takes `rhs += x` and slot `d0` `g +=
 /// 1` first, as `Circuit.groundStamp` does after the stamp. Without charge
 /// A is G. Skips inactive lanes.
-fn assemble(n_lanes: u64, n: u64, nnz: u64, d0: u64, charge: u64, sc: P(LaneScalars), active: P(u8), x: P(f64), rhs: P(f64), q: P(f64), ring: P(f64), perm: P(u8), n_hist: u64, i_prev: P(f64), g: P(f64), c: P(f64), a: P(f64)) callconv(gompute.kernel_callconv) void {
+fn assemble(n_lanes: u64, n: u64, nnz: u64, d0: u64, charge: u64, sc: P(LaneScalars), active: P(u8), x: P(f64), rhs: P(f64), q: P(f64), ring: P(f64), perm: P(u8), n_hist: u64, i_prev: P(f64), g: P(f64), c: P(f64), a: P(f64), gear: P(lk.LaneGear)) callconv(gompute.kernel_callconv) void {
     const tid = gompute.globalIdX(block);
     if (tid >= (n + nnz) * n_lanes) return;
     const l: u32 = @intCast(tid % n_lanes);
@@ -354,7 +356,15 @@ fn assemble(n_lanes: u64, n: u64, nnz: u64, d0: u64, charge: u64, sc: P(LaneScal
     const e: usize = @intCast(tid / n_lanes);
     if (e < n) {
         if (e == 0) rhs[l] += x[l];
-        if (charge != 0) B.companionRow(e, @intCast(s.method), s.ag0, s.ag1, s.ag2, rhs, q, ring, perm, @intCast(n_hist), @intCast(n), i_prev, @intCast(n_lanes), l);
+        if (charge != 0 and s.method >= 3) {
+            // Gear-3..6: the older charges through `gearHistory`'s g.
+            const nh: usize = @intCast(n_hist);
+            const nn: usize = @intCast(n);
+            var h: [8]f64 = @splat(0);
+            h[0] = q[e * N + l];
+            for (1..@as(usize, s.method) + 1) |k| h[k] = ring[(@as(usize, perm[l * nh + k]) * nn + e) * N + l];
+            rhs[e * N + l] = lk.companionGear(true, @intCast(s.method), gear[l].ag, h, rhs[e * N + l]);
+        } else if (charge != 0) B.companionRow(e, @intCast(s.method), s.ag0, s.ag1, s.ag2, rhs, q, ring, perm, @intCast(n_hist), @intCast(n), i_prev, @intCast(n_lanes), l);
     } else {
         const p = e - @as(usize, @intCast(n));
         if (p == d0) g[p * N + l] += 1;
@@ -364,26 +374,36 @@ fn assemble(n_lanes: u64, n: u64, nnz: u64, d0: u64, charge: u64, sc: P(LaneScal
 
 /// Separate from assembly so the diagonal update cannot race the slot
 /// workers that write A. Only needed for a nonzero Newton gmin.
-fn gmin(n_lanes: u64, n: u64, value: f64, active: P(u8), x: P(f64), rhs: P(f64), a: P(f64), diag: P(u32)) callconv(gompute.kernel_callconv) void {
+fn gmin(n_lanes: u64, n: u64, opts: NewtonOpts, homotopy: P([2]f64), active: P(u8), x: P(f64), rhs: P(f64), a: P(f64), diag: P(u32)) callconv(gompute.kernel_callconv) void {
     const tid = gompute.globalIdX(block);
     if (tid >= n * n_lanes) return;
-    const l: usize = @intCast(tid % n_lanes);
+    const l: u32 = @intCast(tid % n_lanes);
     if (active[l] == 0) return;
-    const i: usize = @intCast(tid / n_lanes);
-    const N: usize = @intCast(n_lanes);
-    rhs[i * N + l] += value * x[i * N + l];
-    a[@as(usize, diag[i]) * N + l] += value;
+    const value = if (opts.per_lane != 0) homotopy[l][0] else opts.gmin;
+    B.gminRow(@intCast(tid / n_lanes), value, x, rhs, a, diag, @intCast(n_lanes), l);
 }
 
-/// The delta update for every active lane: x_old = x, x += dx, the score;
-/// the runaway bound at iteration 0; clears the lane's flag word for the
-/// limit pass that follows. `iter` is the device iteration word.
+/// `converger.loadExtras`' stamps and holds per lane (`B.loadExtras`),
+/// after `gmin` and before the refactor: one thread per lane walks the
+/// lane-uniform tables in order, so no two threads touch one entry.
+fn extras(n_lanes: u64, opts: NewtonOpts, homotopy: P([2]f64), active: P(u8), stamps: P(lk.GminStamp), force: P(lk.ForceRow), x: P(f64), rhs: P(f64), a: P(f64)) callconv(gompute.kernel_callconv) void {
+    const l = lane();
+    if (l >= n_lanes or active[l] == 0) return;
+    const h: [2]f64 = if (opts.per_lane != 0) homotopy[l] else .{ opts.gmin, 1 };
+    B.loadExtras(opts.n_stamps, stamps, h[0], opts.n_force, force, h[1], x, rhs, a, @intCast(n_lanes), l);
+}
+
+/// The delta update for every active lane: the `.options dv` clamp, x_old
+/// = x, x += dx, the score; the runaway bound at iteration 0. Sets the
+/// lane's flag word to bit 0 when the clamp fired (the limited veto the
+/// limit pass that follows ORs into), else clears it.
 fn update(n_lanes: u64, n: u64, opts: NewtonOpts, active: P(u8), gate: P(Gate), x: P(f64), dx: P(f64), x_old: P(f64), cur_row: P(u8), rhs: P(f64), a: P(f64), diag: P(u32), flags: P(u32)) callconv(gompute.kernel_callconv) void {
     const l = lane();
     if (l >= n_lanes or active[l] == 0) return;
     if (gate[l].tick == 0) gate[l].limit = B.plausibleLimit(@intCast(n), x, rhs, a, diag, @intCast(n_lanes), l);
+    const clamped = B.clampUpdate(@intCast(n), dx, cur_row, opts.dv, @intCast(n_lanes), l);
     gate[l].scaled = B.updateNorm(@intCast(n), x, dx, x_old, cur_row, opts.reltol, opts.abstol, opts.vntol, @intCast(n_lanes), l);
-    flags[l] = 0;
+    flags[l] = @intFromBool(clamped);
 }
 
 /// `finalizeStep`'s gates after the limit pass, in its order: limited,

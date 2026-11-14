@@ -1,5 +1,5 @@
 //! Developer switches, read from the environment once by the facade
-//! (`espice.zig` `knobsFromEnv`) and carried by `Config.knobs` into
+//! (`espice/config.zig` `knobsFromEnv`) and carried by `Config.knobs` into
 //! `Circuit.knobs`, so nothing below the facade reads the environment. Each
 //! field names its variable; dev/ notes cite them.
 //! In: nothing at run time (plain data). Out: the switches.
@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const converger = @import("solver").converger;
 const direct = @import("solver").direct;
+const Levers = @import("core").perf.Levers;
 
 /// Every developer switch; the defaults are the shipped behaviour.
 pub const Knobs = struct {
@@ -68,6 +69,9 @@ pub const Knobs = struct {
     /// `ESPICE_GPU_HOST_STEP`: GPU transient lanes keep step control on the
     /// host (`tran.Sim` per lane), the bitwise oracle for device step control.
     gpu_host_step: bool = false,
+    /// `ESPICE_PERF`: the levers under evaluation (`core.perf`); all off is
+    /// the shipped path. `newton.perf` and `lu.perf` carry the same value.
+    perf: Levers = .{},
     /// `XDG_CACHE_HOME` and `HOME`, where the GPU JIT warm markers live.
     xdg_cache_home: ?[]const u8 = null,
     home: ?[]const u8 = null,

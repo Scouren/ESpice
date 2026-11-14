@@ -20,13 +20,26 @@ pub fn build(b: *Build) void {
     const vera_exe = b.dependency("vera", .{ .target = b.graph.host, .optimize = .fast }).artifact("vera");
     const contract: Import = .{ .name = "contract", .module = vera.module("contract") };
 
-    // The runtime .hdl loader rebuilds src/device/eval.zig against these roots.
+    // The runtime .hdl loader rebuilds src/device/eval.zig against these roots
+    // (src/device/Library.zig). What ships names them absolutely; test roots
+    // name them under the build root, where every test runs, so a test binary
+    // is the same bytes in every worktree and the shared cache serves them all.
+    const ship_paths = b.addOptions();
+    const test_paths = b.addOptions();
+    for ([_]struct { []const u8, *Build, []const u8 }{
+        .{ "contract_path", vera.builder, "lib/contract.zig" },
+        .{ "dyn_path", b, "src/device/eval.zig" },
+        .{ "device_abi_path", b, "src/device/abi.zig" },
+        .{ "core_path", b, "src/core/root.zig" },
+        .{ "gompute_path", gompute.builder, "src/root.zig" },
+    }) |root| {
+        const abs = pathFromRoot(b, root[1], root[2]);
+        ship_paths.addOption([]const u8, root[0], abs);
+        test_paths.addOption([]const u8, root[0], underBuildRoot(b, abs));
+    }
+    const hdl_paths: HdlPaths = .{ .ship = ship_paths.createModule(), .tests = test_paths.createModule() };
+    // Path-free: every worktree compiles the modules importing it alike.
     const bopts = b.addOptions();
-    bopts.addOption([]const u8, "contract_path", pathFromRoot(b, vera.builder, "lib/contract.zig"));
-    bopts.addOption([]const u8, "dyn_path", pathFromRoot(b, b, "src/device/eval.zig"));
-    bopts.addOption([]const u8, "device_abi_path", pathFromRoot(b, b, "src/device/abi.zig"));
-    bopts.addOption([]const u8, "core_path", pathFromRoot(b, b, "src/core/root.zig"));
-    bopts.addOption([]const u8, "gompute_path", pathFromRoot(b, gompute.builder, "src/root.zig"));
     bopts.addOption(bool, "certify", b.option(bool, "certify", "Certify every converged Newton point against its KCL residual") orelse false);
     bopts.addOption(bool, "lu_instrument", b.option(bool, "lu-instrument", "Compile the LU census (ZP_LU_STATS) and the device-LU bench (ESPICE_GPU_LU_BENCH)") orelse false);
     const bo = bopts.createModule();
@@ -76,13 +89,13 @@ pub fn build(b: *Build) void {
         )) else m.src);
     }
 
-    const g = graph(M, vera, gompute.module("gompute"), models, gen, bo);
+    const g = graph(M, vera, gompute.module("gompute"), models, gen, bo, hdl_paths);
     const exe = b.addExecutable(.{
         .name = "espice",
         .use_llvm = use_llvm,
         .use_lld = use_llvm and !target.result.os.tag.isDarwin(),
         .root_module = M.make(b.path("src/main.zig"), &.{
-            .{ .name = "espice", .module = g.espice },
+            .{ .name = "espice", .module = g.ship.espice },
             .{ .name = "vera_vpi", .module = vera.module("vpi") },
             .{ .name = "fastvaf", .module = vera.module("vera") },
             contract,
@@ -139,7 +152,8 @@ pub fn build(b: *Build) void {
         .hip = if (gpu_kernels) gpuArch(hip_arch) else .{ .enabled = false },
         .optimize = if (optimize == .debug) .fast else optimize,
     });
-    g.analysis.addImport("gompute_kernels", exe.root_module.import_table.get("gompute_kernels").?);
+    const kernels = exe.root_module.import_table.get("gompute_kernels").?;
+    for ([_]*Module{ g.ship.analysis, g.tests.analysis }) |analysis| analysis.addImport("gompute_kernels", kernels);
 
     // Compile the coupled-line state kernels on CPU-only CI runners too.
     // LLVM's AMDGPU frame lowering has failed here even when host tests pass.
@@ -184,7 +198,7 @@ pub fn build(b: *Build) void {
     const wasm = target.result.cpu.arch.isWasm();
     const espice_h = b.addTranslateC(.{ .root_source_file = b.path("include/espice.h"), .target = target, .optimize = optimize, .link_libc = !wasm }).createModule();
     const c_api_mod = M.make(b.path("src/c_api.zig"), &.{
-        .{ .name = "espice", .module = g.espice },
+        .{ .name = "espice", .module = g.ship.espice },
         .{ .name = "espice_h", .module = espice_h },
         .{ .name = "core", .module = g.core },
     });
@@ -210,18 +224,23 @@ pub fn build(b: *Build) void {
         .b = b,
         .exe = exe,
         .objs = g.objs,
-        .check = b.step("check", "Type-check every test root without emitting binaries (use with --watch -fincremental)"),
+        .check = b.step("check", "Type-check every test root without emitting binaries (pre-commit; one root: check-<root>)"),
         .filters = if (b.option([]const u8, "test-filter", "Run unit tests whose names contain this text")) |filter| &.{filter} else &.{},
     };
+    // Test roots over `espice` get the build-root `.hdl` paths (HdlPaths).
+    const tests_espice: Import = .{ .name = "espice", .module = g.tests.espice };
+    const test_data = treeFiles(b, &test_data_dirs);
 
     const c_api_test_mod = M.make(b.path("src/tests/c_api.zig"), &.{.{ .name = "espice_h", .module = espice_h }});
     c_api_test_mod.link_libc = true;
     c_api_test_mod.linkLibrary(c_api_lib);
     const run_c_api_tests = t.run(c_api_test_mod, &.{}, false);
-    run_c_api_tests.setEnvironmentVariable("ZIG", b.graph.zig_exe);
-    const run_c_api_unit_tests = t.run(c_api_mod, &.{}, false);
-    const run_espice_tests = t.run(M.make(b.path("src/tests/espice.zig"), &.{ .{ .name = "espice", .module = g.espice }, .{ .name = "core", .module = g.core }, .{ .name = "analysis", .module = g.analysis } }), &.{}, true);
-    run_espice_tests.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    setTestEnv(b, run_c_api_tests, "ZIG", b.graph.zig_exe);
+    for (test_data) |f| run_c_api_tests.addFileInput(f);
+    const run_c_api_unit_tests = t.run(c_api_mod, &.{tests_espice}, false);
+    const run_espice_tests = t.run(M.make(b.path("src/tests/espice.zig"), &.{ tests_espice, .{ .name = "core", .module = g.core }, .{ .name = "analysis", .module = g.tests.analysis } }), &.{}, true);
+    setTestEnv(b, run_espice_tests, "ZIG", b.graph.zig_exe);
+    for (test_data) |f| run_espice_tests.addFileInput(f);
 
     const limiter_gen = b.addRunArtifact(vera_exe);
     limiter_gen.addArgs(&.{ "--emit-zig", "--allow=W0650", "-o" });
@@ -242,20 +261,25 @@ pub fn build(b: *Build) void {
     const error_tests_mod = M.make(b.path("src/device/tests/device_errors.zig"), &.{.{ .name = "device_abi", .module = g.abi }});
     error_tests_mod.addObject(b.addObject(.{ .name = "device_errors", .root_module = error_object_mod, .use_llvm = use_llvm }));
 
-    const wfit_mod = M.make(b.path("src/frontend/wfit.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } });
+    // src/device/tests/catalog.zig reads models/*.va for their aliases.
+    const run_device_tests = t.run(g.tests.device, &.{}, true);
+    for (treeFiles(b, &.{"models"})) |f| run_device_tests.addFileInput(f);
+    // spicerack.zig's `detect` test walks the corpus decks.
+    const run_exe_tests = t.run(exe.root_module, &.{tests_espice}, false);
+    for (test_data) |f| run_exe_tests.addFileInput(f);
 
     for ([_]*Build.Step.Run{
         run_espice_tests,
         run_c_api_tests,
         run_c_api_unit_tests,
-        t.run(exe.root_module, &.{}, false),
+        run_exe_tests,
         t.run(g.netlist, &.{}, false),
-        t.run(wfit_mod, &.{}, false),
-        t.run(g.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
-        // spice.zig and builder.zig's own tests live only in the builder module.
-        t.run(g.builder, &.{}, true),
-        t.run(g.analysis, &.{
-            .{ .name = "builder", .module = g.builder },
+        t.run(g.wfit, &.{}, false),
+        t.run(g.tests.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
+        // spice.zig and Circuit.zig's own tests live only in the builder module.
+        t.run(g.tests.builder, &.{}, true),
+        t.run(g.tests.analysis, &.{
+            .{ .name = "builder", .module = g.tests.builder },
             .{ .name = "limiter_device", .module = M.make(limiter_source, &.{contract}) },
             .{ .name = "crawl_device", .module = M.make(crawl_source, &.{contract}) },
             contract,
@@ -266,13 +290,14 @@ pub fn build(b: *Build) void {
         t.run(g.solver, &.{}, false),
         t.run(g.output, &.{}, false),
         t.run(g.measure, &.{}, false),
-        t.run(g.device, &.{}, true),
+        run_device_tests,
         t.run(g.abi, &.{}, false),
         t.run(M.make(b.path("src/device/tests/eval.zig"), &.{
             .{ .name = "device_eval", .module = g.eval },
             contract,
             .{ .name = "models", .module = g.models },
         }), &.{}, true),
+        t.run(M.make(b.path("src/device/tests/math_agree.zig"), &.{ contract, .{ .name = "gompute", .module = gompute.module("gompute") } }), &.{}, false),
         t.run(error_tests_mod, &.{}, false),
         t.run(M.make(b.path("models/ltra_ac.zig"), &.{}), &.{}, false),
     }) |r| test_step.dependOn(&r.step);
@@ -291,21 +316,37 @@ pub fn build(b: *Build) void {
     });
     const run_harness_tests = t.run(correctness.root_module, &.{}, false);
     run_harness_tests.setCwd(b.path("."));
+    for (test_data) |f| run_harness_tests.addFileInput(f);
 
-    const run_correctness = corpus(b, correctness, exe, vpi_fixture, &.{});
+    // `-Dperf=c1,c7` runs the corpus with those levers on (`core.perf`),
+    // through the same variable a user sets, so the binary is the one a
+    // plain run tests. The runner sets it, and ZIG, in each espice child:
+    // as arguments neither clones this build's environment into the step
+    // (setTestEnv says why that matters).
+    const perf_levers = b.option([]const u8, "perf", "Run the corpus with these levers on (ESPICE_PERF: a comma list, or `all`)");
+    const runner_flags = if (perf_levers) |l| b.dupeStrings(&.{ "--zig", b.graph.zig_exe, "--perf", l }) else b.dupeStrings(&.{ "--zig", b.graph.zig_exe });
+    const run_correctness = corpus(b, correctness, exe, vpi_fixture, runner_flags);
     run_correctness.step.dependOn(&run_harness_tests.step);
     test_step.dependOn(&run_correctness.step);
 
-    const run_metamorphic = corpus(b, correctness, exe, vpi_fixture, &.{"--metamorphic"});
+    const run_metamorphic = corpus(b, correctness, exe, vpi_fixture, std.mem.concat(b.allocator, []const u8, &.{ runner_flags, &.{"--metamorphic"} }) catch @panic("OOM"));
     run_metamorphic.step.dependOn(&run_harness_tests.step);
     test_step.dependOn(&run_metamorphic.step);
+
+    // The edit loop's two halves of `install` and `test`: the exe alone skips
+    // libespice.a (a second whole-engine LLVM module), and the corpus alone
+    // skips the ~115 unit roots and the codegen and HIP probes.
+    b.step("exe", "Install the espice CLI alone, without libespice.a").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    const corpus_step = b.step("corpus", "Run the SPICE corpus (correctness and metamorphic) alone; `-- --filter PREFIX`");
+    corpus_step.dependOn(&run_correctness.step);
+    corpus_step.dependOn(&run_metamorphic.step);
 
     {
         var P = M;
         P.target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 } });
         P.optimize = .fast;
         P.strip = false;
-        const pg = graph(P, b.dependency("vera", .{ .target = P.target, .optimize = P.optimize }), gompute.module("gompute"), models, gen, bo);
+        const pg = graph(P, b.dependency("vera", .{ .target = P.target, .optimize = P.optimize }), gompute.module("gompute"), models, gen, bo, hdl_paths);
         const core: Import = .{ .name = "core", .module = pg.core };
         const probe = b.addObject(.{ .name = "codegen-probe", .root_module = P.make(b.path("tests/codegen.zig"), &.{
             .{ .name = "device_eval", .module = pg.eval },
@@ -317,14 +358,21 @@ pub fn build(b: *Build) void {
         const residue = b.addSystemCommand(&.{"python3"});
         residue.addFileArg(b.path("tools/asm_probe.py"));
         residue.addFileArg(probe.getEmittedAsm());
-        residue.addArgs(&.{ "gen_dual_mul=hand_dual_mul", "gen_batch_of=hand_batch_of", "gen_engine_solve=hand_engine_solve", "gen_hook_trap_assemble=hand_hook_trap_assemble", "gen_hook_step_assemble=hand_hook_step_assemble", "gen_hook_diag_at=hand_hook_diag_at", "gen_num_dot=hand_num_dot", "gen_num_sum=hand_num_sum", "gen_num_norminf=hand_num_norminf", "gen_lanes_splat=hand_lanes_splat", "gen_lanes_any=hand_lanes_any", "gen_lanes_all=hand_lanes_all", "gen_lanes_select=hand_lanes_select", "gen_lanes_cmp=hand_lanes_cmp", "gen_lanes_either=hand_lanes_either", "gen_lanes_lane=hand_lanes_lane", "gen_lanes_each=hand_lanes_each", "gen_newton=hand_newton", "gen_update_and_norm=hand_update_and_norm" });
+        residue.addArgs(&.{ "gen_dual_mul=hand_dual_mul", "gen_batch_of=hand_batch_of", "gen_engine_solve=hand_engine_solve", "gen_hook_trap_assemble=hand_hook_trap_assemble", "gen_hook_step_assemble=hand_hook_step_assemble", "gen_hook_diag_at=hand_hook_diag_at", "gen_num_dot=hand_num_dot", "gen_num_sum=hand_num_sum", "gen_num_norminf=hand_num_norminf", "gen_lanes_splat=hand_lanes_splat", "gen_lanes_any=hand_lanes_any", "gen_lanes_all=hand_lanes_all", "gen_lanes_select=hand_lanes_select", "gen_lanes_cmp=hand_lanes_cmp", "gen_lanes_either=hand_lanes_either", "gen_lanes_lane=hand_lanes_lane", "gen_lanes_each=hand_lanes_each", "gen_newton=hand_newton", "gen_update_and_norm=hand_update_and_norm", "gen_publish_sim=hand_publish_sim" });
         test_step.dependOn(&residue.step);
     }
 
     const bench_runner = b.addExecutable(.{ .name = "bench-runner", .root_module = M.make(b.path("tests/benchmark/runner.zig"), &.{}) });
     test_step.dependOn(&t.run(bench_runner.root_module, &.{}, false).step);
     // Every open-source simulator on PATH (a missing one drops out); --fixtures DIR for another deck set.
-    b.step("bench", "Time and compare ESPice against ngspice, VACASK and Xyce (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{ "tests/conformance/tests/netlist", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto" }).step);
+    const bench = corpus(b, bench_runner, exe, null, &.{ "tests/conformance/tests/netlist", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto" });
+    bench.setEnvironmentVariable("ZIG", b.graph.zig_exe); // it always reruns (inherited stdio), so the cloned environment costs no hit
+    b.step("bench", "Time and compare ESPice against ngspice, VACASK and Xyce (nix develop .#benchmarking)").dependOn(&bench.step);
+
+    // The reader's golden (compiler-construction rule 9): `nldump --out FILE (--list FILE | DECK...)`
+    // hashes the reader's output per deck; `--reps N` times the parse.
+    const nldump = b.addExecutable(.{ .name = "nldump", .root_module = M.make(b.path("tools/nldump.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } }), .use_llvm = use_llvm });
+    b.step("nldump", "Install nldump, the reader's golden: one hash of the parsed netlist per deck").dependOn(&b.addInstallArtifact(nldump, .{}).step);
 
     checkModuleGraph(b, exe.root_module);
     checkModuleGraph(b, c_api_mod);
@@ -364,23 +412,40 @@ const Graph = struct {
     kernel_contract: Import,
     kernel_abi: Import,
     objs: []*Compile,
-    device: *Module,
     solver: *Module,
-    analysis: *Module,
     netlist: *Module,
-    builder: *Module,
-    frontend: *Module,
+    wfit: *Module,
     output: *Module,
     measure: *Module,
+    /// What ships: the `.hdl` roots by absolute path.
+    ship: Upper,
+    /// What test roots import: the `.hdl` roots under the build root.
+    tests: Upper,
+};
+
+/// The `.hdl` loader's source roots, as `device`'s `build_options`
+/// (src/device/Library.zig). Absolute in what ships, which runs anywhere;
+/// relative to the build root in test roots, which run there, so a test root
+/// compiles to the same bytes in every worktree.
+const HdlPaths = struct { ship: *Module, tests: *Module };
+
+/// The modules over `device`, built once per `HdlPaths` module. Every
+/// module below them is shared, so the device objects compile once.
+const Upper = struct {
+    device: *Module,
+    analysis: *Module,
+    builder: *Module,
+    frontend: *Module,
     espice: *Module,
 };
 
-/// The simulator's module graph for one target. `analysis` still needs `gompute_kernels`.
-fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Model, gen: []const Build.LazyPath, bo: *Module) Graph {
+/// The simulator's module graph for one target. Each `analysis` still needs `gompute_kernels`.
+fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Model, gen: []const Build.LazyPath, bo: *Module, hdl_paths: HdlPaths) Graph {
     const b = c.b;
-    // Device code: always stripped (DWARF on generated models crashed NVPTX).
-    var dev = c;
-    dev.strip = true;
+    // Host device code follows -Ddebug-info: the exe's LLVM module imports the
+    // models, and a stripped model inlined into an unstripped caller segfaults
+    // Zig 0.18.0-dev.349 while emitting DWARF. The kernel twins (`kmake`) stay
+    // stripped (DWARF on generated models crashed NVPTX).
     const contract: Import = .{ .name = "contract", .module = vera.module("contract") };
     const gomp: Import = .{ .name = "gompute", .module = gompute };
     // emitKernels mutates the public Gompute module to import all GPU blobs.
@@ -399,7 +464,7 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     const abi: Import = .{ .name = "device_abi", .module = c.make(b.path("src/device/abi.zig"), &.{ contract, core }) };
     // Device objects see only core's ids leaf (GROUND, DeviceType): an edit elsewhere in core
     // must not recompile every model. abi's own tests still get the full core.
-    const abi_dev = dev.make(b.path("src/device/abi.zig"), &.{ contract, .{ .name = "core", .module = dev.make(b.path("src/core/ids.zig"), &.{}) } });
+    const abi_dev = c.make(b.path("src/device/abi.zig"), &.{ contract, .{ .name = "core", .module = c.make(b.path("src/core/ids.zig"), &.{}) } });
     // Zig 0.18's std.Io.Threaded does not compile for wasm32-wasi with libc
     // (Environ and PATH_MAX); without it, it takes the WASI syscall path.
     const libc = !c.target.result.cpu.arch.isWasm();
@@ -420,7 +485,7 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     for (models, gen, dev_mods, kernel_models, objs) |m, src, *dm, *kone, *obj| {
         const line = b.fmt("pub const {s} = @import(\"{s}\");\n", .{ m.name, m.name });
         agg.appendSlice(b.allocator, line) catch @panic("OOM");
-        dm.* = dev.make(src, &.{contract});
+        dm.* = c.make(src, &.{contract});
         // The device kernels compile at .fast, where VerA's Debug-only Model
         // field (`su_ok`) does not exist; `gpu_kernels` makes the host's
         // device object drop it too, so a Model row has one size on both sides.
@@ -435,13 +500,13 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
             if (c.gpu_kernels or c.optimize != .debug) "pub const gpu_kernels = true;\n" else "",
             if (ltra) "pub const ltra_ac = @import(\"ltra_ac\");\n" else "",
         }));
-        const one = dev.make(one_src, &.{.{ .name = m.name, .module = dm.* }});
+        const one = c.make(one_src, &.{.{ .name = m.name, .module = dm.* }});
         kone.* = kmake(b, one_src, &.{.{ .name = m.name, .module = kmake(b, src, &.{k_contract}) }});
         if (ltra) {
-            one.addImport("ltra_ac", dev.make(b.path("models/ltra_ac.zig"), &.{}));
+            one.addImport("ltra_ac", c.make(b.path("models/ltra_ac.zig"), &.{}));
             kone.*.addImport("ltra_ac", kmake(b, b.path("models/ltra_ac.zig"), &.{}));
         }
-        const host = dev.make(b.path("src/device/eval.zig"), &.{ contract, .{ .name = "models", .module = one }, .{ .name = "device_abi", .module = abi_dev }, object_gomp });
+        const host = c.make(b.path("src/device/eval.zig"), &.{ contract, .{ .name = "models", .module = one }, .{ .name = "device_abi", .module = abi_dev }, object_gomp });
         host.link_libc = libc;
         // The callconv(.auto) vtable gains a hidden *StackTrace when tracing is on.
         host.error_tracing = c.optimize == .debug;
@@ -450,26 +515,44 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     const models_mod = c.make(b.addWriteFiles().add("models.zig", agg.items), &.{});
     for (models, dev_mods) |m, dm| models_mod.addImport(m.name, dm);
 
-    const device: Import = .{ .name = "device", .module = c.make(b.path("src/device/root.zig"), &.{
-        .{ .name = "models", .module = models_mod },
-        abi,
-        core,
-        .{ .name = "fastvaf", .module = vera.module("vera") },
-        .{ .name = "zigbuild", .module = vera.module("zigbuild") },
-        .{ .name = "vera_sim", .module = vera.module("sim") },
-        .{ .name = "vera_digital", .module = vera.module("digital") },
-        build_options,
-    }) };
-    device.module.link_libc = libc;
-    const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options });
+    // gompute: `kernels/lane_step.zig`'s exp and log, the same on the host and in the kernels.
+    const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options, gomp });
     // `.meas` evaluation: output prints it, a transient watches its cards resolve.
     const measure: Import = .{ .name = "measure", .module = c.make(b.path("src/output/measure/root.zig"), &.{core}) };
-    const analysis = c.make(b.path("src/analysis/root.zig"), &.{ .{ .name = "solver", .module = solver }, core, device, gomp, build_options, measure });
-    analysis.link_libc = libc;
-    const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/netlist.zig"), &.{core}) };
-    const builder: Import = .{ .name = "builder", .module = c.make(b.path("src/frontend/builder.zig"), &.{ core, device, netlist }) };
-    const frontend = c.make(b.path("src/frontend/prepare.zig"), &.{ core, device, netlist, builder });
+    const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/Netlist.zig"), &.{core}) };
+    // The S- and W-element fits: numerics over a data file, no card grammar.
+    const wfit: Import = .{ .name = "wfit", .module = c.make(b.path("src/frontend/fit/wfit.zig"), &.{ core, netlist }) };
     const output = c.make(b.path("src/output/root.zig"), &.{ core, measure });
+    var uppers: [2]Upper = undefined;
+    for (&uppers, [_]*Module{ hdl_paths.ship, hdl_paths.tests }) |*upper, paths| {
+        const device: Import = .{ .name = "device", .module = c.make(b.path("src/device/root.zig"), &.{
+            .{ .name = "models", .module = models_mod },
+            abi,
+            core,
+            .{ .name = "fastvaf", .module = vera.module("vera") },
+            .{ .name = "zigbuild", .module = vera.module("zigbuild") },
+            .{ .name = "vera_sim", .module = vera.module("sim") },
+            .{ .name = "vera_digital", .module = vera.module("digital") },
+            .{ .name = "build_options", .module = paths },
+        }) };
+        device.module.link_libc = libc;
+        const analysis = c.make(b.path("src/analysis/root.zig"), &.{ .{ .name = "solver", .module = solver }, core, device, gomp, build_options, measure });
+        analysis.link_libc = libc;
+        const builder: Import = .{ .name = "builder", .module = c.make(b.path("src/frontend/Circuit.zig"), &.{ core, device, netlist, wfit }) };
+        const frontend = c.make(b.path("src/frontend/Jobs.zig"), &.{ core, device, netlist, builder });
+        upper.* = .{
+            .device = device.module,
+            .analysis = analysis,
+            .builder = builder.module,
+            .frontend = frontend,
+            .espice = c.make(b.path("src/espice.zig"), &.{
+                core,
+                .{ .name = "analysis", .module = analysis },
+                .{ .name = "frontend", .module = frontend },
+                .{ .name = "output", .module = output },
+            }),
+        };
+    }
     return .{
         .core = core.module,
         .abi = abi.module,
@@ -479,20 +562,13 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
         .kernel_contract = k_contract,
         .kernel_abi = k_abi,
         .objs = objs,
-        .device = device.module,
         .solver = solver,
-        .analysis = analysis,
         .netlist = netlist.module,
-        .builder = builder.module,
-        .frontend = frontend,
+        .wfit = wfit.module,
         .output = output,
         .measure = measure.module,
-        .espice = c.make(b.path("src/espice.zig"), &.{
-            core,
-            .{ .name = "analysis", .module = analysis },
-            .{ .name = "frontend", .module = frontend },
-            .{ .name = "output", .module = output },
-        }),
+        .ship = uppers[0],
+        .tests = uppers[1],
     };
 }
 
@@ -504,7 +580,6 @@ fn corpus(b: *Build, runner: *Compile, exe: *Compile, vpi: ?*Compile, args: []co
         r.addArg("--vpi-fixture");
         r.addArtifactArg(v);
     } else r.stdio = .inherit;
-    r.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     // Debug runs the slowest decks (stress/scaling_inverter_chain_4k,
     // tran/ltra_tran_long_run_past_8192) in ~620 s under load, past the
     // runner's 300 s default. A later passthrough --timeout still wins.
@@ -512,6 +587,81 @@ fn corpus(b: *Build, runner: *Compile, exe: *Compile, vpi: ?*Compile, args: []co
     r.addArgs(args);
     r.addPassthruArgs();
     return r;
+}
+
+/// What the espice, C API, exe-root and corpus-harness tests read at run
+/// time: decks with their includes and models, the docs' examples, and
+/// opvars' model.
+const test_data_dirs = [_][]const u8{ "tests/conformance/tests/netlist", "docs/examples", "src/tests/opvars.assets" };
+
+/// What `nix develop` sets anew on every call (its temporary directory),
+/// and OLDPWD and ZIG_PROGRESS, which also vary per call; no test reads one.
+const per_call_env = [_][]const u8{ "NIX_BUILD_TOP", "TMPDIR", "TMP", "TEMP", "TEMPDIR", "OLDPWD", "ZIG_PROGRESS" };
+
+/// Sets `key` to `value` for `run`'s child, a test binary, whose runner
+/// rejects any argument it does not know (lib/compiler/test_runner.zig:62).
+/// One variable clones this build's whole environment into the step, and
+/// the Maker hashes all of it into the run's key (Maker Run.zig:60-67), so
+/// this then drops what differs per call (`per_call_env`) or per checkout
+/// (a value holding the build root: PWD, out, NIX_LDFLAGS), and a rerun
+/// with nothing changed is a hit. PATH stays; the child, with no TMPDIR,
+/// uses /tmp.
+fn setTestEnv(b: *Build, run: *Build.Step.Run, key: []const u8, value: []const u8) void {
+    run.setEnvironmentVariable(key, value);
+    const env = run.getEnvMap();
+    // Absolute unless --build-file names a relative directory (Maker.zig:1155).
+    const root = pathFromRoot(b, b, "");
+    var i = env.count();
+    while (i > 0) {
+        i -= 1;
+        const name = env.keys()[i];
+        if (std.mem.eql(u8, name, key) or std.mem.eql(u8, name, "PATH")) continue;
+        const per_call = for (per_call_env) |p| {
+            if (std.mem.eql(u8, name, p)) break true;
+        } else false;
+        const per_checkout = std.fs.path.isAbsolute(root) and std.mem.find(u8, env.values()[i], root) != null;
+        if (per_call or per_checkout) _ = env.orderedRemove(name);
+    }
+    std.debug.assert(std.mem.eql(u8, env.get(key).?, value));
+    for (per_call_env) |p| std.debug.assert(!env.contains(p));
+}
+
+/// Every file under each of `dirs` (build-root relative), sorted, so a run
+/// that reads them declares them (`addFileInput`) and reruns when one
+/// changes: a Run step takes no directory input, as a directory argument
+/// hashes its path alone (Maker Run.zig:110-120).
+fn treeFiles(b: *Build, dirs: []const []const u8) []const Build.LazyPath {
+    const io = b.graph.io;
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (dirs) |sub| {
+        // A flake's source has no submodules (tests/conformance), and an
+        // install reads none of these: declare nothing. A test run still
+        // fails without them; the corpus runner refuses an empty catalog.
+        var dir = b.root.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => std.debug.panic("{s}: {t}", .{ sub, err }),
+        };
+        b.dependOnDirectoryContents(b.path(sub));
+        defer dir.close(io);
+        var walker = dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch |err| std.debug.panic("{s}: {t}", .{ sub, err })) |e| {
+            const path = b.fmt("{s}/{s}", .{ sub, e.path });
+            switch (e.kind) {
+                .file => paths.append(b.allocator, path) catch @panic("OOM"),
+                .directory => b.dependOnDirectoryContents(b.path(path)),
+                else => {},
+            }
+        }
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    const out = b.allocator.alloc(Build.LazyPath, paths.items.len) catch @panic("OOM");
+    for (out, paths.items) |*lazy, path| lazy.* = b.path(path);
+    return out;
 }
 
 /// "A module importing `name` must be rooted under one of `allowed`", checked on shipped graphs.
@@ -522,6 +672,7 @@ const restricted_imports = [_]struct { name: []const u8, allowed: []const []cons
     .{ .name = "output", .allowed = &.{"src/espice.zig"} },
     .{ .name = "netlist", .allowed = &.{"src/frontend/"} },
     .{ .name = "builder", .allowed = &.{"src/frontend/"} },
+    .{ .name = "wfit", .allowed = &.{"src/frontend/"} },
     .{ .name = "espice", .allowed = &.{ "src/main.zig", "src/c_api.zig" } },
 };
 
@@ -544,16 +695,25 @@ const HostTest = struct {
     b: *Build,
     exe: *Compile,
     objs: []const *Compile,
+    /// `check`: the union of every root's `check-<root>`.
     check: *Build.Step,
     filters: []const []const u8,
 
+    /// Also adds the root's type-check (no binary) to `check` and as its own
+    /// `check-<root>` step (`checkName`), the target of one edit loop's watch.
     fn run(self: HostTest, m: *Module, extra: []const Import, devices: bool) *Build.Step.Run {
-        self.check.dependOn(&self.b.addTest(.{ .name = "check", .root_module = self.copy(m, extra), .use_llvm = false }).step);
+        const b = self.b;
+        const check = b.addTest(.{ .name = "check", .root_module = self.copy(m, extra), .use_llvm = false });
+        self.check.dependOn(&check.step);
+        const root = m.root_source_file.?.src_path.sub_path;
+        b.step(b.fmt("check-{s}", .{checkName(b, root)}), b.fmt("Type-check {s} alone (the edit loop)", .{root})).dependOn(&check.step);
         const mod = self.copy(m, extra);
         mod.link_objects.appendSlice(self.b.allocator, m.link_objects.items) catch @panic("OOM");
         mod.include_dirs.appendSlice(self.b.allocator, m.include_dirs.items) catch @panic("OOM");
         if (devices) for (self.objs) |o| mod.addObject(o);
-        return self.b.addRunArtifact(self.b.addTest(.{ .root_module = mod, .filters = self.filters, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
+        const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = mod, .filters = self.filters, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
+        b.step(b.fmt("test-{s}", .{checkName(b, root)}), b.fmt("Run {s}'s unit tests alone", .{root})).dependOn(&run_tests.step);
+        return run_tests;
     }
 
     fn copy(self: HostTest, m: *Module, extra: []const Import) *Module {
@@ -567,10 +727,22 @@ const HostTest = struct {
         });
         var it = m.import_table.iterator();
         while (it.next()) |e| mod.addImport(e.key_ptr.*, e.value_ptr.*);
-        for (extra) |e| mod.addImport(e.name, e.module);
+        for (extra) |e| mod.addImport(e.name, e.module); // replaces a same-named import
         return mod;
     }
 };
+
+/// `check-<name>`'s name for the test root at `sub_path`: under src/, with
+/// no `.zig` or final `/root`, `/` as `-` (src/core/root.zig is core,
+/// src/device/tests/eval.zig is device-tests-eval).
+fn checkName(b: *Build, sub_path: []const u8) []const u8 {
+    var name = std.mem.cutPrefix(u8, sub_path, "src/") orelse sub_path;
+    name = std.mem.cutSuffix(u8, name, ".zig") orelse name;
+    name = std.mem.cutSuffix(u8, name, "/root") orelse name;
+    const out = b.allocator.dupe(u8, name) catch @panic("OOM");
+    std.mem.replaceScalar(u8, out, '/', '-');
+    return out;
+}
 
 const Model = struct {
     name: []const u8,
@@ -599,7 +771,8 @@ const hdl_by_ext = std.StaticStringMap(Hdl).initComptime(.{
 /// kind stays its own device; only the source is shared.
 const model_variants = [_]struct { name: []const u8, base: []const u8, defines: []const u8 }{
     .{ .name = "bsource_i", .base = "bsource.va", .defines = "`define BSRC_CURRENT\n" },
-    .{ .name = "bsource_q", .base = "bsource.va", .defines = "`define BSRC_CHARGE\n" },
+    .{ .name = "bsource_d", .base = "bsource.va", .defines = "`define BSRC_DDT\n" },
+    .{ .name = "bsource_di", .base = "bsource.va", .defines = "`define BSRC_CURRENT\n`define BSRC_DDT\n" },
     .{ .name = "vccs_laplace", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_CURRENT\n" },
     .{ .name = "vcvs_pole", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_ZP\n" },
     .{ .name = "vccs_pole", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_ZP\n`define LAPLACE_CURRENT\n" },
@@ -611,6 +784,8 @@ const model_variants = [_]struct { name: []const u8, base: []const u8, defines: 
     .{ .name = "wline_4", .base = "wline_1.va", .defines = "`define W_N 4\n`define W_4\n" },
     .{ .name = "coupled_ltra3", .base = "coupled_ltra.va", .defines = "`define CPL_N 3\n`define CPL_MODULE coupled_ltra3\n" },
     .{ .name = "coupled_ltra4", .base = "coupled_ltra.va", .defines = "`define CPL_N 4\n`define CPL_MODULE coupled_ltra4\n" },
+    // The self-heated diode (diode.va's header); net_devices.zig builds it.
+    .{ .name = "diode_t", .base = "diode.va", .defines = "`define SELFHEATING\n" },
 };
 
 /// Third-party model releases, vendored in models/ as one file each (the
@@ -762,7 +937,6 @@ fn laneKernelImports(_: *Build, _: Build.ResolvedTarget, _: std.lang.Optimize, c
     return imports[0..1];
 }
 
-/// Absolute `sub_path` under `owner`'s package root, resolved against `b`'s.
 /// The VerA commit `espice --version` names: the one build.zig.zon pins,
 /// or for a `--fork=<VerA>` checkout its `git describe` ("-dirty" with
 /// uncommitted edits), or the fork's path when it is no git checkout.
@@ -781,8 +955,18 @@ fn veraCommit(b: *Build, vera: *Build) []const u8 {
     return std.mem.trimEnd(u8, out, "\n");
 }
 
+/// `sub_path` under `owner`'s package root, resolved against `b`'s:
+/// absolute, as Maker.zig:1155 hands the configurer an absolute build root
+/// unless --build-file names a relative directory.
 fn pathFromRoot(b: *Build, owner: *Build, sub_path: []const u8) []u8 {
     const top = b.root.root_dir.path orelse ".";
     const dep = owner.root.root_dir.path orelse ".";
     return b.pathResolve(&.{ top, b.root.sub_path, dep, owner.root.sub_path, sub_path });
+}
+
+/// `path` relative to `b`'s build root when it lies under it (a pinned
+/// package sits in zig-pkg/), else unchanged (a `--fork` checkout elsewhere).
+fn underBuildRoot(b: *Build, path: []const u8) []const u8 {
+    const rest = std.mem.cutPrefix(u8, path, pathFromRoot(b, b, "")) orelse return path;
+    return std.mem.cutPrefix(u8, rest, std.fs.path.sep_str) orelse path;
 }

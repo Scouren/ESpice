@@ -447,34 +447,6 @@ test "branch currents: op emits i(<card>) with ngspice's sign, last probe stays 
     try std.testing.expect(std.mem.startsWith(u8, res.varnames[res.varnames.len - 1], "v("));
 }
 
-test "sensing: a Spectre cccs binds the first exact-case source of its probe name" {
-    // F1 mirrors i(VCase) = -2 mA into out1 (+2 V), F2 i(vcase) = -3 mA
-    // (+3 V); binding the duplicate VCase would read 9 V.
-    const problem = try api.Problem.init(std.testing.allocator, std.testing.io, .{
-        .source = .{ .bytes = .{ .data =
-        \\// Spectre keeps case: VCase and vcase are two sources
-        \\VCase (first 0) vsource dc=2
-        \\vcase (second 0) vsource dc=3
-        \\VCase (duplicate 0) vsource dc=9
-        \\R1 (first 0) resistor r=1k
-        \\R2 (second 0) resistor r=1k
-        \\R3 (duplicate 0) resistor r=1k
-        \\F1 (out1 0) cccs probe=VCase gain=1
-        \\F2 (out2 0) cccs probe=vcase gain=1
-        \\R4 (out1 0) resistor r=1k
-        \\R5 (out2 0) resistor r=1k
-        \\op1 dc
-        \\
-        , .origin = "sensing.scs" } },
-        .dialect = .spectre,
-    });
-    defer problem.deinit();
-    try problem.run_all();
-    const res = try requestedResult(problem, 0);
-    try std.testing.expectApproxEqAbs(@as(f64, 2), probeFirst(res, "out1") orelse return error.NoProbe, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 3), probeFirst(res, "out2") orelse return error.NoProbe, 1e-9);
-}
-
 test "bsource: expressions of several probes match ngspice at the operating point" {
     // ngspice 45 on this deck (numdgt=12), including its default
     // `^` semantics: |x|^3 = +0.421875.
@@ -511,6 +483,69 @@ test "bsource: expressions of several probes match ngspice at the operating poin
     for (want) |w| {
         const k = findNameIndex(res.varnames, w[0]) orelse return error.MissingColumn;
         try std.testing.expectApproxEqRel(w[1], res.data[k], 1e-9);
+    }
+}
+
+test "behavioural resistor: the R card solves as its hand-written B, and a v()-free one as the plain R" {
+    // Metamorphic, from ngspice inpcom.c:6878: `R n1 n2 'eq'` is
+    // `B n1 n2 i=v(n1,n2)/(eq)`, so each pair is one set of equations; r2
+    // reads v(c), a net that is none of its terminals. `0*v(..)` leaves R a
+    // constant, so the plain resistor solves the same circuit. The decks run
+    // at reltol=1e-6, so Newton and the step control agree to that; OP and
+    // the transient's last point (both land on tstop).
+    const pairs = [_][2][]const u8{
+        .{ "r1 a b '500*(1+0.2*abs(v(a,b)))'\nr2 b 0 r={2k+100*v(c)}\n", "b1 a b i=v(a,b)/(500*(1+0.2*abs(v(a,b))))\nb2 b 0 i=v(b,0)/(2k+100*v(c))\n" },
+        .{ "r1 a b '500+0*v(a)'\nr2 b 0 {2k+0*v(c)}\n", "r1 a b 500\nr2 b 0 2k\n" },
+    };
+    for (pairs) |pair| {
+        var runs: [2]*api.Problem = undefined;
+        var made: usize = 0;
+        defer for (runs[0..made]) |run| run.deinit();
+        for (pair) |cards| {
+            const deck = try std.fmt.allocPrint(std.testing.allocator, "behavioural r\nvin in 0 dc 1 sin(1 0.5 10k)\nrs in a 1k\n{s}vc c 0 2\nc1 a 0 10n\n.options reltol=1e-6\n.op\n.tran 1u 50u\n.end\n", .{cards});
+            defer std.testing.allocator.free(deck);
+            runs[made] = try runDeck(deck);
+            made += 1;
+        }
+        const op = [2]Result{ try requestedResult(runs[0], 0), try requestedResult(runs[1], 0) };
+        const tran = [2]Result{ try requestedResult(runs[0], 1), try requestedResult(runs[1], 1) };
+        for ([_][]const u8{ "a", "b" }) |node| {
+            const at_op = probeFirst(op[1], node) orelse return error.NoProbe;
+            try std.testing.expectApproxEqRel(at_op, probeFirst(op[0], node) orelse return error.NoProbe, 1e-6);
+            const at_end = probeLast(tran[1], node) orelse return error.NoProbe;
+            try std.testing.expectApproxEqRel(at_end, probeLast(tran[0], node) orelse return error.NoProbe, 1e-6);
+        }
+    }
+}
+
+test "behavioural C and L: an equation constant in v solves as the plain card" {
+    // Metamorphic, from ngspice inpcom.c:6948-7056 (a9da7bc): C 'C0+0*v' is
+    // the G/R/C/V/B network for i = C0 dv/dt, C q='C0*v' the G/L/B one for
+    // i = dq/dt and L 'L0+0*v' the F/L/B one for v = L0 di/dt, each the
+    // plain card's equation. Every aux state is a fixed multiple of the plain
+    // card's, so the step control takes the same steps: ngspice-45 agrees
+    // to 5e-15 on this deck (65 time points each), so OP and the
+    // transient's last point to 1e-6.
+    const decks = [2][]const u8{
+        "c1 a 0 {10n+0*v(a)}\nc2 a 0 q={10n*v(a)}\nl1 a b {1m+0*v(b)}\n",
+        "c1 a 0 10n\nc2 a 0 10n\nl1 a b 1m\n",
+    };
+    var runs: [2]*api.Problem = undefined;
+    var made: usize = 0;
+    defer for (runs[0..made]) |run| run.deinit();
+    for (decks) |cards| {
+        const deck = try std.fmt.allocPrint(std.testing.allocator, "behavioural c l\nvin in 0 dc 1 sin(1 0.5 10k)\nrs in a 1k\n{s}rl b 0 100\n.options reltol=1e-6\n.op\n.tran 1u 50u\n.end\n", .{cards});
+        defer std.testing.allocator.free(deck);
+        runs[made] = try runDeck(deck);
+        made += 1;
+    }
+    const op = [2]Result{ try requestedResult(runs[0], 0), try requestedResult(runs[1], 0) };
+    const tran = [2]Result{ try requestedResult(runs[0], 1), try requestedResult(runs[1], 1) };
+    for ([_][]const u8{ "a", "b" }) |node| {
+        const at_op = probeFirst(op[1], node) orelse return error.NoProbe;
+        try std.testing.expectApproxEqRel(at_op, probeFirst(op[0], node) orelse return error.NoProbe, 1e-6);
+        const at_end = probeLast(tran[1], node) orelse return error.NoProbe;
+        try std.testing.expectApproxEqRel(at_end, probeLast(tran[0], node) orelse return error.NoProbe, 1e-6);
     }
 }
 

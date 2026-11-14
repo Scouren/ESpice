@@ -83,6 +83,26 @@ jobs:
           -Dgpu="$GPU" -Dcuda-arch="$CUDA" -Dhip-arch="$HIP"
           -j2 --prefix out --summary failures
 
+      # spice2rack beside espice in bin/, where the CLI looks after
+      # ESPICE_SPICERACK: SpiceRack at flake.lock's rev, static musl on
+      # Linux (the archive targets glibc 2.28), native on macOS.
+      - name: Bundle spice2rack
+        shell: bash
+        run: |
+          rev=$(python3 -c "import json;print(json.load(open('flake.lock'))['nodes']['spicerack']['locked']['rev'])")
+          case "$(uname -s)" in
+            Linux) triple="$(uname -m)-unknown-linux-musl"; rustup target add "$triple" ;;
+            *) triple="" ;;
+          esac
+          cargo install --locked --git https://github.com/Scouren/SpiceRack --rev "$rev" \
+            --no-default-features --bin spice2rack --root s2r ${triple:+--target "$triple"}
+          install -m 755 s2r/bin/spice2rack out/bin/spice2rack
+          # The archive's espice finds it with no ESPICE_SPICERACK and none on PATH.
+          (cd tests/conformance/tests/netlist/hspice && env -u ESPICE_SPICERACK PATH=/usr/bin:/bin \
+            "$GITHUB_WORKSPACE/out/bin/espice" -b --tokenizer hspice hspice_expressions.sp 2>&1 | tee "$RUNNER_TEMP/s2r.log"
+            exit "${PIPESTATUS[0]}")
+          grep -q 'espice: spicerack translated hspice_expressions.sp' "$RUNNER_TEMP/s2r.log"
+
       - name: Check runner CPU
         id: cpu
         shell: bash
@@ -144,12 +164,15 @@ jobs:
       - name: Smoke bundle outside Nix
         if: matrix.bundle && steps.cpu.outputs.runnable == 'true'
         run: |
+          # The launcher needs user namespaces it can mount in (docs/using/install.md);
+          # Ubuntu 23.10+ hosts, this runner included, restrict them through AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           docker build -t espice-bundle-smoke -f tools/release-container.Dockerfile tools
           docker run --rm --network none \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/conformance/tests/netlist:/fixtures:ro" \
+            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/conformance/tests/netlist:/home/bundle/fixtures:ro" \
             -v "$PWD/tools/release_smoke.sh:/smoke.sh:ro" \
-            espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
+            espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /home/bundle/fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
       # The tarball alone for hip-package: 18 .run bundles with ROCm inside
@@ -175,6 +198,8 @@ jobs:
   # and packaging/espice-hip.sh picks one at start (tools/hip_bundle.sh).
   hip-package:
     needs: [plan, build]
+    # A single-variant dispatch builds a HIP tarball only when it names one.
+    if: (inputs.variant || 'all') == 'all' || contains(inputs.variant, '-hip-')
     runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.plan.outputs.version }}

@@ -39,6 +39,8 @@ const Newton = mhb_newton.Newton;
 const LaneOutcome = mhb.LaneOutcome;
 const querySpectrum = mhb.querySpectrum;
 const publish = mhb.publish;
+const Planes = mhb_newton.Planes;
+const lane_fan = @import("../lane_fan.zig");
 
 /// Test-only counters of points the device batch admitted and of their line
 /// search backtracks; empty outside tests.
@@ -48,6 +50,61 @@ pub const gpu_test_access = if (@import("builtin").is_test) struct {
     /// Line-search backtracks of the admitted points.
     pub var backtracks = std.atomic.Value(usize).init(0);
 } else struct {};
+
+/// G1 stage 1: one round's per-point host steps of `runGpuBatch`, for
+/// `lane_fan.each`. Point p's step reads and writes only `states[p]` (its
+/// own circuit, transform, spectrum, `FreqSolver`, GMRES and slab, all
+/// allocated per point from the thread-safe scratch allocator) and
+/// `out[p]`; the batch planes `sampled` are read only. Neither step
+/// reaches a checkpoint (the round's ran in the serial sampling loop), so
+/// no helper thread parks the leader's worker. The serial loops in
+/// `runGpuBatch` are the oracle: same steps, same state, one point at a
+/// time.
+const Rows = struct {
+    active: []const u8,
+    states: []?Newton,
+    out: []LaneOutcome,
+    sampled: Planes,
+    used_device: bool,
+    points: usize,
+
+    /// The consume step: point p's samples, then `Newton.sampled`.
+    fn consume(r: Rows, p: usize) void {
+        std.debug.assert(r.active.len == r.points and r.states.len == r.points);
+        if (r.active[p] == 0) return;
+        const state = &r.states[p];
+        const s = &state.*.?;
+        if (r.used_device) {
+            scatter(s.planes.f, r.sampled.f, p, r.points);
+            scatter(s.planes.q, r.sampled.q, p, r.points);
+            scatter(s.planes.g, r.sampled.g, p, r.points);
+            scatter(s.planes.c, r.sampled.c, p, r.points);
+        } else {
+            sample(s.ckt, s.tr, s.nf, s.dt, s.x_hat, s.x_sample, s.planes);
+        }
+        s.sampled() catch |err| {
+            r.out[p] = err;
+            s.deinit();
+            state.* = null;
+        };
+    }
+
+    /// The host solve step of a linear-phase point: its preconditioner
+    /// factors, then the Krylov solve (`Newton.solveAlone`).
+    fn solveHost(r: Rows, p: usize) void {
+        std.debug.assert(r.states.len == r.points);
+        const state = &r.states[p];
+        const s = if (state.*) |*live| live else return;
+        if (s.phase != .linear) return;
+        s.factorHost() catch |err| {
+            r.out[p] = err;
+            s.deinit();
+            state.* = null;
+            return;
+        };
+        s.solveAlone();
+    }
+};
 
 /// Driven sparse HB/MHB points share sampled evaluation and resident
 /// Krylov work. Every point keeps its own Newton iteration and line search.
@@ -77,6 +134,16 @@ fn interleave(out: []f64, input: []const f64, point: usize, points: usize) void 
 fn scatter(out: []f64, input: []const f64, point: usize, points: usize) void {
     std.debug.assert(input.len == out.len * points);
     for (out, 0..) |*value, row| value.* = input[row * points + point];
+}
+
+/// Whether no live point holds a GPU context, so its host work (sampling,
+/// factors, `solveAlone`, `deinit`) never touches a driver and may run on
+/// any thread (G1).
+fn hostOnly(states: []const ?Newton) bool {
+    for (states) |state| if (state) |s| {
+        if (s.ckt.gpu != null or s.gpu_operator != null or s.gpu_held != null) return false;
+    };
+    return true;
 }
 
 fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.RunCtx, options: Options, out: []LaneOutcome) !void {
@@ -178,6 +245,9 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
     defer if (device) |*d| d.deinit();
     var device_samples: usize = 0;
     var device_solves: usize = 0;
+    // G1 stage 1: the pool the executor lent (`lane_fan.lent`, set only
+    // under the lever), when no point holds a GPU context of its own.
+    const lend: ?lane_fan.Lend = if (lane_fan.lent) |l| (if (hostOnly(states)) l else null) else null;
     while (true) {
         @memset(active, 0);
         var any = false;
@@ -207,7 +277,10 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
             device_samples += 1;
             break :blk true;
         } else false;
-        for (active, states, 0..) |enabled, *state, p| {
+        if (lend) |l| {
+            const rows: Rows = .{ .active = active, .states = states, .out = out, .sampled = sampled, .used_device = used_device, .points = N };
+            lane_fan.each(l.pool, l.threads, N, rows, Rows.consume);
+        } else for (active, states, 0..) |enabled, *state, p| {
             if (enabled == 0) continue;
             const s = &state.*.?;
             if (used_device) {
@@ -256,7 +329,10 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
             device_solves += 1;
             break :blk true;
         } else false;
-        for (states, 0..) |*state, p| if (state.*) |*s| {
+        if (lend != null and !solved_device) {
+            const rows: Rows = .{ .active = active, .states = states, .out = out, .sampled = sampled, .used_device = false, .points = N };
+            lane_fan.each(lend.?.pool, lend.?.threads, N, rows, Rows.solveHost);
+        } else for (states, 0..) |*state, p| if (state.*) |*s| {
             if (s.phase != .linear) continue;
             if (solved_device) {
                 scatter(s.dx, dx, p, N);

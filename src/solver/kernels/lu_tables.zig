@@ -15,8 +15,16 @@ const std = @import("std");
 const assert = std.debug.assert;
 const klu = @import("lu.zig");
 const SparseLu = @import("../sparse_lu.zig").SparseLu;
+const lu_runs = @import("../lu_runs.zig");
+const lever = @import("lu_lever_tables.zig");
+const chunks = @import("lu_chunks.zig");
+const tile = @import("lu_tile.zig");
+const instrument = @import("../sparse_lu.zig").instrument;
+const TailLevels = lever.TailLevels;
+const tailLevels = lever.tailLevels;
 
-/// Overrides of `build`'s own choices, for tests and E2 calibration.
+/// Overrides of `build`'s own choices, for tests and E2 calibration, and
+/// the levers the kernels read from `Tab.levers`.
 pub const Options = struct {
     /// The solves' tail cut t0.
     tail: ?u32 = null,
@@ -24,6 +32,29 @@ pub const Options = struct {
     gather: bool = true,
     /// False keeps `dmap` at u32 even where u16 fits.
     dmap16: bool = true,
+    /// G2 part 1 (exact): the refactor publishes each column before its
+    /// growth test and loads a step's first flops before the previous
+    /// step's barrier. No table changes; sets `klu.lever_g2`.
+    g2: bool = false,
+    /// G7 stage 1 (exact): the tail panels load their block before the
+    /// waits and sweep it by in-panel level. Appends `Tab.tl_in`..`t_nlv`
+    /// (5 u32 per tail row, 2 per panel) after today's tables, which stay
+    /// as they were; sets `klu.lever_g7`.
+    g7: bool = false,
+    /// G2 part 2 stage A (exact): each supernode run of a stored-order
+    /// column's U list is one step, from `lu`'s C1 tables (`lu.runs`,
+    /// built by a `factor` with `runs_on`); without them, no effect.
+    /// Columns with runs keep the stored order, `dmap` drops their runs'
+    /// flops, `val` gains the panels; sets `klu.lever_runs`.
+    runs: bool = false,
+    /// N1 (exact, host lanes only): the tail `lu_tile.choose` admits runs
+    /// as tiles after the tickets; its columns keep the stored-order form
+    /// (no gather, no runs); appends `Tab.tseg`, `tdm`, `tpan`; sets
+    /// `klu.lever_tile`. Not for the device.
+    tile: bool = false,
+    /// With `tile`: the tail order instead of the rule's (0: none), for
+    /// tests.
+    tile_order: ?u32 = null,
 };
 
 /// The device tables of one pivot epoch.
@@ -81,6 +112,13 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
     const ui = lu.ui.items;
     const nu: u32 = @intCast(ui.len);
     const nnz = col_ptr[n];
+    const rv: ?lu_runs.View = if (opt.runs and lu.runs.run_ptr.items.len == @as(usize, n) + 1) lu.runs.view() else null;
+    // N1's tail: from `tile0` on (n for none). Its census prints with the
+    // statistics whether or not the lever is on.
+    const stats = instrument and lu.stats;
+    const pick: tile.Choice = if (opt.tile and opt.tile_order != null) .{ .order = opt.tile_order.? } else if (opt.tile or stats) tile.choose(lu, stats) else .{};
+    assert(pick.order <= n);
+    const tile0 = if (opt.tile) n - pick.order else n;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -163,10 +201,21 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
         // lanes idle): the analysis walks every flop of the column again,
         // which on a dense tail (logic_bsim4_10k) doubled the table build.
         const sparse_steps = col_flops * 2 < @as(u64, nuk) * lanes;
-        const gathered = opt.gather and nuk >= gather_min_u and sparse_steps and try gatherColumn(ar, lu, k, base, coff[k + 1] - base, pos, lvl, cnt, pseq, &lev_ptr, &g_slot, &g_cptr, &g_l, &g_u);
+        // A tile column keeps the plain stored order: its `dmap` is read
+        // by segments (`lu_tile.tables`).
+        const in_tile = k >= tile0;
+        const rv0 = if (rv != null and !in_tile) rv.?.run_ptr[k] else 0;
+        const rv1 = if (rv != null and !in_tile) rv.?.run_ptr[k + 1] else 0;
+        const gathered = !in_tile and rv0 == rv1 and opt.gather and nuk >= gather_min_u and sparse_steps and try gatherColumn(ar, lu, k, base, coff[k + 1] - base, pos, lvl, cnt, pseq, &lev_ptr, &g_slot, &g_cptr, &g_l, &g_u);
         if (!gathered) {
             assert(nd + col_flops <= flops);
+            var ri = rv0;
             for (up[k]..up[k + 1]) |p| {
+                // `Options.runs`: a run's flops go through its panel.
+                if (ri < rv1 and p >= rv.?.run_at[ri]) {
+                    if (p + 1 == rv.?.run_at[ri] + rv.?.run_len[ri]) ri += 1;
+                    continue;
+                }
                 const i = ui[p];
                 const rows = li[lp[i]..lp[i + 1]];
                 if (dmap16) {
@@ -179,6 +228,13 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
         }
     }
     dcol[n] = @intCast(nd);
+    const rt: lever.RunTables = if (rv) |v| try lever.runTables(ar, lu, v, coff, pos) else .{};
+    // G2 step 4's census (`ZP_LU_STATS`): reads the pattern only.
+    const tt: tile.Tables = if (tile0 < n) try tile.tables(ar, lu, tile0, dcol) else .{};
+    if (stats) {
+        const pat: chunks.Pattern = .{ .lp = lp, .li = li, .up = up, .ui = ui, .void_col = lu.void_col };
+        if (chunks.census(ar, pat)) |c| c.print() else |e| std.debug.print("lu-chunks: {s}\n", .{@errorName(e)});
+    }
     wlev[n] = @intCast(lev_ptr.items.len - 1);
     // An odd u16 count leaves half a word: zero it, so the tables are a
     // function of the factor.
@@ -301,7 +357,10 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
         }
     }
 
-    // Concatenate, each table at the Tab field of its name.
+    const g7: TailLevels = if (opt.g7) try tailLevels(ar, tn, tl_ptr, tl_col, tu_ptr, tu_col) else .{};
+
+    // Concatenate, each table at the Tab field of its name; the lever
+    // tables last, so without them `idx` is today's.
     const parts = .{
         .{ "dmap", dmap.items[0..dwords] }, .{ "coff", coff },                   .{ "up", up },               .{ "lp", lp },
         .{ "ui", ui },                      .{ "ul0", ul0 },                     .{ "ulen", ulen },           .{ "flags", flags },
@@ -312,7 +371,10 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
         .{ "l_slot", l_slot },              .{ "perm_in", perm_in },             .{ "u_lev", u_sched.lev },   .{ "u_rows", u_sched.rows },
         .{ "u_ptr", u_ptr },                .{ "u_col", u_col },                 .{ "u_slot", u_slot },       .{ "l_chunk", l_chunk },
         .{ "u_chunk", u_chunk },            .{ "tl_ptr", tl_ptr },               .{ "tl_col", tl_col },       .{ "tl_slot", tl_slot },
-        .{ "tu_ptr", tu_ptr },              .{ "tu_col", tu_col },               .{ "tu_slot", tu_slot },
+        .{ "tu_ptr", tu_ptr },              .{ "tu_col", tu_col },               .{ "tu_slot", tu_slot },     .{ "tl_in", g7.tl_in },
+        .{ "tu_in", g7.tu_in },             .{ "tl_lv", g7.tl_lv },              .{ "tu_lv", g7.tu_lv },      .{ "t_nlv", g7.t_nlv },
+        .{ "rcol", rt.rcol },               .{ "rinfo", rt.rinfo },              .{ "rmap", rt.rmap },        .{ "lpv", rt.lpv },
+        .{ "tseg", tt.tseg },               .{ "tdm", tt.tdm },                  .{ "tpan", tt.tpan },
     };
     var tab: klu.Tab = undefined;
     tab.n = n;
@@ -323,8 +385,12 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
     tab.u_levels = u_levels;
     tab.l_chunks = @intCast(l_chunk.len - 1);
     tab.u_chunks = @intCast(u_chunk.len - 1);
-    tab.n_val = n_val;
+    tab.n_val = std.math.cast(u32, @as(u64, n_val) + rt.pv_len) orelse return error.OutOfMemory;
     tab.dmap16 = @intFromBool(dmap16);
+    tab.tile0 = tile0;
+    tab.tile_np = if (tile0 < n) @intCast(tt.tpan.len - 1) else 0;
+    tab.tile_tickets = if (tile0 < n) tt.tpan[tt.tpan.len - 1] else 0;
+    tab.levers = (if (opt.g2) klu.lever_g2 else 0) | (if (opt.g7) klu.lever_g7 else 0) | (if (rv != null) klu.lever_runs else 0) | (if (tile0 < n) klu.lever_tile else 0);
     var total: usize = 0;
     inline for (parts) |part| {
         @field(tab, part[0]) = std.math.cast(u32, total) orelse return error.OutOfMemory;

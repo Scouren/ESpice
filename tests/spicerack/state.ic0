@@ -1,0 +1,4 @@
+* state.ic0: a decoy in the working directory of the spicerack/load check,
+* named as files_spice2rack.sh's .load file. Read in its place, v(b)
+* starts at 0.75 V, not 0.25 V.
+.ic v(b)=0.75

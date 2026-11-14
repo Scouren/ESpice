@@ -14,6 +14,7 @@
 //! - `pub fn deinit() void`
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const contract = @import("contract");
 const vera = @import("fastvaf");
@@ -132,12 +133,19 @@ pub fn deinit() void {
 
 // ---- private ----
 
+/// Opens the application file at `path` and runs its startup routines.
+/// A name with no directory is a file in the work directory, as every other
+/// file argument is, never one dlopen finds on the library path.
 fn loadApp(_: *anyopaque, path: []const u8) VpiError!void {
     host.mutex.lockUncancelable(host.io);
     defer host.mutex.unlock(host.io);
     for (host.apps.items) |a| if (std.mem.eql(u8, a, path)) return;
-    var lib = std.DynLib.open(path) catch |err| {
-        std.log.err("vpi: {s}: cannot open the application ({s})", .{ path, @errorName(err) });
+    // Longer than `max_path_bytes` fails the open as NameTooLong either way.
+    var file_buf: [std.Io.Dir.max_path_bytes + 2]u8 = undefined;
+    const file = if (std.fs.path.dirname(path) != null) path else std.fmt.bufPrint(&file_buf, "./{s}", .{path}) catch path;
+    var lib = std.DynLib.open(file) catch |err| {
+        var buf: [std.Io.Dir.max_path_bytes + 256]u8 = undefined;
+        std.log.err("vpi: {s}: cannot open the application: {s}", .{ path, unloadable(host.io, path, err, &buf) });
         return error.VpiApplicationUnloadable;
     };
     // The symbol is the array itself, so its address is its first entry's.
@@ -155,6 +163,19 @@ fn loadApp(_: *anyopaque, path: []const u8) VpiError!void {
     // registry, even if the name list below fails.
     vpi.session.runStartupTable(table);
     host.int_names = try vpi.systf.intAnalogNames(host.names_arena.allocator());
+}
+
+/// Why `std.DynLib.open(path)` failed with `err`, which DynLib reports as
+/// FileNotFound whatever `dlopen` said: "no such file" when nothing is at
+/// `path`, else "not a loadable shared object (<dlerror's text>)", such as
+/// glibc's "<path>: file too short" or "<path>: invalid ELF header", in
+/// `buf` (cut at its end). Call it right after the failed open: the next
+/// `dl*` call replaces dlerror's text.
+fn unloadable(io: std.Io, path: []const u8, err: std.DynLib.Error, buf: []u8) []const u8 {
+    const dl: ?[*:0]const u8 = if (builtin.link_libc and err == error.FileNotFound) std.c.dlerror() else null;
+    std.Io.Dir.cwd().access(io, path, .{}) catch |e| return if (e == error.FileNotFound) "no such file" else @errorName(e);
+    const why = if (dl) |s| std.mem.span(s) else @errorName(err);
+    return std.fmt.bufPrint(buf, "not a loadable shared object ({s})", .{why}) catch buf;
 }
 
 fn intSystfs(_: *anyopaque) []const []const u8 {
@@ -329,4 +350,31 @@ fn systfTok(k: usize) callconv(.c) u32 {
 fn systfOuts(k: usize) callconv(.c) u64 {
     assert(k < host.calls.len);
     return host.calls[k].outs;
+}
+
+test "unloadable: a file that is no shared object gets dlopen's reason, a missing one no such file" {
+    // Oracle: glibc 2.42's dlerror for this 30-byte text file, measured
+    // with Python ctypes ("<path>: file too short"). Red before: both
+    // reported DynLib's FileNotFound.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "x.vpi", .data = "a text file, no shared object\n" });
+    var why_buf: [std.Io.Dir.max_path_bytes + 256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const text = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/x.vpi", .{tmp.sub_path});
+    const refused = if (std.DynLib.open(text)) |l| {
+        var lib = l;
+        lib.close();
+        return error.TextFileLoaded;
+    } else |e| e;
+    // What DynLib says of it, the reason `unloadable` exists.
+    try std.testing.expectEqual(error.FileNotFound, refused);
+    const why = unloadable(io, text, refused, &why_buf);
+    try std.testing.expect(std.mem.startsWith(u8, why, "not a loadable shared object ("));
+    if (builtin.link_libc) try std.testing.expect(std.mem.indexOf(u8, why, "/x.vpi") != null);
+    if (builtin.link_libc and builtin.abi.isGnu()) try std.testing.expect(std.mem.endsWith(u8, why, ": file too short)"));
+    const gone = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/gone.vpi", .{tmp.sub_path});
+    const missing = if (std.DynLib.open(gone)) |_| return error.MissingFileLoaded else |e| e;
+    try std.testing.expectEqualStrings("no such file", unloadable(io, gone, missing, &why_buf));
 }

@@ -1,6 +1,7 @@
-//! Temperature sweep (`.temp`): one structural lane per temperature, using
-//! the devices' own temperature physics (`Circuit.setCircuitTemp`), no
-//! external coefficients.
+//! Temperature sweep, the API's `temp` query (`core.query.Temp`; no deck
+//! card reaches it: a deck sweeps temperature with `.dc temp`): one
+//! structural lane per temperature, using the devices' own temperature
+//! physics (`Circuit.setCircuitTemp`), no external coefficients.
 //! In: a run context and the temperature range. Out: real point-major rows
 //! (temp, probes...), one per converged temperature.
 //! Cites no outside source.
@@ -34,12 +35,12 @@ pub const Setup = struct {
 
     /// Installs lane `k`'s temperature.
     pub fn apply(self: *Setup, k: usize) !void {
-        self.ckt.setCircuitTemp(@floatCast(self.t_start + @as(f64, @floatFromInt(k)) * self.t_step));
+        try self.ckt.setCircuitTemp(@floatCast(self.t_start + @as(f64, @floatFromInt(k)) * self.t_step));
     }
 
     /// Reinstalls the temperature from before the sweep.
     pub fn restore(self: *Setup) !void {
-        self.ckt.setCircuitTemp(self.temp_c);
+        try self.ckt.setCircuitTemp(self.temp_c);
     }
 
     /// Frees nothing: the `lanes.run` protocol's hook.

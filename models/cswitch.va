@@ -25,7 +25,6 @@ module cswitch(p, n, cp, cn);
     parameter real ron    = 1.0    from (0:inf);  // ohm  on resistance
     parameter real roff   = 1.0e12 from (0:inf);  // ohm  off resistance (1/gmin)
     parameter real vsense = 0.0;                  // V    ammeter voltage; the builder leaves it 0
-    parameter integer ic  = 0;                    //      >0 = start ON
 
     integer latched;  // held across evaluations: the in-band memory
     integer on;
@@ -41,7 +40,10 @@ module cswitch(p, n, cp, cn);
         V(ctl) <+ vsense;
         u = I(ctl);
 
-        @(initial_step) latched = (ic > 0) ? 3 : 2;
+        // The .op's in-band state: cswload.c:65-88 step from CKTstate1, which
+        // no .op writes (REALLY_OFF), so off for ih > 0 and HYST_ON for
+        // ih <= 0, whatever ON or OFF the card carries (cswparam.c:24-31).
+        @(initial_step) latched = (ih > 0.0) ? 2 : 3;
 
         @(cross(u - hi, +1)) latched = 3;                    // -> HYST_ON
         @(cross(u - lo, -1)) latched = 2;                    // -> HYST_OFF

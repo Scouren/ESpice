@@ -14,8 +14,11 @@
 //   * Junction currents/charges carry `type` and use the true node voltages,
 //     and the intrinsic drain charge is un-swapped for V(di,si) < 0 (b1ld.c
 //     ceqbs/ceqbd/ceqqg and the B1mosCap argument+output swap).
-//   * Model-level TEMP (degC) is not declared: Verilog-A cannot carry two
-//     `temp` parameters and no equation reads it; the instance TEMP (K) feeds Vt.
+//
+// `temp` is ngspice's model TEMP in degC (b1.c:97), stored and never read
+// (b1set.c:190-192): Vt is CONSTvt0 at 300.15 K whatever the circuit
+// temperature (b1ld.c:361-380), and the thermal noise is at the circuit
+// temperature (b1noi.c:81-91, nevalsrc.c:110-111).
 
 `include "constants.vams"
 `include "disciplines.vams"
@@ -88,8 +91,15 @@ module bsim1(d, g, s, b);
     parameter integer type  = 1 from [-1:1] exclude 0;  // 1 = NMOS, -1 = PMOS
     parameter real w    = 5e-6   from (0:inf);
     parameter real l    = 5e-6   from (0:inf);
-    parameter real temp = 300.15 from (0:inf);          // K
+    parameter real temp = 27.0;                         // degC, never read
     parameter real m    = 1.0    from (0:inf);
+    // Junction geometry (b1.c:15-18), 0 when not given (b1set.c:284-310):
+    // no area means the 1e-15 A saturation floor and no junction caps
+    // (b1ld.c:139-149, 439-442).
+    parameter real ad   = 0.0    from [0:inf);          // m^2 drain area
+    parameter real as   = 0.0    from [0:inf);          // m^2 source area
+    parameter real pd   = 0.0    from [0:inf);          // m   drain perimeter
+    parameter real ps   = 0.0    from [0:inf);          // m   source perimeter
 
     // bias-independent
     real leff, weffr, lum, wum, wm, toxcm, cox, coxp, bfac, wlcox;
@@ -170,14 +180,14 @@ module bsim1(d, g, s, b);
         bvdd_d = max(x3mse * bfac, 0.0);
 
         // ============ temperature scaling =================================
-        // BSIM1 has no temperature model beyond Vt at the instance TEMP (K).
-        vt = 1.38064852e-23 * temp / 1.6021766208e-19; // CONSTvt0 at the default 300.15 K
+        // BSIM1 has no temperature model: Vt is CONSTvt0 at REFTEMP 300.15 K.
+        vt = 1.38064852e-23 * 300.15 / 1.6021766208e-19;
 
         // ============ geometry, junction sizing ===========================
-        asource = wdf > 0.0 ? wdf * dell : wm * 1e-6;
-        adrain  = asource;
-        psource = 2.0 * wm;
-        pdrain  = psource;
+        asource = as;
+        adrain  = ad;
+        psource = ps;
+        pdrain  = pd;
         isats   = max(asource * js, 1e-15);
         isatd   = max(adrain  * js, 1e-15);
         vcrits  = vt * ln(vt / (1.4142135623730951 * isats));
@@ -353,20 +363,20 @@ module bsim1(d, g, s, b);
         // RSH*NR is zero.
         if (gdrain > 0.0) begin
             I(d, di) <+ gdrain * V(d, di)
-                      + white_noise(4.0 * 1.38064852e-23 * temp * gdrain, "rd");
+                      + white_noise(4.0 * 1.38064852e-23 * $temperature * gdrain, "rd");
         end else begin
             V(d, di) <+ 0.0;
         end
         if (gsource > 0.0) begin
             I(s, si) <+ gsource * V(s, si)
-                      + white_noise(4.0 * 1.38064852e-23 * temp * gsource, "rs");
+                      + white_noise(4.0 * 1.38064852e-23 * $temperature * gsource, "rs");
         end else begin
             V(s, si) <+ 0.0;
         end
 
         // ============ noise (mos1noi.c form) ==============================
         // Cox'^2 in the flicker denominator.
-        I(di, si) <+ white_noise(4.0 * 1.38064852e-23 * temp * (2.0 / 3.0) * abs(gmnoi),
+        I(di, si) <+ white_noise(4.0 * 1.38064852e-23 * $temperature * (2.0 / 3.0) * abs(gmnoi),
                                  "channel");
         if (kf > 0.0) begin
             I(di, si) <+ flicker_noise(kf * pow(abs(id), af)

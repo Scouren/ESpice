@@ -12,6 +12,8 @@
 //! - `pub const SaveOp = struct`
 //! - `pub const Stim = struct`
 //! - `pub const AcOverride = struct`
+//! - `pub const NoiseGap = struct { card: []const u8, key: []const u8 }`
+//! - `pub const Temper = struct`, `Temper.count(self: Temper) u32`
 //! - `pub const Variants = struct`, `Variants.Kind = enum { step, data, monte, alter }`,
 //!   `Variants.count(self: Variants) u32`,
 //!   `Variants.writes(self: Variants, v: u32) struct { []const u32, []const f64 }`,
@@ -24,7 +26,7 @@
 //! - `pub const Soa = struct`, `pub const SoaLimit = struct`
 //! - `pub const QueryBindings = struct`
 //! - `pub const Deck = struct`
-//! - `pub const OpVar = struct`, `OpVar.Quantity = enum(u8)`
+//! - `pub const OpVar = struct`, `OpVar.Quantity = enum(u8)`, `OpVar.mosfet_quantities`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -87,6 +89,37 @@ pub const AcOverride = struct {
     index: u32,
     param_name: []const u8,
     value: f64,
+};
+
+/// A card that sets a noise-only parameter ESPice does not model, at a
+/// value that is not inert (a resistor's `kf` other than 0). A `.noise`
+/// would drop that generator, so `validate.validateDeck` refuses `.noise`
+/// on a deck that has one; every other analysis runs, since the key moves
+/// none of their numbers.
+pub const NoiseGap = struct { card: []const u8, key: []const u8 };
+
+/// Device parameters whose card value reads `temper`, the circuit
+/// temperature in °C. ngspice re-evaluates them (inp_evaluate_temper) before
+/// each analysis and at each `.dc temp` point (cktdojob.c:133,
+/// dctrcurv.c:217, 379), and `Circuit.setCircuitTemp` does here: expression
+/// `k` writes its value to the parameters numbered
+/// `refs[starts[k]..starts[k + 1]]` (`Circuit.collectParams` ordinals, as
+/// `Variants.refs`). `eval` is a function pointer because the evaluator is
+/// the frontend's and the analysis does not import it (the build graph's
+/// cut); the frontend's `prepared_temper.zig` is its one implementation.
+pub const Temper = struct {
+    starts: []const u32,
+    refs: []const u32,
+    /// Expression `k`'s value at `temp_c` °C; `ctx` is the frontend's table.
+    eval: *const fn (ctx: *const anyopaque, k: u32, temp_c: f64) error{OutOfMemory}!f64,
+    ctx: *const anyopaque,
+
+    /// Number of expressions. Asserts a non-empty `starts`.
+    pub fn count(self: Temper) u32 {
+        assert(self.starts.len >= 2);
+        assert(self.starts[self.starts.len - 1] == self.refs.len);
+        return @intCast(self.starts.len - 1);
+    }
 };
 
 /// Circuit variants over one topology: `.step` and `.data` points, `.alter`
@@ -284,6 +317,9 @@ pub const QueryBindings = struct {
     /// `DISTOF2 <mag> <phase>` of each V card; empty is none.
     v_distof2: []const [2]f64 = &.{},
     ports: []const requests.Port,
+    /// Every V and I card, in card order (a zero phasor without an `AC`
+    /// spec): `Deck.ac_drive` one card at a time, for `.sens ... ac`.
+    ac_sources: []const requests.Sens.AcSource = &.{},
 };
 
 /// The prepared deck. Session-owned; every slice lives in the arena that
@@ -335,6 +371,12 @@ pub const Deck = struct {
     /// `cards` as a dense per-type column, for per-instance labels.
     card_names: requests.CardNames = .empty,
     ac_overrides: []const AcOverride,
+    /// Noise-only keys the cards set and ESPice does not model, in card
+    /// order. Only a `.noise` query reads it.
+    noise_gaps: []const NoiseGap = &.{},
+    /// The parameters that follow the circuit temperature; null when no
+    /// card value reads `temper`.
+    temper: ?Temper = null,
     /// `.meas` cards, in deck order, evaluated over finished results.
     measures: []const Measure = &.{},
     variants: Variants = .{},
@@ -370,19 +412,41 @@ pub const Deck = struct {
 
 /// One device operating-point variable (ngspice `@m1[gm]`, #236) of
 /// instance `index` of circuit batch `batch`, a device with `ports`
-/// terminals, published as `label`: the model's own variable `own`, or else
-/// the terminal `quantity`.
+/// terminals, published as `label`: the model's own variable `own`, a
+/// parameter `param` (ngspice `@v1[dc]`), or else the terminal `quantity`.
 pub const OpVar = struct {
     label: []const u8,
     batch: u32,
     index: u32,
     ports: u32,
-    /// Index into the batch's `Hooks.op_vars`; null for a terminal quantity.
+    /// Index into the batch's `Hooks.op_vars`; null for a parameter or a
+    /// terminal quantity.
     own: ?u32 = null,
+    /// Ordinal in the batch's `Hooks.param_layout`; null for a variable.
+    /// Its value is the run's, and along a `.dc` that sweeps it the sweep's.
+    param: ?u32 = null,
     quantity: Quantity = .id,
     /// Whether the card is p-type (`pmos`), which flips the sign of its
     /// terminal currents and voltages.
     pmos: bool = false,
+    /// What the value is multiplied by: the card's `m=` (and `scale=`) that
+    /// the frontend folds into the device where ngspice's value keeps them
+    /// out (frontend `opvar_ngspice.Card`). Never the swept value's.
+    times: f64 = 1,
+    /// A transient's terminal currents carry their charging currents: the
+    /// integrator replayed over the instance's charges at the recorded
+    /// rows (`Result.steps`), as ngspice's `.tran` adds them.
+    charging: bool = false,
+    /// At a transient row the own variable adds ag0 × own variable
+    /// `companion`, its capacitance: the integrator's companion
+    /// conductance, as ngspice's `.tran` adds it (NIintegrate's geq).
+    companion: ?u32 = null,
+    /// ngspice's value at a transient row is not one evaluation's: a
+    /// `.tran` whose rows neither `charging` nor `companion` serves, as one
+    /// the API appends to a deck that runs none, or one whose first row is
+    /// no operating point (uic, TSTART > 0), is refused
+    /// (`validate.validateDeck`, `error.UnreplayedOpVar`).
+    dynamic: bool = false,
 
     /// A MOSFET's terminal quantities, after ngspice's names, from its
     /// static currents and charges with its internal nodes eliminated
@@ -393,8 +457,15 @@ pub const OpVar = struct {
     /// report them; `c<x><y>` is -∂Q_x/∂V_y, `cgg` is ∂Q_g/∂V_g, overlap
     /// included; `ft` is gm / (2π cgg) of that terminal `cgg` even where
     /// the model's own `cgg` shadows it. `ids` is BSIM-CMG's name for `id`.
-    /// A model's own variable of the same name wins.
-    pub const Quantity = enum(u8) { id, ids, ig, is, ib, gm, gds, gmbs, cgg, cgd, cgs, cgb, ft, vgs, vds, vbs };
+    /// A model's own variable of the same name wins. Any device's, named
+    /// only through the frontend's ngspice table (`opvar_ngspice.zig`):
+    /// `id` the current into terminal 0, `v` the voltage from terminal 0
+    /// to 1, `p` the static power its terminals absorb, the sum of the
+    /// current into each times its voltage.
+    pub const Quantity = enum(u8) { id, ids, ig, is, ib, gm, gds, gmbs, cgg, cgd, cgs, cgb, ft, vgs, vds, vbs, v, p };
+
+    /// The MOSFET's terminal quantities: `Quantity` up to `vbs`.
+    pub const mosfet_quantities = std.enums.values(Quantity)[0 .. @backingInt(Quantity.vbs) + 1];
 };
 
 test "Variants slice each row's writes out of the shared columns" {

@@ -222,7 +222,10 @@ pub fn ProtoStore(comptime D: type) type {
             store.slots = &.{};
             store.original_ids = &.{};
             store.bypass = null;
+            store.census = null;
             if (comptime has_q) store.q_tape = &.{};
+            if (comptime has_q) store.track_q = false;
+            if (comptime has_q) store.q_clean = false;
             if (comptime traits.hasSpiceBreaks(D)) store.src_brk = &.{};
             if (comptime @hasDecl(D, "limit")) store.lim_x = &.{};
             if (comptime @hasDecl(D, "State")) store.states = &.{};

@@ -1,0 +1,197 @@
+diff --git a/src/analysis/executor.zig b/src/analysis/executor.zig
+index 435e398e..27e0c372 100644
+--- a/src/analysis/executor.zig
++++ b/src/analysis/executor.zig
+@@ -626,4 +626,5 @@ fn printNewtonSplit(ws: *const converger.Workspace, job: requests.Query) void {
+             .tri, .bbd => 0,
+         },
+     });
++    converger.Census.print(@tagName(job));
+ }
+diff --git a/src/device/batch_bypass.zig b/src/device/batch_bypass.zig
+index 7ae45140..17a579b9 100644
+--- a/src/device/batch_bypass.zig
++++ b/src/device/batch_bypass.zig
+@@ -120,6 +120,13 @@ pub fn Bypass(comptime D: type) type {
+             const total = h + bp.misses.load(.monotonic);
+             if (total < 4 * @as(u64, count)) return;
+             if (h * 5 < total) bp.off = true;
++            // CENSUS (throwaway): the hit rate at the decision and at each power-of-two review after it.
++            const S = struct {
++                var calls: u64 = 0;
++            };
++            S.calls += 1;
++            if (bp.off or std.math.isPowerOfTwo(S.calls))
++                std.debug.print("census-bypass: {s} count={d} hits={d} total={d} off={} reviews={d}\n", .{ @typeName(D), count, h, total, bp.off, S.calls });
+         }
+ 
+         /// `Hooks.set_bypass`: sets the tolerances, clearing every
+diff --git a/src/solver/converger.zig b/src/solver/converger.zig
+index c77cae42..73c56f8d 100644
+--- a/src/solver/converger.zig
++++ b/src/solver/converger.zig
+@@ -279,6 +279,7 @@ pub fn newtonLanes(
+     if (W == 1) if (comptime @hasDecl(S, "certify") and S.certify) try sys.certifyReserve();
+     const prof = &ws.prof;
+ 
++    var census_stale: f64 = -1;
+     while (iter < opts.max_iter) : (iter += 1) {
+         if (W > 1) sys.active = active;
+         if (comptime @hasDecl(S, "checkpoint")) if (iter != 0)
+@@ -306,6 +307,26 @@ pub fn newtonLanes(
+             // solve; false leaves both to the host.
+             const on_device = if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false;
+             if (!on_device) {
++                // CENSUS (throwaway): the step the held factor (iterate k-1's) gives at iterate k.
++                census_stale = -1;
++                if (iter >= 1 and slv.factored) {
++                    if (slv.unchanged(v)) {
++                        Census.reuse += 1;
++                    } else {
++                        if (Census.buf.len < sys.n) Census.buf = std.heap.page_allocator.alloc(f64, sys.n) catch &.{};
++                        if (Census.buf.len >= sys.n) {
++                            slv.solveNeg(sys.rhs, Census.buf);
++                            var worst: f64 = 0;
++                            for (x[0..sys.n], Census.buf[0..sys.n], sys.current_row[0..sys.n]) |xo, d, cur| {
++                                const tol = opts.reltol * @max(@abs(xo + d), @abs(xo)) + (if (cur) opts.abstol else opts.vntol);
++                                const q = @abs(d) / tol;
++                                if (q != q) continue;
++                                worst = @max(worst, q);
++                            }
++                            census_stale = worst;
++                        }
++                    }
++                }
+                 slv.factor(v, newton_sys.executionOf(sys)) catch |e| {
+                     if (ws.knobs.opdbg) {
+                         var nan_cnt: usize = 0;
+@@ -333,6 +354,25 @@ pub fn newtonLanes(
+         // stale value, so the extra pass solved F(lim(x)) = 0 (#53).
+         const st = finalizeStep(W, sys, hook, x, dx, x_old, sys.rhs, v, iter, t, opts, limit, load_ok, L.not(init_fix), active);
+         prof.lap(.update);
++        if (W == 1) {
++            if (st.converged) Census.its[@min(iter, 5)] += 1;
++            if (census_stale >= 0) {
++                Census.later += 1;
++                if (st.converged) Census.conv += 1;
++                for (Census.thetas, 0..) |th, i| if (census_stale < th) {
++                    if (st.converged) {
++                        Census.save[i] += 1;
++                    } else if (st.why == .delta) {
++                        Census.wrong_delta[i] += 1;
++                    } else Census.wrong_other[i] += 1;
++                };
++                if (st.converged) {
++                    const s = st.scaled;
++                    Census.true_hist[if (s < 0.01) 0 else if (s < 0.1) 1 else if (s < 0.25) 2 else if (s < 0.5) 3 else 4] += 1;
++                    Census.stale_hist[if (census_stale < 0.01) 0 else if (census_stale < 0.1) 1 else if (census_stale < 0.25) 2 else if (census_stale < 0.5) 3 else if (census_stale < 1) 4 else 5] += 1;
++                }
++            }
++        }
+         if (W == 1) if (ws.knobs.opdbg) {
+             var fi: usize = 0;
+             var di: usize = 0;
+@@ -493,6 +533,34 @@ pub fn updateAndNorm(comptime W: usize, x: []Lanes(W).V, dx: []const Lanes(W).V,
+     return result;
+ }
+ 
++/// CENSUS (throwaway): the confirming solve on the held factor.
++pub const Census = struct {
++    pub const thetas = [4]f64{ 1.0, 0.5, 0.25, 0.1 };
++    pub var later: u64 = 0;
++    pub var conv: u64 = 0;
++    pub var reuse: u64 = 0;
++    pub var save: [4]u64 = @splat(0);
++    pub var wrong_delta: [4]u64 = @splat(0);
++    pub var wrong_other: [4]u64 = @splat(0);
++    pub var true_hist: [5]u64 = @splat(0);
++    pub var stale_hist: [6]u64 = @splat(0);
++    pub var its: [6]u64 = @splat(0);
++    pub var buf: []f64 = &.{};
++
++    pub fn print(job: []const u8) void {
++        std.debug.print("census-confirm: {s} converged_at_iter0..5+={any} later={d} converged={d} bitwise_reuse={d} save@1/.5/.25/.1={any} wrong_delta={any} wrong_other={any} true_scaled<.01/.1/.25/.5/1={any} stale_scaled<.01/.1/.25/.5/1/inf={any}\n", .{ job, its, later, conv, reuse, save, wrong_delta, wrong_other, true_hist, stale_hist });
++        later = 0;
++        conv = 0;
++        reuse = 0;
++        save = @splat(0);
++        wrong_delta = @splat(0);
++        wrong_other = @splat(0);
++        true_hist = @splat(0);
++        stale_hist = @splat(0);
++        its = @splat(0);
++    }
++};
++
+ // ---- private ----
+ 
+ /// `finalizeStep`'s verdict: the lanes it accepted and each lane's delta
+diff --git a/src/solver/lu_census.zig b/src/solver/lu_census.zig
+index f24baa03..fd36f76a 100644
+--- a/src/solver/lu_census.zig
++++ b/src/solver/lu_census.zig
+@@ -202,6 +202,64 @@ pub fn census(self: *const SparseLu, gpa: Allocator, col_ptr: []const u32, row_i
+     }
+     var rail_rows: u32 = 0;
+     for (width) |w| rail_rows += @intFromBool(w > 1000);
++    // CENSUS (throwaway): supernode runs in the replay's stored order.
++    {
++        const li = self.li.items;
++        const ui = self.ui.items;
++        const lp = self.lp;
++        const up = self.up;
++        const link = try gpa.alloc(bool, n);
++        defer gpa.free(link);
++        var links: u64 = 0;
++        for (0..n) |i| {
++            link[i] = false;
++            if (i + 1 >= n) continue;
++            if (lp[i + 1] - lp[i] != lp[i + 2] - lp[i + 1] + 1) continue;
++            var has_l = false;
++            for (li[lp[i]..lp[i + 1]]) |r| has_l = has_l or r == i + 1;
++            var has_u = false;
++            for (ui[up[i + 1]..up[i + 2]]) |s| has_u = has_u or s == i;
++            link[i] = has_l and has_u;
++            links += @intFromBool(link[i]);
++        }
++        var run_f: [5]u64 = @splat(0);
++        var rect_f: u64 = 0;
++        var long_f: u64 = 0;
++        var broken_f: u64 = 0;
++        var axpys: u64 = 0;
++        @memset(span, 0);
++        for (0..n) |kc| {
++            for (ui[up[kc]..up[kc + 1]]) |i| span[i] = @intCast(kc + 1);
++            var p = up[kc];
++            while (p < up[kc + 1]) {
++                var r: u32 = 1;
++                while (p + r < up[kc + 1] and ui[p + r] == ui[p + r - 1] + 1 and link[ui[p + r - 1]]) r += 1;
++                var f: u64 = 0;
++                for (0..r) |j| {
++                    const i = ui[p + j];
++                    const len = lp[i + 1] - lp[i];
++                    f += len;
++                    if (len >= 32) long_f += len;
++                }
++                axpys += r;
++                const last = ui[p + r - 1];
++                if (link[last] and last + 1 < n and span[last + 1] == kc + 1) broken_f += f;
++                run_f[if (r >= 16) 4 else if (r >= 8) 3 else if (r >= 4) 2 else if (r >= 2) 1 else 0] += f;
++                if (r >= 2) rect_f += @as(u64, r) * (lp[last + 1] - lp[last]);
++                p += r;
++            }
++        }
++        const pc = struct {
++            fn f(a: u64, b: u64) f64 {
++                return 100 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(@max(b, 1)));
++            }
++        }.f;
++        std.debug.print("lu-runs: links={d} axpys={d} mean_axpy={d:.1} F by run 1/2-3/4-7/8-15/16+ = {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}% rect_F={d:.1}% long_axpy_F={d:.1}% broken_run_F={d:.1}%\n", .{
++            links, axpys, @as(f64, @floatFromInt(flops)) / @as(f64, @floatFromInt(@max(axpys, 1))),
++            pc(run_f[0], flops), pc(run_f[1], flops), pc(run_f[2], flops), pc(run_f[3], flops), pc(run_f[4], flops),
++            pc(rect_f, flops), pc(long_f, flops), pc(broken_f, flops),
++        });
++    }
+     const nl: u64 = self.li.items.len;
+     const nu: u64 = self.ui.items.len;
+     const epoch = 8 * (nu + n + nl + 1) + 4 * (2 * (n + 1) + nu + (nu + 1) + flops + col_ptr[n]) + n +

@@ -130,7 +130,7 @@ fn mosModule(level: u32) ?Module {
         9 => .mos9,
         49 => .bsim3v3,
         54 => .bsim4v8,
-        // espice's PSP103 level (frontend/spice.zig); ngspice-45 has none.
+        // espice's PSP103 level (frontend/Circuit/spice.zig); ngspice-45 has none.
         1040 => .psp103,
         else => null,
     };

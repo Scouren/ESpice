@@ -9,12 +9,16 @@
 //
 // Topology: C-RC-ci, B-Rbb'-bi, E-RE-ei, substrate S. Junction voltages live
 // on the primed nodes; the extrinsic BC cap sits outside RB. Currents and
-// voltages are in the npn frame, so PNP is type = -1.
+// voltages are in the npn frame, so PNP is type = -1, except the substrate
+// junction's, which are in type*subs's (S to c' vertical, S to b' lateral).
 //
 // Conductances are not written out: each is the derivative of a contributed
 // current, so the AD Jacobian is the stamp. pnjlim is applied through $limit
 // as in diode.va; the junction exponent is also clamped so a wild iterate
 // cannot return inf. Excess phase is the xf1/xf2 filter network.
+//
+// Not modelled (bjt.c parameters a card may carry): ibe/ibc, the quasimod
+// quasi-saturation set (rco, vo, gamma, qco, vg, cn, d) and the SOA limits.
 
 `include "constants.vams"
 `include "disciplines.vams"
@@ -27,7 +31,7 @@ module gummel_poon(c, b, e, s);
 
     // ---- ngspice .model parameters (bjtset.c names, defaults, units) -------
     parameter integer type = 1  from [-1:1] exclude 0;   // +1 npn, -1 pnp
-    parameter integer subs = 1  from [-1:1] exclude 0;   // +1 vertical, -1 lateral
+    parameter integer subs = 1  from [-1:1] exclude 0;   // +1 vertical, -1 lateral; unset: by type
     parameter real is   = 1e-16 from [0:inf);   // A   transport saturation current
     parameter real bf   = 100.0 from [0:inf);   //     ideal forward beta
     parameter real nf   = 1.0   from (0:inf);   //     forward emission coeff
@@ -73,7 +77,8 @@ module gummel_poon(c, b, e, s);
     parameter real eg   = 1.11  from (0:inf);   // eV  activation energy
     parameter real xti  = 3.0;                  //     is temperature exponent
     parameter real xtb  = 0.0;                  //     beta temperature exponent
-    parameter real tnom = $simparam("tnom") + 273.15 from (0:inf);  // K   parameter extraction temperature
+    // degC, like the card TNOM/TREF (bjtmpar.c:41-43 adds CONSTCtoK).
+    parameter real tnom = $simparam("tnom");    // degC parameter extraction temperature
     parameter real gmin = $simparam("gmin") from [0:inf);   // S   leakage-branch conductance floor
     // Resistance/knee temperature maps: X(T) = X*(1 + t1*dt + t2*dt^2),
     // dt = T - Tnom (bjttemp.c)
@@ -89,14 +94,73 @@ module gummel_poon(c, b, e, s);
     parameter real tikf2 = 0.0;                 // 1/K^2
     parameter real tikr1 = 0.0;                 // 1/K ikr linear tempco
     parameter real tikr2 = 0.0;                 // 1/K^2
+    // The rest of bjt.c's second-order tempcos, X*(1 + t1*dt + t2*dt^2)
+    // (bjttemp.c:95-158). tbf/tbr replace the xtb law only when given
+    // (bjttemp.c:244-256); mje/mjc/mjs clamp at 0.999 (bjttemp.c:144-156).
+    parameter real tbf1  = 0.0;   parameter real tbf2  = 0.0;
+    parameter real tbr1  = 0.0;   parameter real tbr2  = 0.0;
+    parameter real tirb1 = 0.0;   parameter real tirb2 = 0.0;
+    parameter real tnf1  = 0.0;   parameter real tnf2  = 0.0;
+    parameter real tnr1  = 0.0;   parameter real tnr2  = 0.0;
+    parameter real tne1  = 0.0;   parameter real tne2  = 0.0;
+    parameter real tnc1  = 0.0;   parameter real tnc2  = 0.0;
+    parameter real tns1  = 0.0;   parameter real tns2  = 0.0;
+    parameter real tvaf1 = 0.0;   parameter real tvaf2 = 0.0;
+    parameter real tvar1 = 0.0;   parameter real tvar2 = 0.0;
+    parameter real titf1 = 0.0;   parameter real titf2 = 0.0;
+    parameter real ttf1  = 0.0;   parameter real ttf2  = 0.0;
+    parameter real ttr1  = 0.0;   parameter real ttr2  = 0.0;
+    parameter real tmje1 = 0.0;   parameter real tmje2 = 0.0;
+    parameter real tmjc1 = 0.0;   parameter real tmjc2 = 0.0;
+    parameter real tmjs1 = 0.0;   parameter real tmjs2 = 0.0;
+    // tlev 0: exp(xtb*ln(T/Tnom)) beta law; 1: 1 + xtb*dt; 3: saturation
+    // currents as is^(1 + tis1*dt + tis2*dt^2) and no beta law
+    // (bjttemp.c:178-201, 244-272).
+    parameter integer tlev = 0 from [0:3] exclude 2;
+    parameter real tis1  = 0.0;   parameter real tis2  = 0.0;
+    parameter real tise1 = 0.0;   parameter real tise2 = 0.0;
+    parameter real tisc1 = 0.0;   parameter real tisc2 = 0.0;
+    parameter real tiss1 = 0.0;   parameter real tiss2 = 0.0;
+    // tlevc 0: the SPICE intrinsic-shift cap law; 1: linear caps
+    // cj*(1 + ct*dt) and potentials vj - tvj*dt (bjttemp.c:274-325).
+    parameter integer tlevc = 0 from [0:1];
+    parameter real cte  = 0.0;    parameter real tvje = 0.0;   // 1/K, V/K
+    parameter real ctc  = 0.0;    parameter real tvjc = 0.0;
+    parameter real cts  = 0.0;    parameter real tvjs = 0.0;
+    // bjt.c's other spellings (vje is its IOP name, pe the IOPR). They bind
+    // on this model only: a shared binder table once bound tref and ik on
+    // every model with a tnom or ikf field, where ngspice calls them
+    // unrecognized.
+    aliasparam vje  = pe;
+    aliasparam vjc  = pc;
+    aliasparam vjs  = ps;
+    aliasparam csub = cjs;
+    aliasparam ccs  = cjs;
+    aliasparam va   = vaf;
+    aliasparam vb   = VAR;
+    aliasparam ik   = ikf;
+    aliasparam me   = mje;
+    aliasparam mc   = mjc;
+    aliasparam ms   = mjs;
+    aliasparam tref = tnom;
+    aliasparam nk   = nkf;
+    aliasparam trb  = trb1;
+    aliasparam trc  = trc1;
+    aliasparam tre  = tre1;
     // noise (bjtnoise.c): flicker on b'-e', KF*|IB|^AF/f
     parameter real kf = 0.0 from [0:inf);       //     flicker noise coefficient
     parameter real af = 1.0 from (0:inf);       //     flicker noise exponent
     // instance card
     parameter real area  = 1.0 from (0:inf);    //     emitter (BE junction) area
-    parameter real areab = 1.0 from (0:inf);    //     base area (lateral BC/sub caps)
-    parameter real areac = 1.0 from (0:inf);    //     collector area (vertical sub cap)
+    // areab/areac default to area when not given (bjtsetup.c:429-434).
+    parameter real areab = 1.0 from (0:inf);    //     base area (vertical BC, lateral sub)
+    parameter real areac = 1.0 from (0:inf);    //     collector area (lateral BC, vertical sub)
     parameter real m     = 1.0 from (0:inf);    //     device multiplicity
+    // Instance temperature (bjt.c:76-77): a given `temp` wins and dtemp is
+    // ignored, else T = $temperature + dtemp (bjtparam.c:46-53,
+    // bjttemp.c:86-91).
+    parameter real temp  = 27.0;                // degC instance temperature
+    parameter real dtemp = 0.0;                 // K    offset from $temperature
 
     // Junction current with the smooth-cubic reverse continuation: the
     // -3*Vtn branch keeps i and di/dv C1, so g never collapses in reverse.
@@ -141,86 +205,154 @@ module gummel_poon(c, b, e, s);
         end
     endfunction
 
-    real tdev, vt, vtn, dt, fact1, fact2, egt, egn, argt, argn, pbft, pbfn;
-    real ratlog, factlog, factor, bfac;
+    real tdev, tnomk, vt, vtn, dt, fact1, fact2, egt, egn, argt, argn, pbft, pbfn;
+    real ratlog, factlog, bfac;
     real ise_x, isc_x, is_t, ise_t, isc_t, iss_t, bf_t, br_t;
-    real pbo, gold, gnew, tcap, pe_t, cje_t, pc_t, cjc_t, ps_t, cjs_t;
-    real ai, abc, asb, vert, inv_vaf, inv_var, inv_ikf, inv_ikr;
-    real rbtot, rbpr, rbpi, rbb, zc, tanz, xjrb, rc_t, re_t;
-    real vbe, vbc, vbx, vsub, vcrit, cbe, cben, cbc, cbcn, cdsub;
-    real q1, q2, qb, td, icc, ic, ib, argtf, tmp;
-    real qbe, qbc, qbx, qsub, fourkt;
+    real nf_t, nr_t, ne_t, nc_t, ns_t, tf_t, tr_t, itf_t, mje_t, mjc_t, mjs_t;
+    real pbo, gold, gnew, pe_t, cje_t, pc_t, cjc_t, ps_t, cjs_t;
+    real ai, abc, asb, vert, stype, areab_x, areac_x, inv_vaf, inv_var, inv_ikf, inv_ikr;
+    real rbtot, rbpr, rbpi, rbb, zc, tanz, xjrb, rc_t, re_t, rbm_x;
+    real vbx, vsub, vcrit, cbe, cben, cbc, cbcn, cdsub;
+    real q1, q2, qb, td, icc, icn, ibn, argtf, tmp;
+    real fourkt;
+    // Operating-point variables (LRM §3.2.1) under bjt.c's names (#236), as
+    // bjtask.c reports them at a DC point: currents type × the npn frame's,
+    // voltages, partials and charges in the npn frame, all m devices'.
+    // `capsub` is bjt.c's `csub`, which the aliasparam above spells.
+    (* desc = "Current at collector node", units = "A" *) real ic;
+    (* desc = "Current at base node", units = "A" *) real ib;
+    (* desc = "Emitter current", units = "A" *) real ie;
+    (* desc = "B-E voltage", units = "V" *) real vbe;
+    (* desc = "B-C voltage", units = "V" *) real vbc;
+    (* desc = "Small signal transconductance", units = "S" *) real gm;
+    (* desc = "Small signal input conductance - pi", units = "S" *) real gpi;
+    (* desc = "Small signal conductance - mu", units = "S" *) real gmu;
+    (* desc = "Conductance from base to internal base", units = "S" *) real gx;
+    (* desc = "Small signal output conductance", units = "S" *) real go;
+    (* desc = "Internal base to emitter capacitance", units = "F" *) real cpi;
+    (* desc = "Internal base to collector capacitance", units = "F" *) real cmu;
+    (* desc = "Base to collector capacitance", units = "F" *) real cbx;
+    (* desc = "Substrate capacitance", units = "F" *) real capsub;
+    (* desc = "Approximated transit frequency", units = "Hz" *) real ft;
+    (* desc = "Charge storage B-E junction", units = "C" *) real qbe;
+    (* desc = "Charge storage B-C junction", units = "C" *) real qbc;
+    (* desc = "Charge storage B-X junction", units = "C" *) real qbx;
+    (* desc = "Charge storage Subs. junction", units = "C" *) real qsub;
 
     analog begin
         // ---- temperature and geometry: bias independent (bjttemp.c) -------
-        tdev  = $temperature;
-        dt    = tdev - tnom;
+        if ($param_given(temp)) tdev = temp + 273.15;
+        else tdev = $temperature + dtemp;
+        tnomk = tnom + 273.15;
+        dt    = tdev - tnomk;
         vt    = 1.38064852e-23 / 1.6021766208e-19 * tdev;   // bjttemp.c:149 CONSTKoverQ
-        vtn   = 1.38064852e-23 / 1.6021766208e-19 * tnom;
-        fact1 = tnom / 300.15;
+        vtn   = 1.38064852e-23 / 1.6021766208e-19 * tnomk;
+        fact1 = tnomk / 300.15;
         fact2 = tdev / 300.15;
         egt   = 1.16 - 7.02e-4 * tdev * tdev / (tdev + 1108.0);
-        egn   = 1.16 - 7.02e-4 * tnom * tnom / (tnom + 1108.0);
+        egn   = 1.16 - 7.02e-4 * tnomk * tnomk / (tnomk + 1108.0);
         argt  = -egt / (2.0 * 1.38064852e-23 * tdev)
               + 1.1150877 / (1.38064852e-23 * (300.15 + 300.15));
-        argn  = -egn / (2.0 * 1.38064852e-23 * tnom)
+        argn  = -egn / (2.0 * 1.38064852e-23 * tnomk)
               + 1.1150877 / (1.38064852e-23 * (300.15 + 300.15));
         pbft  = -2.0 * vt  * (1.5 * ln(fact2) + 1.6021766208e-19 * argt);
         pbfn  = -2.0 * vtn * (1.5 * ln(fact1) + 1.6021766208e-19 * argn);
 
-        ratlog  = ln(tdev / tnom);
-        factlog = (tdev / tnom - 1.0) * eg / vt + xti * ratlog;
-        factor  = exp(factlog);
-        bfac    = exp(xtb * ratlog);
-        is_t    = is * factor;
-        iss_t   = iss * factor;
-        bf_t    = bf * bfac;
-        br_t    = br * bfac;
+        // Second-order tempcos on the model values (bjttemp.c:95-158).
+        nf_t  = nf * (1.0 + tnf1 * dt + tnf2 * dt * dt);
+        nr_t  = nr * (1.0 + tnr1 * dt + tnr2 * dt * dt);
+        ne_t  = ne * (1.0 + tne1 * dt + tne2 * dt * dt);
+        nc_t  = nc * (1.0 + tnc1 * dt + tnc2 * dt * dt);
+        ns_t  = ns * (1.0 + tns1 * dt + tns2 * dt * dt);
+        tf_t  = tf * (1.0 + ttf1 * dt + ttf2 * dt * dt);
+        tr_t  = tr * (1.0 + ttr1 * dt + ttr2 * dt * dt);
+        itf_t = itf * (1.0 + titf1 * dt + titf2 * dt * dt);
+        mje_t = min(mje * (1.0 + tmje1 * dt + tmje2 * dt * dt), 0.999);
+        mjc_t = min(mjc * (1.0 + tmjc1 * dt + tmjc2 * dt * dt), 0.999);
+        mjs_t = min(mjs * (1.0 + tmjs1 * dt + tmjs2 * dt * dt), 0.999);
+
         // Legacy Gummel-Poon cards give the leakage currents as C2/C4
         // multiples of IS (bjttemp.c); ise/isc win when both are set.
         ise_x   = ise;
         isc_x   = isc;
         if (ise <= 0.0) ise_x = c2 * is;
         if (isc <= 0.0) isc_x = c4 * is;
-        // Leakage currents carry their own emission coeff and divide by the
-        // beta factor (bjttemp.c).
-        ise_t   = ise_x * exp(factlog / ne) / bfac;
-        isc_t   = isc_x * exp(factlog / nc) / bfac;
+        // Saturation currents and the beta factor. The exp laws take the
+        // card's emission coefficients, not the tempered ones
+        // (bjttemp.c:178-191, 259-267).
+        ratlog  = ln(tdev / tnomk);
+        factlog = (tdev / tnomk - 1.0) * eg / vt + xti * ratlog;
+        if (tlev == 3) begin
+            is_t  = pow(is, 1.0 + tis1 * dt + tis2 * dt * dt);
+            iss_t = pow(iss, 1.0 + tiss1 * dt + tiss2 * dt * dt);
+            ise_t = pow(ise_x, 1.0 + tise1 * dt + tise2 * dt * dt);
+            isc_t = pow(isc_x, 1.0 + tisc1 * dt + tisc2 * dt * dt);
+            bfac  = 1.0;
+        end else begin
+            is_t  = is * exp(factlog);
+            iss_t = iss * exp(factlog / ns);
+            if (tlev == 1) bfac = 1.0 + xtb * dt;
+            else bfac = exp(xtb * ratlog);
+            ise_t = ise_x * exp(factlog / ne) / bfac;
+            isc_t = isc_x * exp(factlog / nc) / bfac;
+        end
+        bf_t = bf * bfac;
+        br_t = br * bfac;
+        if ($param_given(tbf1) || $param_given(tbf2)) bf_t = bf * (1.0 + tbf1 * dt + tbf2 * dt * dt);
+        if ($param_given(tbr1) || $param_given(tbr2)) br_t = br * (1.0 + tbr1 * dt + tbr2 * dt * dt);
 
-        // Junction potentials/caps: SPICE intrinsic-shift mapping (as diode.va).
-        pbo   = (pe - pbfn) / fact1;
-        gold  = (pe - pbo) / pbo;
-        gnew  = (fact2 * pbo + pbft - pbo) / pbo;
-        pe_t  = fact2 * pbo + pbft;
-        tcap  = (1.0 + mje * (4e-4 * (tdev - 300.15) - gnew))
-              / (1.0 + mje * (4e-4 * (tnom - 300.15) - gold));
-        cje_t = cje * tcap;
-
-        pbo   = (pc - pbfn) / fact1;
-        gold  = (pc - pbo) / pbo;
-        gnew  = (fact2 * pbo + pbft - pbo) / pbo;
-        pc_t  = fact2 * pbo + pbft;
-        tcap  = (1.0 + mjc * (4e-4 * (tdev - 300.15) - gnew))
-              / (1.0 + mjc * (4e-4 * (tnom - 300.15) - gold));
-        cjc_t = cjc * tcap;
-
-        pbo   = (ps - pbfn) / fact1;
-        gold  = (ps - pbo) / pbo;
-        gnew  = (fact2 * pbo + pbft - pbo) / pbo;
-        ps_t  = fact2 * pbo + pbft;
-        tcap  = (1.0 + mjs * (4e-4 * (tdev - 300.15) - gnew))
-              / (1.0 + mjs * (4e-4 * (tnom - 300.15) - gold));
-        cjs_t = cjs * tcap;
+        // Junction potentials/caps (bjttemp.c:274-325). tlevc 0: SPICE
+        // intrinsic-shift mapping (as diode.va), on the tempered grading.
+        if (tlevc == 1) begin
+            cje_t = cje * (1.0 + cte * dt);
+            pe_t  = pe - tvje * dt;
+            cjc_t = cjc * (1.0 + ctc * dt);
+            pc_t  = pc - tvjc * dt;
+            cjs_t = cjs * (1.0 + cts * dt);
+            ps_t  = ps - tvjs * dt;
+        end else begin
+            pbo   = (pe - pbfn) / fact1;
+            gold  = (pe - pbo) / pbo;
+            pe_t  = fact2 * pbo + pbft;
+            gnew  = (pe_t - pbo) / pbo;
+            cje_t = cje * (1.0 + mje_t * (4e-4 * (tdev - 300.15) - gnew))
+                  / (1.0 + mje_t * (4e-4 * (tnomk - 300.15) - gold));
+            pbo   = (pc - pbfn) / fact1;
+            gold  = (pc - pbo) / pbo;
+            pc_t  = fact2 * pbo + pbft;
+            gnew  = (pc_t - pbo) / pbo;
+            cjc_t = cjc * (1.0 + mjc_t * (4e-4 * (tdev - 300.15) - gnew))
+                  / (1.0 + mjc_t * (4e-4 * (tnomk - 300.15) - gold));
+            pbo   = (ps - pbfn) / fact1;
+            gold  = (ps - pbo) / pbo;
+            ps_t  = fact2 * pbo + pbft;
+            gnew  = (ps_t - pbo) / pbo;
+            cjs_t = cjs * (1.0 + mjs_t * (4e-4 * (tdev - 300.15) - gnew))
+                  / (1.0 + mjs_t * (4e-4 * (tnomk - 300.15) - gold));
+        end
 
         // Area/multiplicity scaling; `subs` picks which area carries the
         // substrate junction and where it lands.
         ai   = area * m;   // emitter area: transport/BE junction, caps, rb/rc/re
+        // Without a card `subs`, an npn is vertical and a pnp lateral
+        // (bjtsetup.c:40-46).
         vert = 0.0;
-        if (subs > 0) vert = 1.0;
-        // bjtload.c: the BC leakage and BC depletion caps take areab
-        // vertical / areac lateral; the substrate cap is the other way round.
-        abc = m * (vert * areab + (1.0 - vert) * areac);
-        asb = m * (vert * areac + (1.0 - vert) * areab);
+        if ($param_given(subs)) begin
+            if (subs > 0) vert = 1.0;
+        end else if (type > 0) vert = 1.0;
+        // The substrate junction runs in ttype = type*subs's frame
+        // (bjtload.c:139, 185-187): S to c' vertical, S to b' lateral, so a
+        // lateral pnp's p substrate on its n base is forward for V(S) > V(b').
+        stype = type * (2.0 * vert - 1.0);
+        areab_x = area;
+        areac_x = area;
+        if ($param_given(areab)) areab_x = areab;
+        if ($param_given(areac)) areac_x = areac;
+        // bjttemp.c:211-226: the BC transport and leakage currents and the
+        // BC depletion caps take areab vertical / areac lateral; the
+        // substrate cap is the other way round.
+        abc = m * (vert * areab_x + (1.0 - vert) * areac_x);
+        asb = m * (vert * areac_x + (1.0 - vert) * areab_x);
 
         // 0 means "infinite" for the Early and knee currents. The knee currents
         // are per unit area, so the inverse carries 1/(area*m) (bjtload.c
@@ -229,16 +361,19 @@ module gummel_poon(c, b, e, s);
         inv_var = 0.0;
         inv_ikf = 0.0;
         inv_ikr = 0.0;
-        if (vaf > 0.0) inv_vaf = 1.0 / vaf;
-        if (VAR > 0.0) inv_var = 1.0 / VAR;
+        if (vaf > 0.0) inv_vaf = 1.0 / (vaf * (1.0 + tvaf1 * dt + tvaf2 * dt * dt));
+        if (VAR > 0.0) inv_var = 1.0 / (VAR * (1.0 + tvar1 * dt + tvar2 * dt * dt));
         if (ikf > 0.0) inv_ikf = 1.0 / (ikf * (1.0 + tikf1 * dt + tikf2 * dt * dt) * ai);
         if (ikr > 0.0) inv_ikr = 1.0 / (ikr * (1.0 + tikr1 * dt + tikr2 * dt * dt) * ai);
 
+        // rbm defaults to rb and takes the trm tempco either way
+        // (bjttemp.c:57-59, 132).
+        rbm_x = rb;
+        if ($param_given(rbm)) rbm_x = rbm;
         rbtot = rb * (1.0 + trb1 * dt + trb2 * dt * dt) / ai;
-        rbpr  = rbtot;
-        if (rbm > 0.0) rbpr = rbm * (1.0 + trm1 * dt + trm2 * dt * dt) / ai;
+        rbpr  = rbm_x * (1.0 + trm1 * dt + trm2 * dt * dt) / ai;
         rbpi = rbtot - rbpr;
-        xjrb = irb * ai;
+        xjrb = irb * (1.0 + tirb1 * dt + tirb2 * dt * dt) * ai;
         rc_t = rc * (1.0 + trc1 * dt + trc2 * dt * dt) / ai;
         re_t = re * (1.0 + tre1 * dt + tre2 * dt * dt) / ai;
 
@@ -252,16 +387,18 @@ module gummel_poon(c, b, e, s);
         vbc = type * $limit(V(bi, ci), "pnjlim", vt, vcrit, type);
         // vbx/vsub stay raw, as in bjtload.c; both feed clamped laws only.
         vbx  = type * V(b, ci);
-        vsub = type * (vert * V(s, ci) + (1.0 - vert) * V(s, bi));
+        vsub = stype * (vert * V(s, ci) + (1.0 - vert) * V(s, bi));
 
         // ---- junction currents; GMIN on the leakage/substrate parts --------
-        cbe   = pnj(vbe, is_t * ai, nf * vt);
-        cben  = pnj(vbe, ise_t * ai, ne * vt) + m * gmin * vbe;
-        cbc   = pnj(vbc, is_t * ai, nr * vt);
-        cbcn  = pnj(vbc, isc_t * abc, nc * vt) + m * gmin * vbc;
+        // Each law runs on its tempered emission coefficient (bjtload.c:
+        // 166-167, 433, 463, 494); BC transport takes abc (bjttemp.c:211-215).
+        cbe   = pnj(vbe, is_t * ai, nf_t * vt);
+        cben  = pnj(vbe, ise_t * ai, ne_t * vt) + m * gmin * vbe;
+        cbc   = pnj(vbc, is_t * abc, nr_t * vt);
+        cbcn  = pnj(vbc, isc_t * abc, nc_t * vt) + m * gmin * vbc;
         // The substrate current keeps the emitter area (bjtload.c); only the
         // substrate cap swaps to areac/areab.
-        cdsub = pnj(vsub, iss_t * ai, ns * vt) + m * gmin * vsub;
+        cdsub = pnj(vsub, iss_t * ai, ns_t * vt) + m * gmin * vsub;
 
         // ---- base charge: Early + Webster high injection -------------------
         q1 = 1.0 / (1.0 - vbc * inv_vaf - vbe * inv_var);
@@ -290,26 +427,27 @@ module gummel_poon(c, b, e, s);
 
         // ---- transport current, split per branch so node KCL matches
         // ic = icc - cbc/br - cbcn and ib = cbe/bf + cben + cbc/br + cbcn ----
-        ib  = cbe / bf_t + cben + cbc / br_t + cbcn;
-        ic  = icc - cbc / br_t - cbcn;
+        ibn = cbe / bf_t + cben + cbc / br_t + cbcn;
+        icn = icc - cbc / br_t - cbcn;
 
         // ---- bias-dependent forward transit time --------------------------
         argtf = 0.0;
-        if (tf > 0.0 && vbe > 0.0 && xtf > 0.0) begin
+        if (tf_t > 0.0 && vbe > 0.0 && xtf > 0.0) begin
             argtf = xtf;
             if (vtf > 0.0) argtf = argtf * exp(vbc / (1.44 * vtf));
-            if (itf > 0.0) begin
-                tmp   = cbe / (cbe + itf * ai);
+            if (itf_t > 0.0) begin
+                tmp   = cbe / (cbe + itf_t * ai);
                 argtf = argtf * tmp * tmp;
             end
         end
 
         // Diffusion charge keeps the 1/qb base-widening division, so ddt()
         // reproduces both capbe and the geqcb cross term of bjtload.c.
-        qbe  = tf * cbe * (1.0 + argtf) / qb + depq(vbe, cje_t * ai, pe_t, mje, fc);
-        qbc  = tr * cbc + depq(vbc, cjc_t * xcjc * abc, pc_t, mjc, fc);
-        qbx  = depq(vbx, cjc_t * (1.0 - xcjc) * abc, pc_t, mjc, fc);
-        qsub = depq(vsub, cjs_t * asb, ps_t, mjs, 0.0);
+        // Tempered tf, tr and gradings (bjtload.c:642-659).
+        qbe  = tf_t * cbe * (1.0 + argtf) / qb + depq(vbe, cje_t * ai, pe_t, mje_t, fc);
+        qbc  = tr_t * cbc + depq(vbc, cjc_t * xcjc * abc, pc_t, mjc_t, fc);
+        qbx  = depq(vbx, cjc_t * (1.0 - xcjc) * abc, pc_t, mjc_t, fc);
+        qsub = depq(vsub, cjs_t * asb, ps_t, mjs_t, 0.0);
 
         // ---- stamps ---------------------------------------------------------
         // ddt() has to sit on its own multiplicative spine (LRM 5.6.1.2), so
@@ -322,31 +460,35 @@ module gummel_poon(c, b, e, s);
         // bjttrunc.c truncates qbe, qbc and qsub, not qbx (nor the excess
         // phase network above).
         (* vera_lte = 0 *) I(b, ci)  <+ type * ddt(qbx);
-        I(s, ci)  <+ vert * type * cdsub;
-        I(s, ci)  <+ vert * type * ddt(qsub);
-        I(s, bi)  <+ (1.0 - vert) * type * cdsub;
-        I(s, bi)  <+ (1.0 - vert) * type * ddt(qsub);
+        I(s, ci)  <+ vert * stype * cdsub;
+        I(s, ci)  <+ vert * stype * ddt(qsub);
+        I(s, bi)  <+ (1.0 - vert) * stype * cdsub;
+        I(s, bi)  <+ (1.0 - vert) * stype * ddt(qsub);
 
         // ---- noise (bjtnoise.c) ---------------------------------------------
         // Currents/conductances here already carry area*m, and ngspice's table
         // is (area-scaled quantity)*m — so no extra factor except the flicker
         // row, which is m*KF*|IB/m|^AF (IB there excludes m).
         fourkt = 4.0 * 1.38064852e-23 * tdev;
-        I(ci, ei) <+ white_noise(2.0 * 1.6021766208e-19 * abs(ic), "ic");
-        I(bi, ei) <+ white_noise(2.0 * 1.6021766208e-19 * abs(ib), "ib");
-        I(bi, ei) <+ flicker_noise(m * kf * pow(abs(ib / m), af), 1.0, "flicker");
+        I(ci, ei) <+ white_noise(2.0 * 1.6021766208e-19 * abs(icn), "ic");
+        I(bi, ei) <+ white_noise(2.0 * 1.6021766208e-19 * abs(ibn), "ib");
+        I(bi, ei) <+ flicker_noise(m * kf * pow(abs(ibn / m), af), 1.0, "flicker");
 
         // ---- bias-dependent base resistance ---------------------------------
+        // rbb is stamped frozen, gx = 1/rbb with no d(rbb) term, as ngspice
+        // does in DC and AC (ngspice-45 bjtload.c:619-626, bjtacld.c:64-85).
+        // The DC fixed point is the same; the Jacobian, and so the AC small
+        // signal, follow ngspice, under which PDK cards (gf180 vnpn) were fitted.
         if (rbtot > 0.0) begin
             if (xjrb > 0.0) begin
                 // Current-crowding form; ngspice floors ib/(irb*A) at 1e-9 so
                 // z stays finite at zero base current.
-                tmp  = max(ib / xjrb, 1e-9);
+                tmp  = max(ibn / xjrb, 1e-9);
                 zc   = (sqrt(1.0 + 14.59025 * tmp) - 1.0) / (2.4317 * sqrt(tmp));
                 tanz = tan(zc);
-                rbb  = rbpr + 3.0 * rbpi * (tanz - zc) / (zc * tanz * tanz);
+                (* vera_nodiff *) rbb  = rbpr + 3.0 * rbpi * (tanz - zc) / (zc * tanz * tanz);
             end else begin
-                rbb = rbpr + rbpi / qb;
+                (* vera_nodiff *) rbb = rbpr + rbpi / qb;
             end
             I(b, bi) <+ V(b, bi) / rbb;
             // Thermal noise on the modulated gx (bjtnoise.c).
@@ -366,6 +508,26 @@ module gummel_poon(c, b, e, s);
         end else begin
             V(e, ei) <+ 0.0;
         end
+        // ---- operating-point variables (bjtload.c:622-635, bjtask.c) -------
+        // gm and go split the DC transport current's slope as gm dvbe +
+        // go dvce (excess phase only delays it): a ddx over V(bi) holds vce,
+        // one over V(ci) or V(ei) moves vbc or vbe alone. A lateral device's
+        // ib, a vertical one's ie, carry the substrate current.
+        ic  = type * icn;
+        ib  = type * (ibn - (1.0 - vert) * cdsub);
+        ie  = type * (vert * cdsub - icn - ibn);
+        gm  = type * ddx(cbe / qb - cbc / qb, V(bi));
+        go  = type * ddx(cbe / qb - cbc / qb, V(ci));
+        gpi = type * ddx(cbe / bf_t + cben, V(bi));
+        gmu = type * ddx(cbc / br_t + cbcn, V(bi));
+        gx  = 0.0;
+        if (rbtot > 0.0) gx = 1.0 / rbb;
+        cpi = -type * ddx(qbe, V(ei));
+        cmu = type * ddx(qbc, V(bi));
+        cbx = type * ddx(qbx, V(b));
+        capsub = stype * ddx(qsub, V(s));
+        ft  = 0.0;
+        if (cpi + cmu > 0.0) ft = gm / (2.0 * `M_PI * (cpi + cmu));
         // Unused filter nodes short onto the substrate port so setup can drop
         // them. ponytail: kept last until VerA proves parameter-only
         // retention through the later bias-dependent phis.

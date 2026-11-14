@@ -3,14 +3,19 @@
 //! out, bitwise the GPU's and `SparseLu.refactor`'s. `runHost` runs the
 //! refactor and both solves on `threads` threads (the kernels' ticket
 //! schedule with a one-lane block); `HostRefactor` keeps one epoch's tables
-//! and buffers for `direct`'s multicore refactor.
+//! and buffers for `direct`'s multicore refactor. For tests, `runBlocks`
+//! runs every kernel with blocks of several lane threads between real
+//! barriers, the schedule a device block runs.
 //! Cites: dev/solvers/gpu-lu.md ("Multicore host refactor", option 3).
 //!
 //! Contents:
 //! - `pub const HostBufs = struct`
-//! - `pub const test_access = if (@import("builtin").is_test) .{ .runHostCap = runHostC...`
+//! - `pub const test_access = if (@import("builtin").is_test) .{ .runHostCap = runHostCap, .runBlocks = runBlocks } else {}`
 //! - `pub const HostRefactor = struct`
 //!   - `pub fn init(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64) !HostRefactor`
+//!   - `pub const Init = struct`
+//!   - `pub fn initWith(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64, runs: bool) !HostRefactor`
+//!   - `pub fn initOpts(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64, opt: Init) !HostRefactor`
 //!   - `pub fn deinit(self: *HostRefactor, gpa: std.mem.Allocator) void`
 //!   - `pub fn run(self: *HostRefactor, lu: *SparseLu, vals: []const f64, io: std.Io, threads: u32) error{SingularMatrix}!void`
 //!   - `pub fn P(comptime T: type) type`
@@ -24,6 +29,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const klu = @import("lu.zig");
 const lu_tables = @import("lu_tables.zig");
+const lu_tile = @import("lu_tile.zig");
 const SparseLu = @import("../sparse_lu.zig").SparseLu;
 
 /// Host buffers for one `runHost` call; `sync` must be zeroed once after
@@ -46,7 +52,7 @@ pub const HostBufs = struct {
 };
 
 /// Private functions for tests.zig; void outside test builds.
-pub const test_access = if (@import("builtin").is_test) .{ .runHostCap = runHostCap } else {};
+pub const test_access = if (@import("builtin").is_test) .{ .runHostCap = runHostCap, .runBlocks = runBlocks } else {};
 
 /// The refactor kernel body as a multicore host refactor (dev/solvers/
 /// gpu-lu.md option 3): one pivot epoch's tables and buffers. Its factors
@@ -60,11 +66,28 @@ pub const HostRefactor = struct {
     sync: []align(64) u32,
     stamp: u32 = 0,
 
+    /// `initOpts`' choices. `runs`: each supernode run of a column is one
+    /// step (`lu_tables.Options.runs`; needs `lu`'s C1 tables). `tile`
+    /// (lever N1): the tail `lu_tile.choose` admits runs as tiles.
+    pub const Init = struct { runs: bool = false, tile: bool = false };
+
     /// Builds the tables for `lu`'s current factor (4 bytes per flop).
     /// Caller owns the result; free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64) !HostRefactor {
+        return initWith(gpa, lu, col_ptr, growth, false);
+    }
+
+    /// `init`, with `runs` taking each supernode run of a column as one
+    /// step (`lu_tables.Options.runs`; needs `lu`'s C1 tables, else as
+    /// `init`). Same factors, bitwise.
+    pub fn initWith(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64, runs: bool) !HostRefactor {
+        return initOpts(gpa, lu, col_ptr, growth, .{ .runs = runs });
+    }
+
+    /// `init` with the choices of `opt`. Same factors, bitwise.
+    pub fn initOpts(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64, opt: Init) !HostRefactor {
         // No solve runs from these tables: skip the tail cut search.
-        var tb = try lu_tables.build(gpa, lu, col_ptr, growth, .{ .tail = lu.n });
+        var tb = try lu_tables.build(gpa, lu, col_ptr, growth, .{ .tail = lu.n, .runs = opt.runs, .tile = opt.tile });
         errdefer tb.deinit(gpa);
         const val = try gpa.alloc(f64, tb.tab.n_val);
         errdefer gpa.free(val);
@@ -99,6 +122,7 @@ pub const HostRefactor = struct {
         const work = RefactorLoop(klu.col_max).work;
         self.stamp +%= 1;
         @memset(self.sync[0..klu.sync_header], 0);
+        resetTile(self.tb.tab, self.sync);
         const args = .{ self.tb.tab, self.tb.idx.ptr, self.val.ptr, @constCast(vals.ptr), self.sync.ptr, self.stamp };
         var futures: [15]std.Io.Future(void) = undefined;
         const extra = @min(@max(threads, 1) - 1, futures.len);
@@ -148,6 +172,56 @@ const HostSy = struct {
     }
 };
 
+/// Lanes of one test block share its scratch and this barrier. A last
+/// arriver resets the count, then bumps the generation (release); every
+/// lane's earlier stores are visible to every lane leaving the barrier.
+const LaneBarrier = struct {
+    lanes: u32,
+    count: std.atomic.Value(u32) = .init(0),
+    gen: std.atomic.Value(u32) = .init(0),
+
+    fn wait(b: *LaneBarrier) void {
+        assert(b.lanes > 0);
+        const g = b.gen.load(.acquire);
+        if (b.count.fetchAdd(1, .acq_rel) + 1 == b.lanes) {
+            b.count.store(0, .monotonic);
+            b.gen.store(g +% 1, .release);
+            return;
+        }
+        var spins: u32 = 0;
+        while (b.gen.load(.acquire) == g) : (spins +%= 1) HostSy.pause(spins);
+        assert(b.count.load(.monotonic) < b.lanes);
+    }
+};
+
+/// The host instance of a block of several lanes, one thread each (tests):
+/// `barrier` is the block's `LaneBarrier`, so the lanes of a step run at
+/// once, as on the device.
+const BlockSy = struct {
+    /// This lane thread's block barrier, set before its first kernel call.
+    threadlocal var bar: ?*LaneBarrier = null;
+    /// A plain many-item pointer, as `HostSy.P`.
+    pub fn P(comptime T: type) type {
+        return [*]T;
+    }
+    /// Waits for every lane of the block.
+    pub inline fn barrier() void {
+        bar.?.wait();
+    }
+    /// `HostSy.pause`.
+    pub inline fn pause(spins: u32) void {
+        HostSy.pause(spins);
+    }
+    /// `HostSy.acquire`.
+    pub inline fn acquire(p: *const u32) u32 {
+        return HostSy.acquire(p);
+    }
+    /// `HostSy.release`.
+    pub inline fn release(p: *u32, v: u32) void {
+        HostSy.release(p, v);
+    }
+};
+
 /// Refactors on `threads` host threads (at most 64) and solves on this one
 /// with the kernel bodies: bitwise `refactorColumns` plus `solve` (dx =
 /// -A^-1 rhs). Returns the lowest failing pivot step, or null; the solves
@@ -169,11 +243,23 @@ fn RefactorLoop(comptime cap: u32) type {
         fn work(t: klu.Tab, x: [*]u32, val: [*]f64, av: [*]f64, sy: [*]u32, stamp: u32) void {
             const H = klu.Kernels(HostSy, cap, 1);
             var sh: H.Shared = undefined;
+            const T = lu_tile.Tile(HostSy);
             if (t.dmap16 != 0) {
                 while (H.refactor(u16, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
-            } else while (H.refactor(u32, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
+                T.work(u16, t, x, val, av, sy, stamp);
+            } else {
+                while (H.refactor(u32, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
+                T.work(u32, t, x, val, av, sy, stamp);
+            }
         }
     };
+}
+
+/// Zeroes `lever_tile`'s per-run sync words (`Tab.tileWords`).
+fn resetTile(t: klu.Tab, sync: []u32) void {
+    assert(sync.len >= t.syncLen());
+    assert(t.tile0 <= t.n);
+    @memset(sync[t.tileSync()..][0..t.tileWords()], 0);
 }
 
 // `runHost` with the refactor's scratch capped at `cap` slots; 0 runs
@@ -184,6 +270,7 @@ fn runHostCap(comptime cap: u32, t: klu.Tab, b: HostBufs, stamp: u32, threads: u
     assert(b.sync.len >= t.syncLen());
     const H = klu.Kernels(HostSy, cap, 1);
     @memset(b.sync[0..klu.sync_header], 0);
+    resetTile(t, b.sync);
     const x = @constCast(b.idx.ptr);
     const work = RefactorLoop(cap).work;
     const args = .{ t, x, b.val.ptr, @constCast(b.a.ptr), b.sync.ptr, stamp };
@@ -216,4 +303,82 @@ fn runHostCap(comptime cap: u32, t: klu.Tab, b: HostBufs, stamp: u32, threads: u
     const f = b.sync[1];
     assert(f <= t.n);
     return if (f == 0) null else t.n - f;
+}
+
+// `runHostCap` with every kernel run by `blocks` blocks of `lanes` lane
+// threads (at most 64 threads), each kernel a launch after the one before:
+// the lanes of one block run a step at once between real barriers, the
+// device's schedule, where `runHost`'s one-lane blocks run it in order.
+// Test harness: a lane that fails to spawn panics, since its block would
+// wait for it forever.
+fn runBlocks(comptime cap: u32, comptime lanes: u32, t: klu.Tab, b: HostBufs, stamp: u32, blocks: u32) !?u32 {
+    if (@import("builtin").single_threaded) return error.SingleThreaded else return BlockRun(cap, lanes).run(t, b, stamp, blocks);
+}
+
+fn BlockRun(comptime cap: u32, comptime lanes: u32) type {
+    return struct {
+        const H = klu.Kernels(BlockSy, cap, lanes);
+        const Kernel = enum { refactor, tile, lhead, lpanel, upanel, uhead };
+        // One block's scratch, what a device block keeps in shared memory.
+        const Block = struct {
+            bar: LaneBarrier = .{ .lanes = lanes },
+            sh: H.Shared = undefined,
+            ssh: H.SolveShared = undefined,
+            psh: H.PanelShared = undefined,
+        };
+
+        fn Lane(comptime which: Kernel) type {
+            return struct {
+                // Tickets until they run out. The barrier after each ends
+                // the block as a device block exits: no lane still reads
+                // the old ticket when lane 0 takes the next.
+                fn run(blk: *Block, t: klu.Tab, b: HostBufs, stamp: u32, tid: u32) void {
+                    BlockSy.bar = &blk.bar;
+                    const x = @constCast(b.idx.ptr);
+                    const val = b.val.ptr;
+                    const sy = b.sync.ptr;
+                    // The tiles: every lane thread a worker of its own.
+                    if (which == .tile) {
+                        const T = lu_tile.Tile(BlockSy);
+                        if (t.dmap16 != 0) T.work(u16, t, x, val, @constCast(b.a.ptr), sy, stamp) else T.work(u32, t, x, val, @constCast(b.a.ptr), sy, stamp);
+                        return;
+                    }
+                    while (switch (which) {
+                        .refactor => if (t.dmap16 != 0)
+                            H.refactor(u16, t, x, val, @constCast(b.a.ptr), sy, stamp, &blk.sh, tid, lanes)
+                        else
+                            H.refactor(u32, t, x, val, @constCast(b.a.ptr), sy, stamp, &blk.sh, tid, lanes),
+                        .lhead => H.lhead(t, x, val, @constCast(b.rhs.ptr), b.y.ptr, sy, stamp, &blk.ssh, tid, lanes),
+                        .lpanel => H.lpanel(t, x, val, b.y.ptr, sy, stamp, &blk.psh, tid, lanes),
+                        .upanel => H.upanel(t, x, val, b.y.ptr, b.dx.ptr, sy, stamp, &blk.psh, tid, lanes),
+                        .uhead => H.uhead(t, x, val, b.y.ptr, b.dx.ptr, sy, stamp, &blk.ssh, tid, lanes),
+                        .tile => false,
+                    }) blk.bar.wait();
+                }
+            };
+        }
+
+        fn run(t: klu.Tab, b: HostBufs, stamp: u32, blocks: u32) !?u32 {
+            assert(blocks >= 1 and blocks * lanes <= 64);
+            assert(b.idx.len >= t.n_idx and b.val.len >= t.n_val);
+            assert(b.sync.len >= t.syncLen());
+            @memset(b.sync[0..klu.sync_header], 0);
+            resetTile(t, b.sync);
+            const blk = try std.heap.page_allocator.alloc(Block, blocks);
+            defer std.heap.page_allocator.free(blk);
+            inline for (.{ .refactor, .tile, .lhead, .lpanel, .upanel, .uhead }) |which| {
+                for (blk) |*k| k.* = .{};
+                var th: [64]std.Thread = undefined;
+                var n: usize = 0;
+                for (blk) |*k| for (0..lanes) |l| {
+                    th[n] = std.Thread.spawn(.{}, Lane(which).run, .{ k, t, b, stamp, @as(u32, @intCast(l)) }) catch @panic("runBlocks: a lane thread failed to spawn");
+                    n += 1;
+                };
+                for (th[0..n]) |h| h.join();
+            }
+            const f = b.sync[1];
+            assert(f <= t.n);
+            return if (f == 0) null else t.n - f;
+        }
+    };
 }

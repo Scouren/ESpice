@@ -92,6 +92,7 @@ const num = @import("core").numerics;
 extern fn probe_eval(x: [*]const f64, len: usize, t: f64) void;
 extern fn probe_combine(alpha: f64, out: [*]f64, len: usize) void;
 extern fn probe_eval_gc(x: [*]const f64, len: usize, t: f64, alpha: f64) void;
+extern fn probe_eval_gc_with(x: [*]const f64, len: usize, t: f64, alpha: f64, comp: *const anyopaque) void;
 
 const Ckt = struct {
     n: u32,
@@ -99,6 +100,7 @@ const Ckt = struct {
     q_vec: []f64,
     g_vals: []f64,
     c_vals: []f64,
+    reduce_a: bool,
 
     pub fn evalNewton(_: *Ckt, x: []const f64, t: f64) void {
         probe_eval(x.ptr, x.len, t);
@@ -108,6 +110,9 @@ const Ckt = struct {
     }
     pub fn evalNewtonGC(_: *Ckt, x: []const f64, t: f64, alpha: f64) void {
         probe_eval_gc(x.ptr, x.len, t, alpha);
+    }
+    pub fn evalNewtonGCWith(_: *Ckt, x: []const f64, t: f64, alpha: f64, comp: ?integrator.Companion) void {
+        probe_eval_gc_with(x.ptr, x.len, t, alpha, @ptrCast(&comp));
     }
     pub fn newtonGC(_: *Ckt, alpha: f64, out: []f64) []f64 {
         probe_combine(alpha, out.ptr, out.len);
@@ -152,7 +157,10 @@ export fn gen_hook_step_assemble(h: *const StepHook, ckt: *Ckt, x: [*]const f64,
 }
 
 export fn hand_hook_step_assemble(h: *const HandStep, ckt: *Ckt, x: [*]const f64, t: f64) void {
-    if (h.has_charge) ckt.evalNewtonGC(x[0..ckt.n], t, h.c.ag0) else ckt.evalNewton(x[0..ckt.n], t);
+    if (h.has_charge) {
+        if (ckt.reduce_a) return ckt.evalNewtonGCWith(x[0..ckt.n], t, h.c.ag0, .{ .method = h.method, .q1 = h.q_prev, .q2 = h.q_prev2, .i_prev = h.i_prev, .c = h.c });
+        ckt.evalNewtonGC(x[0..ckt.n], t, h.c.ag0);
+    } else ckt.evalNewton(x[0..ckt.n], t);
     if (h.has_charge) {
         const n: usize = ckt.n;
         switch (h.method) {
@@ -405,6 +413,11 @@ const old_newton = struct {
         var iter: u16 = 0;
         var init_fix = opts.init_fix;
         var limit: f64 = x_plausible;
+        assert(opts.dv > 0);
+        const bounded = opts.dv < inf;
+        // The C3 lever (`solver.confirm`), mirrored from
+        // `converger.newton` so the probe still compares the lane-generic
+        // loop with its scalar original and nothing else.
         if (comptime @hasDecl(S, "beginSolve")) sys.beginSolve();
         const prof = &ws.prof;
 
@@ -429,8 +442,9 @@ const old_newton = struct {
             prof.lap(.load);
             // The device LU (dev/solvers/gpu-lu.md) is bitwise this factor and
             // solve; false leaves both to the host.
-            const on_device = if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false;
-            if (!on_device) {
+            const settled = solver.confirm.settle(ws, v, iter, init_fix);
+            const on_device = !settled and (if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false);
+            if (!settled and !on_device) {
                 slv.factor(v, executionOf(sys)) catch |e| {
                     if (ws.knobs.opdbg) {
                         var nan_cnt: usize = 0;
@@ -446,10 +460,11 @@ const old_newton = struct {
                 slv.solveNeg(sys.rhs, dx);
             }
             prof.lap(.solve);
+            const clamped = if (bounded) clampUpdate(dx[0..sys.n], sys.current_row[0..sys.n], opts.dv) else false;
             // The INITFIX pass does not stage: its converged iterate is not the
             // answer, and staging there restarted a Newton-history limiter from a
             // stale value, so the extra pass solved F(lim(x)) = 0 (#53).
-            const st = finalizeStep(sys, hook, x, dx, x_old, sys.rhs, v, iter, t, opts, limit, load_ok, !init_fix);
+            const st = finalizeStep(sys, hook, x, dx, x_old, sys.rhs, v, iter, t, opts, limit, load_ok, !init_fix, clamped);
             prof.lap(.update);
             if (ws.knobs.opdbg) {
                 var fi: usize = 0;
@@ -462,6 +477,8 @@ const old_newton = struct {
                 const name_di = sysNodeName(sys, @intCast(di));
                 std.debug.print("  newton it={d} |F|={e:.3}@{d}({s}) dx={e:.3}@{d}({s}) x={e:.3} scaled={e:.3} conv={} why={s}\n", .{ iter, norm_f, fi, name_fi, dx[di], di, name_di, x[di], st.scaled, st.converged, @tagName(st.why) });
             }
+            if (ws.knobs.perf.c3 and iter == 0 and !ws.knobs.perf.n3 and st.why == .first_iter and plausible(x[0..sys.n], limit) and solver.confirm.linearAccept(ws, sys, x[0..sys.n], init_fix, opts.max_iter))
+                return .{ .converged = true, .iterations = 2 };
             if (st.converged and init_fix) {
                 init_fix = false;
             } else if (st.converged) {
@@ -504,8 +521,14 @@ const old_newton = struct {
     const x_plausible = 1e9;
 
     fn plausibleLimit(sys: anytype, x: []const f64, f: []const f64, vals: []const f64) f64 {
-        var g: f64 = 1;
-        for (sys.diag_slots[0..sys.n]) |slot| g = @max(g, @abs(vals[slot]));
+        // The diagonal's max as `converger.diagMax` folds it since
+        // vacask_graetz's profile: on |v|'s bits, NaN read as 0.
+        var g_bits: i64 = @bitCast(@as(f64, 1));
+        for (sys.diag_slots[0..sys.n]) |slot| {
+            const a = @abs(vals[slot]);
+            g_bits = @max(g_bits, if (a == a) @as(i64, @bitCast(a)) else 0);
+        }
+        const g: f64 = @bitCast(g_bits);
         const scale = @min(@max(num.normInf(x), num.normInf(f) * g), 1e18);
         // Negated, so a NaN start keeps the floor.
         return if (!(1e3 * scale > x_plausible)) x_plausible else 1e3 * scale;
@@ -533,6 +556,21 @@ const old_newton = struct {
         return misses;
     }
 
+    /// `converger.clampUpdate` at one lane: the `.options dv` bound.
+    fn clampUpdate(dx: []f64, current_row: []const bool, dv: f64) bool {
+        assert(dv > 0);
+        assert(current_row.len >= dx.len);
+        var clamped = false;
+        for (dx, current_row[0..dx.len]) |*d, cur| {
+            if (cur) continue;
+            const over = d.* > dv;
+            const under = d.* < -dv;
+            d.* = if (over) dv else if (under) -dv else d.*;
+            clamped = clamped or over or under;
+        }
+        return clamped;
+    }
+
     fn finalizeStep(
         sys: anytype,
         hook: anytype,
@@ -547,6 +585,7 @@ const old_newton = struct {
         limit: f64,
         load_ok: bool,
         stage: bool,
+        clamped: bool,
     ) Step {
         const S = Deref(@TypeOf(sys));
         const n = sys.n;
@@ -561,7 +600,8 @@ const old_newton = struct {
             if ((iter == 0 or scaled >= 1.0) and iter + 1 < opts.max_iter) sys.evalFollows(x, t, false);
         }
 
-        const limited = if (comptime @hasDecl(S, "applyLimits")) sys.applyLimits(x, x_old) else false;
+        const device_limited = if (comptime @hasDecl(S, "applyLimits")) sys.applyLimits(x, x_old) else false;
+        const limited = device_limited or clamped;
 
         if (limited) return .{ .converged = false, .scaled = scaled, .why = .limited };
         if (iter == 0) return .{ .converged = false, .scaled = scaled, .why = .first_iter };
@@ -628,3 +668,28 @@ const old_newton = struct {
         return result;
     }
 };
+
+// ---- Circuit's sim-state broadcast (`Batch.publishSim`): a store at the
+// batch's `sim_offset`, keeping its `analog_initial`, instead of a
+// `set_sim_state` call; a batch without one still calls. Against the same
+// loop written out with the branch, the address and the field copy. ----
+
+const PubBatch = eval.Batch;
+const PubSim = @FieldType(ResBatch, "sim");
+
+export fn gen_publish_sim(batches: [*]const PubBatch, n: u32, sim: *const PubSim) void {
+    for (batches[0..n]) |b| b.publishSim(sim.*);
+}
+
+export fn hand_publish_sim(batches: [*]const PubBatch, n: u32, sim: *const PubSim) void {
+    for (batches[0..n]) |b| {
+        if (b.sim_offset == std.math.maxInt(u16)) {
+            b.hooks.set_sim_state(b.ctx, sim.*);
+        } else {
+            const cell: *PubSim = @ptrCast(@alignCast(@as([*]u8, @ptrCast(b.ctx)) + b.sim_offset));
+            const ai = cell.analog_initial;
+            cell.* = sim.*;
+            cell.analog_initial = ai;
+        }
+    }
+}

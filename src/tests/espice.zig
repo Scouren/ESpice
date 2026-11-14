@@ -41,6 +41,61 @@ fn construct(allocator: std.mem.Allocator) !void {
     defer p.deinit();
 }
 
+/// The period `.pss` found in `source`: its time column's last row.
+fn pssPeriod(source: []const u8) !f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    return r.data[(r.npoints - 1) * r.varnames.len + try columnIndex(r, "time")];
+}
+
+/// The period `.pss` found in `source` and `node`'s fundamental amplitude
+/// over it, 2/N |sum_k v_k exp(-2 pi i k/N)| over the period's N steps.
+fn pssOrbit(source: []const u8, node: []const u8) ![2]f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    const w = r.varnames.len;
+    const col = try columnIndex(r, node);
+    const steps = r.npoints - 1;
+    var re: f64 = 0;
+    var im: f64 = 0;
+    for (0..steps) |k| {
+        const phi = 2 * std.math.pi * @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(steps));
+        re += r.data[k * w + col] * @cos(phi);
+        im -= r.data[k * w + col] * @sin(phi);
+    }
+    return .{ r.data[steps * w + try columnIndex(r, "time")], 2 * std.math.hypot(re, im) / @as(f64, @floatFromInt(steps)) };
+}
+
+/// The largest Nyquist component (1/N) |sum_k (-1)^k x_k| of any `.pss`
+/// column in `source` over the period's N steps, relative to that column's
+/// peak (columns at zero aside).
+fn pssRinging(source: []const u8) !f64 {
+    const p = try create(source);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .pss));
+    const w = r.varnames.len;
+    const steps = r.npoints - 1;
+    const time = try columnIndex(r, "time");
+    var worst: f64 = 0;
+    for (0..w) |col| {
+        if (col == time) continue;
+        var sum: f64 = 0;
+        var peak: f64 = 0;
+        for (0..steps) |k| {
+            const x = r.data[k * w + col];
+            sum += if (k % 2 == 0) x else -x;
+            peak = @max(peak, @abs(x));
+        }
+        if (peak != 0) worst = @max(worst, @abs(sum) / @as(f64, @floatFromInt(steps)) / peak);
+    }
+    return worst;
+}
+
 test "Problem: construction releases partial ownership at every allocation failure" {
     try construct(t.allocator);
     try t.checkAllAllocationFailures(@import("core").testing.fixed_growth, construct, .{});
@@ -260,10 +315,15 @@ test "Problem: source and appended port slices are owned after the call returns"
     const result = try p.result(ids[0]);
     try t.expectEqual(@as(usize, 2), result.npoints);
     // A 50-ohm load matches the original port. Borrowing the modified slice
-    // would produce S11 = (50 - 150) / (50 + 150) = -0.5.
+    // would produce S11 = (50 - 150) / (50 + 150) = -0.5. The probes come
+    // before S, so S11 is found by name.
+    const s11 = for (result.varnames, 0..) |name, c| {
+        if (std.mem.eql(u8, name, "v(S_1_1)")) break c;
+    } else return error.MissingColumn;
+    const stride = 2 * result.varnames.len;
     for (0..result.npoints) |i| {
-        try t.expectApproxEqAbs(@as(f64, 0), result.data[4 * i + 2], 1e-9);
-        try t.expectApproxEqAbs(@as(f64, 0), result.data[4 * i + 3], 1e-9);
+        try t.expectApproxEqAbs(@as(f64, 0), result.data[stride * i + 2 * s11], 1e-9);
+        try t.expectApproxEqAbs(@as(f64, 0), result.data[stride * i + 2 * s11 + 1], 1e-9);
     }
 }
 
@@ -474,26 +534,56 @@ test "Problem: an .sp written as Touchstone records each port's reference impeda
 
 test {
     _ = @import("analyses.zig");
+    _ = @import("instance_params.zig");
+    _ = @import("card_keys.zig");
+    _ = @import("breakdown.zig");
+    _ = @import("mfactor.zig");
+    _ = @import("tempco.zig");
+    _ = @import("noise_gap.zig");
+    _ = @import("noise_quiet.zig");
+    _ = @import("expressions.zig");
+    _ = @import("temper.zig");
+    _ = @import("unknown_functions.zig");
+    _ = @import("opvars.zig");
+    _ = @import("opvars_tran.zig");
+    _ = @import("switch_flag.zig");
+    _ = @import("self_heating.zig");
+    _ = @import("pss_keys.zig");
+    _ = @import("source_dc.zig");
+    _ = @import("source_port.zig");
+    _ = @import("sp_plot.zig");
+    _ = @import("sp_balanced.zig");
+    _ = @import("dc_segments.zig");
+    _ = @import("hdl_include.zig");
 }
 
-test "Problem: .lin format=touchstone writes <deck>.s2p beside the deck with the noise block" {
+test "Problem: .lin format=touchstone writes <deck>.s2p beside the output file, not the deck, with the noise block" {
+    // The ports are ngspice's portnum V cards (vsrc.c), each with its z0 in
+    // series in the circuit. The file goes where `.save` and `.stim` files
+    // go (`Problem.out_dir`): beside the deck it was lost under SpiceRack,
+    // whose kit directory the CLI deletes.
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
-    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/amp.sp", .{tmp.sub_path});
+    try tmp.dir.createDirPath(t.io, "deck");
+    try tmp.dir.createDirPath(t.io, "out");
+    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/deck/amp.sp", .{tmp.sub_path});
     defer t.allocator.free(origin);
+    const raw = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/out/amp.raw", .{tmp.sub_path});
+    defer t.allocator.free(raw);
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{
-            .data = "pad\nP1 a 0 port=1 z0=50\nR1 a b 50\nR2 b 0 50\nP2 b 0 port=2 z0=50\n.ac dec 1 1k 10k\n.lin noisecalc=1 format=touchstone\n.end\n",
+            .data = "pad\nV1 a 0 dc 0 portnum 1 z0 50\nR1 a b 50\nR2 b 0 50\nV2 b 0 dc 0 portnum 2 z0 50\n.ac dec 1 1k 10k\n.lin noisecalc=1 format=touchstone\n.end\n",
             .origin = origin,
         } },
-        .dialect = .hspice,
+        .output = .{ .path = raw },
     });
     defer p.deinit();
     try p.run_all();
-    const written = try tmp.dir.readFileAlloc(t.io, "amp.s2p", t.allocator, .unlimited);
+    const written = try tmp.dir.readFileAlloc(t.io, "out/amp.s2p", t.allocator, .unlimited);
     defer t.allocator.free(written);
     try t.expect(std.mem.indexOf(u8, written, "# Hz S RI R 50\n1e3 ") != null);
     try t.expect(std.mem.indexOf(u8, written, "! noise parameters\n1e3 ") != null);
+    try t.expectError(error.FileNotFound, tmp.dir.access(t.io, "deck/amp.s2p", .{}));
 }
 
 test "Problem: parameter sweeps cannot mutate concurrently running transient state" {
@@ -560,7 +650,9 @@ test "device noise needs no input source and retains its thermal PSD" {
     try t.expectEqual(@as(u8, 1), totals);
 }
 
-test "HSPICE .save writes the operating point beside the output and .load reads it back" {
+// Oracle: the divider's own node voltages (v(a) = 2 V, v(b) its half),
+// and `.load` reading back the two top-level `.ic` lines it wrote.
+test ".save type=ic writes the operating point beside the output and .load reads it back" {
     const io = t.io;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -570,7 +662,6 @@ test "HSPICE .save writes the operating point beside the output and .load reads 
     defer t.allocator.free(out);
     const saver = try api.Problem.init(t.allocator, io, .{
         .source = .{ .bytes = .{ .data = "save\nv1 a 0 2\nr1 a b 1k\nr2 b 0 1k\nx1 b sub\n.subckt sub p\nr1 p m 1k\nr2 m 0 1k\n.ends\n.op\n.save type=ic level=top\n.end\n", .origin = "divider.sp" } },
-        .dialect = .hspice,
         .output = .{ .path = out },
     });
     defer saver.deinit();
@@ -584,7 +675,7 @@ test "HSPICE .save writes the operating point beside the output and .load reads 
     try tmp.dir.writeFile(io, .{ .sub_path = "load.sp", .data = "load\nv1 a 0 1\nr1 a b 1k\nc1 b 0 1n\n.load file=divider.ic0\n.tran 1n 10n\n.end\n" });
     const deck_path = try std.fmt.allocPrint(t.allocator, "{s}/load.sp", .{dir});
     defer t.allocator.free(deck_path);
-    const loader = try api.Problem.init(t.allocator, io, .{ .source = .{ .file = deck_path }, .dialect = .hspice });
+    const loader = try api.Problem.init(t.allocator, io, .{ .source = .{ .file = deck_path } });
     defer loader.deinit();
     try t.expectEqual(@as(usize, 2), loader.prepared.deck.ic.len);
 }
@@ -602,7 +693,6 @@ test "HSPICE .stim writes PWL sources and a .data table a later run reads" {
         .source = .{ .bytes = .{ .data = "stim\nv1 a 0 pwl(0 0 1n 1)\nr1 a 0 1k\n.tran 0.1n 2n\n" ++
             ".stim tran pwl filename=rc v0=v(a) node1=b node2=0 npoints=5\n" ++
             ".stim tran data filename=rc tab vv=v(a) w=par('2*v(a)') indepvar=(0.5n 1.5n) indepout\n.end\n", .origin = "stim.sp" } },
-        .dialect = .hspice,
         .output = .{ .path = out },
     });
     defer writer.deinit();
@@ -628,7 +718,7 @@ test "HSPICE .stim writes PWL sources and a .data table a later run reads" {
     try tmp.dir.writeFile(io, .{ .sub_path = "load.sp", .data = "load\n.include rc.pwl0_tr0\nr2 b 0 1k\n.tran 0.1n 2n\n.end\n" });
     const deck_path = try std.fmt.allocPrint(t.allocator, "{s}/load.sp", .{dir});
     defer t.allocator.free(deck_path);
-    const reader = try api.Problem.init(t.allocator, io, .{ .source = .{ .file = deck_path }, .dialect = .hspice });
+    const reader = try api.Problem.init(t.allocator, io, .{ .source = .{ .file = deck_path } });
     defer reader.deinit();
     try reader.run_all();
 }
@@ -643,7 +733,6 @@ test "HSPICE .op <time> counts its columns as .op does" {
     try text.appendSlice(t.allocator, "r63 n63 0 1k\n.op 1n\n.end\n");
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = text.items, .origin = "snapshot.sp" } },
-        .dialect = .hspice,
         .output = .{ .format = .sst2 },
     });
     defer p.deinit();
@@ -728,7 +817,6 @@ test "Problem: a final plan streams a lone transient but keeps one that .stim re
     const p = try api.Problem.init(t.allocator, io, .{
         .source = .{ .bytes = .{ .data = "stim\nv1 a 0 pwl(0 0 1n 1)\nr1 a 0 1k\n.tran 0.1n 2n\n" ++
             ".stim tran pwl filename=rc v0=v(a) node1=b node2=0 npoints=5\n.end\n", .origin = "stim.sp" } },
-        .dialect = .hspice,
         .output = .{ .path = out },
         .backend = .{ .final_plan = true },
     });
@@ -1110,10 +1198,10 @@ fn squareLawGm(vgs: f64) f64 {
     return 1e-4 * 2 * (vgs - 0.5) * (1 + 0.02 * 1.8);
 }
 
-/// Runs `text` in `dialect` and returns its `.meas` cards gm1 (at the OP)
-/// and gm2 (along the .dc).
-fn opvarMeasures(text: []const u8, dialect: api.Dialect) ![2]f64 {
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "opvars.cir" } }, .dialect = dialect });
+/// Runs `text` and returns its `.meas` cards gm1 (at the OP) and gm2
+/// (along the .dc).
+fn opvarMeasures(text: []const u8) ![2]f64 {
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "opvars.cir" } } });
     defer p.deinit();
     try p.run_all();
     const first = for (0..p.query_count()) |i| {
@@ -1127,65 +1215,15 @@ fn opvarMeasures(text: []const u8, dialect: api.Dialect) ![2]f64 {
     return out;
 }
 
-test ".meas reads @m1[gm], HSPICE's lx7(x1.mn1) and their columns at the OP and along a .dc (#236)" {
+test ".meas reads @m1[gm] and its column at the OP and along a .dc (#236)" {
     // Oracle: `squareLawGm` by hand at V_GS = 1.2 V (the OP) and 1.4 V,
     // inside the three-point sweep `find ... at=` interpolates over.
-    const ngspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n" ++
+    // HSPICE's lx7(x1.mn1) reaches the reader as SpiceRack's @-form.
+    const text = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n" ++
         ".op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find @m1[gm]\n.meas dc gm2 find @m1[gm] at=1.4\n.end\n";
-    // A subcircuit's device, named by its path; `.probe` saves without
-    // narrowing what else is written.
-    const hspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nx1 d g 0 cell\n.subckt cell d g s\nmn1 d g s s nm w=2u l=1u\n.ends\n" ++
-        ".model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe dc lx7(x1.mn1)\n.op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find lx7(x1.mn1)\n.meas dc gm2 find lx7(x1.mn1) at=1.4\n.end\n";
-    for ([_][]const u8{ ngspice, hspice }, [_]api.Dialect{ .ngspice, .hspice }) |text, dialect| {
-        const gm = try opvarMeasures(text, dialect);
-        try t.expectApproxEqRel(squareLawGm(1.2), gm[0], 1e-9);
-        try t.expectApproxEqRel(squareLawGm(1.4), gm[1], 1e-9);
-    }
-    // Level 1 has no `vth` of its own (lv9), lx5 is not mapped, and x9 is
-    // no instance.
-    for ([_][]const u8{ "lv9(x1.mn1)", "lx5(x1.mn1)", "lx7(x9.mn1)" }) |name| {
-        var buf: [512]u8 = undefined;
-        const refused = try std.fmt.bufPrint(&buf, "{s}.meas op vt find {s}\n.end\n", .{ hspice[0 .. hspice.len - 5], name });
-        try t.expectError(error.UnsupportedCard, api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = refused, .origin = "opvars.cir" } }, .dialect = .hspice }));
-    }
-}
-
-test "Spectre's save nm1:gm and HSPICE's .probe op are columns with the square law's values (#236)" {
-    // Oracle: `squareLawGm` by hand at each sweep point. `nm1`'s name does
-    // not carry its letter; its master makes it a MOSFET.
-    const spectre_deck =
-        \\// opvars spectre
-        \\vd (dd 0) vsource dc=1.8
-        \\vm (dd d) vsource dc=0
-        \\vg (g 0) vsource dc=1.2
-        \\nm1 (d g 0 0) nm w=2u l=1u
-        \\model nm mos1 type=n vto=0.5 kp=1e-4 lambda=0.02
-        \\save d nm1:gm nm1:d
-        \\sw dc dev=vg start=1.2 stop=1.6 step=0.2
-        \\
-    ;
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = spectre_deck, .origin = "opvars.scs" } }, .dialect = .spectre });
-    defer p.deinit();
-    try p.run_all();
-    const r = try p.result(try find(p, .dc));
-    const gm = try columnIndex(r, "nm1:gm");
-    try t.expectEqual(@as(usize, 3), r.npoints);
-    for (0..r.npoints) |k| {
-        const row = r.data[k * r.varnames.len ..][0..r.varnames.len];
-        try t.expectApproxEqRel(squareLawGm(row[0]), row[gm], 1e-9);
-    }
-    // `.probe op`: every variable as @<card>[<variable>], without the
-    // `ids` alias; a resistor has none.
-    const probe_deck = "opvars probe op\nvd d 0 1.8\nvg g 0 1.2\nr1 g 0 1k\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe op\n.op\n.end\n";
-    const probed = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = probe_deck, .origin = "probe.sp" } }, .dialect = .hspice });
-    defer probed.deinit();
-    try probed.run_all();
-    const op = try probed.result(try find(probed, .op));
-    try t.expectApproxEqRel(squareLawGm(1.2), try column(op, "@m1[gm]"), 1e-9);
-    // V(g) - V(s) of two solved nodes: 1 ulp from 1.2.
-    try t.expectApproxEqRel(@as(f64, 1.2), try column(op, "@m1[vgs]"), 1e-15);
-    try t.expectError(error.MissingColumn, column(op, "@m1[ids]"));
-    try t.expectError(error.MissingColumn, column(op, "@r1[id]"));
+    const gm = try opvarMeasures(text);
+    try t.expectApproxEqRel(squareLawGm(1.2), gm[0], 1e-9);
+    try t.expectApproxEqRel(squareLawGm(1.4), gm[1], 1e-9);
 }
 
 test "a saturated level-1 pfet's @m1[id], is, vgs and vds are positive in ngspice's frame; cgg and ft its overlaps' (#236)" {
@@ -1392,6 +1430,11 @@ fn runThreaded(path: []const u8, device_threads: u32, solver_threads: u8) ![]con
         .backend = .{ .device_threads = device_threads, .solver_threads = solver_threads },
     });
     defer p.deinit();
+    // An exported ESPICE_THREADS or ESPICE_SOLVER_THREADS replaces both
+    // counts (`config.threadsFromEnv`), which would make every comparison
+    // of the caller one run against itself: fail instead.
+    try t.expectEqual(device_threads, p.session.config.device_threads);
+    try t.expectEqual(solver_threads, p.session.config.solver_threads);
     // device_threads > 1 always builds a ParEval; with an instance per
     // lane at least, every lane can claim a chunk.
     try t.expect(p.device_count() >= device_threads);
@@ -1418,16 +1461,24 @@ test "same deck, same bytes: run twice, any solver_threads, any device_threads" 
     // byte; before #137 it regrouped the sums (up to 24554 ulp on
     // parallel_inverters_100) and vacask_ring's transient took 20717 /
     // 20585 / 20318 points at 1 / 2 / 4 threads.
-    const decks = [_][]const u8{
+    const all = [_][]const u8{
         "tests/conformance/tests/netlist/stress/scaling_parallel_inverters_100.sp",
-        "tests/conformance/tests/netlist/stress/scaling_inverter_chain_256.sp",
         "tests/conformance/tests/netlist/stress/sweep_opamp_wl_200.sp",
+        // mos6 with gate, source and bulk tied (MP11-MP13): 1 device
+        // thread differed from 2..8 in i(vdd).
+        "tests/conformance/tests/netlist/tran/device_mos6_inverter.sp",
+        "tests/conformance/tests/netlist/stress/scaling_inverter_chain_256.sp",
         "tests/conformance/tests/netlist/stress/vacask_ring.sp",
         // MOS6 with gate, source and bulk on one node: the bypass replays
         // its source row by the wrong Jacobian row unless serial recording
         // skips the unwritten gate row (`RecordSink`).
         "tests/conformance/tests/netlist/tran/device_mos6_inverter.sp",
     };
+    // A ReleaseFast run of vacask_ring takes 3.5 s and inverter_chain_256
+    // 0.74 s (2026-11-11), eight runs each: past the 5-minute test timeout
+    // in Debug. Debug keeps the three light decks; the ReleaseSafe gate
+    // runs all five.
+    const decks = if (@import("builtin").mode == .debug) all[0..3] else &all;
     try t.expectEqual(@as(c_int, 0), setenv("ESPICE_LU_PAR", "1", 1));
     defer _ = unsetenv("ESPICE_LU_PAR");
     for (decks) |deck_path| {
@@ -1446,6 +1497,30 @@ test "same deck, same bytes: run twice, any solver_threads, any device_threads" 
     }
 }
 
+test "ESPICE_THREADS=1 holds a Zig API run to one worker, as it holds the CLI's" {
+    // Oracle: the config the session runs with. `device_threads` 1 and no
+    // `thread_pool` mean each query stamps on one lane and borrows none
+    // (executor.zig `runQuery`). The options ask for the pool the CLI asks
+    // for; when only main.zig read the variable, a library caller kept the
+    // pool. No query runs while the variable is set, so no worker reads
+    // the process-wide environment.
+    try t.expectEqual(@as(c_int, 0), setenv("ESPICE_THREADS", "1", 1));
+    defer _ = unsetenv("ESPICE_THREADS");
+    const options: api.Options = .{ .source = .{ .bytes = .{ .data = deck, .origin = "threads.cir" } }, .auto_threads = true };
+    const p = try api.Problem.init(t.allocator, t.io, options);
+    defer p.deinit();
+    try t.expectEqual(@as(u32, 1), p.session.config.device_threads);
+    try t.expect(p.session.config.thread_pool == null);
+    // The parse the CLI's own test pinned: a positive integer, else 1.
+    for ([_]struct { [*:0]const u8, u32 }{ .{ "8", 8 }, .{ "0", 1 }, .{ "-3", 1 }, .{ "abc", 1 }, .{ "", 1 } }) |case| {
+        try t.expectEqual(@as(c_int, 0), setenv("ESPICE_THREADS", case[0], 1));
+        const q = try api.Problem.init(t.allocator, t.io, options);
+        defer q.deinit();
+        try t.expectEqual(case[1], q.session.config.device_threads);
+        try t.expect(q.session.config.thread_pool == null);
+    }
+}
+
 /// What a final-plan run of `jobs_deck` writes at `jobs`, as the CLI runs
 /// it: the raw file and `.meas` text, which the caller frees, and the
 /// main session's four points' `tf`.
@@ -1459,7 +1534,6 @@ fn runJobs(tmp: *const std.testing.TmpDir, jobs: u16, warm_start: bool) !JobsRun
     defer t.allocator.free(path);
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = jobs_deck, .origin = "jobs.sp" } },
-        .dialect = .hspice,
         .output = .{ .path = path },
         .backend = .{ .final_plan = true },
         .max_parallel = jobs,
@@ -1560,7 +1634,7 @@ test "Problem.append_points: warm-started points measure what cold ones do" {
         \\.end
         \\
     ;
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = template, .origin = "points.sp" } }, .dialect = .hspice, .live_params = &.{"rl"}, .max_parallel = 3 });
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = template, .origin = "points.sp" } }, .live_params = &.{"rl"}, .max_parallel = 3 });
     defer p.deinit();
     const values = [_]f64{ 800, 1.5e3, 2.5e3 };
     const cold = try p.append_points(&values, values.len, .{});
@@ -1596,7 +1670,7 @@ test "Problem: an optimization takes the same path one point at a time and batch
     var runs: [2]*api.Problem = undefined;
     for (&runs, [_]u16{ 1, 3 }, 0..) |*p, jobs, i| {
         errdefer for (runs[0..i]) |q| q.deinit();
-        p.* = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = fit, .origin = "fit.sp" } }, .dialect = .hspice, .max_parallel = jobs });
+        p.* = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = fit, .origin = "fit.sp" } }, .max_parallel = jobs });
     }
     defer for (runs) |p| p.deinit();
     for (runs) |p| try p.run_all();
@@ -1626,15 +1700,15 @@ test "Problem.set_params: every allocation failure leaves nothing behind" {
     try t.checkAllAllocationFailures(@import("core").testing.fixed_growth, tuneAndRun, .{});
 }
 
-/// A run that writes a raw file, `.save` and `.stim` files into `dir`, then
-/// prints its `.meas` results: each allocation on those paths fails once.
+/// A run that writes a raw file, an operating-point `.save` file and a
+/// `.stim` file into `dir`, then prints its `.meas` results: each
+/// allocation on those paths fails once.
 fn saveStimMeasure(allocator: std.mem.Allocator, dir: []const u8) !void {
     const out = try std.fmt.allocPrint(allocator, "{s}/a.raw", .{dir});
     defer allocator.free(out);
     const p = try api.Problem.init(allocator, t.io, .{
         .source = .{ .bytes = .{ .data = "write\nv1 a 0 pwl(0 0 1n 1)\nr1 a 0 1k\n.tran 0.5n 1n\n.save type=ic\n" ++
             ".stim tran pwl filename=rc v0=v(a) node1=b node2=0 npoints=3\n.meas tran vmax max v(a)\n.end\n", .origin = "write.sp" } },
-        .dialect = .hspice,
         .output = .{ .path = out },
     });
     defer p.deinit();
@@ -1674,8 +1748,8 @@ const MeasureRun = struct {
 };
 
 /// Runs `source` under `point`; the caller deinits the result.
-fn measureRun(source: api.Source, dialect: api.Dialect, point: api.requests.PointOptions) !MeasureRun {
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .point = point });
+fn measureRun(source: api.Source, point: api.requests.PointOptions) !MeasureRun {
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .point = point });
     defer p.deinit();
     try p.run_all();
     var text: std.Io.Writer.Allocating = .init(t.allocator);
@@ -1738,21 +1812,23 @@ const every_card =
 ;
 
 test "measures_only and early_stop: every .meas tran fixture measures as the stored run, to the bit" {
-    const decks = [_]struct { api.Source, api.Dialect }{
-        .{ .{ .file = "tests/conformance/tests/netlist/tran/bbd_ten_cells.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/tran/zero_abstol_vntol.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/tran/trap_maxord1_ngspice.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/tran/zero_vntol_chgtol.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/tran/gear_maxord6_ngspice.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/optimize/rc_delay_fit.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/optimize/bisection_rc_max.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/hspice/meas_events.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/hspice/meas_forms.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/hspice/fft_meas.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/variants/monte_tran_meas.sp" }, .hspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/regression/ota_buffer_large_step.sp" }, .ngspice },
-        .{ .{ .file = "tests/conformance/tests/netlist/regression/ota_buffer_large_step_0p88.sp" }, .ngspice },
-        .{ .{ .bytes = .{ .data = every_card, .origin = "every.sp" } }, .ngspice },
+    // The HSPICE decks here are ones the ngspice reader reads as written;
+    // hspice/meas_forms.sp is not (`.measure t50` names no analysis), and
+    // `every_card` holds its forms.
+    const decks = [_]api.Source{
+        .{ .file = "tests/conformance/tests/netlist/tran/bbd_ten_cells.sp" },
+        .{ .file = "tests/conformance/tests/netlist/tran/zero_abstol_vntol.sp" },
+        .{ .file = "tests/conformance/tests/netlist/tran/trap_maxord1_ngspice.sp" },
+        .{ .file = "tests/conformance/tests/netlist/tran/zero_vntol_chgtol.sp" },
+        .{ .file = "tests/conformance/tests/netlist/tran/gear_maxord6_ngspice.sp" },
+        .{ .file = "tests/conformance/tests/netlist/optimize/rc_delay_fit.sp" },
+        .{ .file = "tests/conformance/tests/netlist/optimize/bisection_rc_max.sp" },
+        .{ .file = "tests/conformance/tests/netlist/hspice/meas_events.sp" },
+        .{ .file = "tests/conformance/tests/netlist/hspice/fft_meas.sp" },
+        .{ .file = "tests/conformance/tests/netlist/variants/monte_tran_meas.sp" },
+        .{ .file = "tests/conformance/tests/netlist/regression/ota_buffer_large_step.sp" },
+        .{ .file = "tests/conformance/tests/netlist/regression/ota_buffer_large_step_0p88.sp" },
+        .{ .bytes = .{ .data = every_card, .origin = "every.sp" } },
     };
     const modes = [_]api.requests.PointOptions{
         .{ .measures_only = true },
@@ -1760,12 +1836,12 @@ test "measures_only and early_stop: every .meas tran fixture measures as the sto
         .{ .measures_only = true, .early_stop = true },
     };
     for (decks) |d| {
-        const want = try measureRun(d[0], d[1], .{});
+        const want = try measureRun(d, .{});
         defer want.deinit();
         for (modes) |mode| {
-            const got = try measureRun(d[0], d[1], mode);
+            const got = try measureRun(d, mode);
             defer got.deinit();
-            errdefer std.debug.print("deck {s}, {any}\n", .{ switch (d[0]) {
+            errdefer std.debug.print("deck {s}, {any}\n", .{ switch (d) {
                 .file => |f| f,
                 .bytes => |b| b.origin,
             }, mode });
@@ -1778,9 +1854,9 @@ test "measures_only and early_stop: every .meas tran fixture measures as the sto
 
 test "early_stop: every card resolves by 3 us of 6 us, so the run ends near halfway" {
     const source: api.Source = .{ .bytes = .{ .data = every_card, .origin = "every.sp" } };
-    const full = try measureRun(source, .ngspice, .{});
+    const full = try measureRun(source, .{});
     defer full.deinit();
-    const cut = try measureRun(source, .ngspice, .{ .early_stop = true });
+    const cut = try measureRun(source, .{ .early_stop = true });
     defer cut.deinit();
     std.debug.print("every_card steps: full {d}, early stop {d}\n", .{ full.steps, cut.steps });
     try t.expect(cut.steps * 10 < full.steps * 6);
@@ -1924,7 +2000,7 @@ test "Problem.append_points: measures equal the CLI's printed .meas of the same 
     try swept.appendSlice(t.allocator, points_body ++ ".data pts rv cv\n");
     for (rows) |p| try swept.print(t.allocator, "+ {e} {e}\n", .{ p[0], p[1] });
     try swept.appendSlice(t.allocator, ".enddata\n.tran 10p 40n sweep data=pts\n" ++ points_meas);
-    const cli = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = swept.items, .origin = "data.sp" } }, .dialect = .hspice });
+    const cli = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = swept.items, .origin = "data.sp" } } });
     defer cli.deinit();
     try cli.run_all();
     var printed: std.Io.Writer.Allocating = .init(t.allocator);
@@ -1935,7 +2011,6 @@ test "Problem.append_points: measures equal the CLI's printed .meas of the same 
 
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = points_body ++ ".tran 10p 40n\n" ++ points_meas, .origin = "points.sp" } },
-        .dialect = .hspice,
         .live_params = &.{ "rv", "cv" },
     });
     defer p.deinit();
@@ -1980,7 +2055,7 @@ test "Options.measures: run_all prints each point's .meas block as it ends, the 
     var want: std.Io.Writer.Allocating = .init(t.allocator);
     defer want.deinit();
     {
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = .hspice });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = source });
         defer p.deinit();
         try p.run_all();
         try p.print_measures(&want.writer, &want.writer);
@@ -1989,7 +2064,7 @@ test "Options.measures: run_all prints each point's .meas block as it ends, the 
     for ([_]u16{ 1, 4 }) |jobs| {
         var got: std.Io.Writer.Allocating = .init(t.allocator);
         defer got.deinit();
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = .hspice, .max_parallel = jobs, .point = .{ .measures_only = true }, .measures = .{ .out = &got.writer, .err = &got.writer } });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .max_parallel = jobs, .point = .{ .measures_only = true }, .measures = .{ .out = &got.writer, .err = &got.writer } });
         defer p.deinit();
         try p.run_all();
         // Every block is out before run_all returns.
@@ -2001,10 +2076,10 @@ test "Options.measures: run_all prints each point's .meas block as it ends, the 
 
 /// Runs `source` as `espice --measures` does, each `.meas` block printed to
 /// `text` as its point ends, then writes the JSON document to `json`.
-fn measuresJson(source: api.Source, dialect: api.Dialect, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+fn measuresJson(source: api.Source, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
     var errors: std.Io.Writer.Allocating = .init(t.allocator);
     defer errors.deinit();
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = 4, .measures = .{ .out = &text.writer, .err = &errors.writer }, .measures_json = true });
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .max_parallel = 4, .measures = .{ .out = &text.writer, .err = &errors.writer }, .measures_json = true });
     defer p.deinit();
     try p.run_all();
     try p.print_measures(&text.writer, &errors.writer);
@@ -2062,7 +2137,7 @@ test "--measures (#235): a .step deck's JSON is its printed .meas lines, each la
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try measuresJson(source, .ngspice, &text, &json);
+    try measuresJson(source, &text, &json);
     const parsed = try expectSameResults(text.written(), json.written());
     defer parsed.deinit();
     const results = jsonResults(parsed);
@@ -2086,6 +2161,33 @@ test "--measures (#235): a .step deck's JSON is its printed .meas lines, each la
     try t.expectEqualStrings(json.written(), again.written());
 }
 
+test "--measures: an optimized parameter is an object named as its summary line, with the exact value the line rounds" {
+    // Oracle: analytic, 5 rx / (1k + rx) = 2 V at rx = 2k/3; bisection keeps
+    // the last passing value, within RELIN * 9900 ohm of it
+    // (optimize/bisection_divider_ngspice.sp at RELIN = 1e-12): 1e-8 ohm,
+    // far inside the line's 6.666667e2, which is 3.3e-5 ohm off.
+    const source: api.Source = .{ .bytes = .{ .data = "bisect\n.param rx=opt1(5k, 100, 10k)\nv1 in 0 5\nr1 in out 1k\nr2 out 0 rx\n" ++
+        ".model optmod opt method=bisection relin=1e-12 relout=1e-6 itropt=60\n.dc v1 0 5 1 sweep optimize=opt1 result=vout model=optmod\n" ++
+        ".meas dc vout find v(out) at=5 goal=2\n.end\n", .origin = "bisect.sp" } };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, &text, &json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    const optimized = parsed.value.object.get("optimized").?.array.items;
+    try t.expectEqual(@as(usize, 1), optimized.len);
+    const o = optimized[0].object;
+    try t.expectEqualStrings("rx", o.get("name").?.string);
+    try t.expectEqualStrings("opt1", o.get("optimization").?.string);
+    try t.expect(o.get("point") == null);
+    const rx = jsonFloat(o.get("value").?);
+    try t.expectApproxEqAbs(2000.0 / 3.0, rx, 1e-12 * 9900);
+    const line = text.written()[std.mem.indexOf(u8, text.written(), "  rx = ").? + 7 ..];
+    try t.expectEqualStrings("6.666667e2", line[0..std.mem.indexOfScalar(u8, line, ' ').?]);
+}
+
 test "--measures (#238): each SOA excursion is an object with its instance, limit, peak, window and variant; soa_count() per point" {
     // Oracle: V2 sweeps v(g) over 0..2 V at v(d) = vd. vgs passes 1.5 V at
     // the 2 V point alone, at both steps; vds = 2 V passes 1.5 V at every
@@ -2098,7 +2200,7 @@ test "--measures (#238): each SOA excursion is an object with its instance, limi
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try measuresJson(source, .ngspice, &text, &json);
+    try measuresJson(source, &text, &json);
     const parsed = try expectSameResults(text.written(), json.written());
     defer parsed.deinit();
     const results = jsonResults(parsed);
@@ -2125,7 +2227,12 @@ test "--measures (#235): an .alter deck labels the nominal run and the altered o
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try measuresJson(.{ .file = "docs/examples/hspice_alter.sp" }, .hspice, &text, &json);
+    // docs/examples/hspice_alter.sp as SpiceRack hands it over: `.measure
+    // t50` names the analysis HSPICE takes from the last analysis card, and
+    // the bare parameter values take braces.
+    const alter = "RC step response\n.param rval=1k cval=2p\nV1 in 0 pulse(0 1 0 10p 10p 50n 100n)\nR1 in out {rval}\nC1 out 0 {cval}\n" ++
+        ".tran 10p 20n\n.measure tran t50 when v(out)=0.5 rise=1\n.alter\n.param rval=2k\n.end\n";
+    try measuresJson(.{ .bytes = .{ .data = alter, .origin = "alter.sp" } }, &text, &json);
     const parsed = try expectSameResults(text.written(), json.written());
     defer parsed.deinit();
     const results = jsonResults(parsed);
@@ -2152,7 +2259,7 @@ test "--measures (#235): Monte Carlo trials are labelled by trial, and the stati
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try measuresJson(.{ .file = "docs/examples/monte_tran.sp" }, .hspice, &text, &json);
+    try measuresJson(.{ .file = "docs/examples/monte_tran.sp" }, &text, &json);
     const parsed = try expectSameResults(text.written(), json.written());
     defer parsed.deinit();
     var seen: [51]bool = @splat(false);
@@ -2269,12 +2376,12 @@ test "SIGMA_SCALE (#239): a trial whose FAIL card has no value fails, and a fit 
 /// and fails 5 sigmas out; `m2 >= 6` is its mirror, failing nominally.
 const wcd_linear = "wcd linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nv2 out 0 {{1+0.6*z1+0.8*z2}}\nr1 out 0 1k\n{s}\n.meas {s} m find v(out) at={s}\n.meas {s} m2 find v(out) at={s}\n.wcd m '<= 6' m2 '>= 6'\n.end\n";
 
-/// Runs `source` in `dialect` at `max_parallel`, printing its `.meas`
-/// text into `text` and its `--measures` JSON into `json`.
-fn wcdRun(source: api.Source, dialect: api.Dialect, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+/// Runs `source` at `max_parallel`, printing its `.meas` text into `text`
+/// and its `--measures` JSON into `json`.
+fn wcdRun(source: api.Source, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
     var errors: std.Io.Writer.Allocating = .init(t.allocator);
     defer errors.deinit();
-    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = max_parallel, .measures_json = true });
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .max_parallel = max_parallel, .measures_json = true });
     defer p.deinit();
     try p.run_all();
     try p.print_measures(&text.writer, &errors.writer);
@@ -2308,7 +2415,7 @@ test ".wcd (#240): a margin linear in Gaussians gives the closed-form beta, sign
             defer text.deinit();
             var json: std.Io.Writer.Allocating = .init(t.allocator);
             defer json.deinit();
-            try wcdRun(.{ .bytes = .{ .data = src, .origin = "wcd.cir" } }, .ngspice, jobs, &text, &json);
+            try wcdRun(.{ .bytes = .{ .data = src, .origin = "wcd.cir" } }, jobs, &text, &json);
             // Every operating point starts cold: the same bytes at any --jobs.
             if (first) |f| try t.expectEqualStrings(f, text.written()) else first = try t.allocator.dupe(u8, text.written());
             try t.expect(std.mem.indexOf(u8, text.written(), "Worst-case distances (.wcd)") != null);
@@ -2342,7 +2449,7 @@ test ".wcd (#240): the 5T OTA's output offset spec has the beta .dcmatch's sigma
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try wcdRun(.{ .file = "docs/examples/wcd_ota.sp" }, .hspice, 4, &text, &json);
+    try wcdRun(.{ .file = "docs/examples/wcd_ota.sp" }, 4, &text, &json);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
     defer parsed.deinit();
     var vo: f64 = std.math.nan(f64);
@@ -2374,7 +2481,7 @@ test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN 
     defer text.deinit();
     var json: std.Io.Writer.Allocating = .init(t.allocator);
     defer json.deinit();
-    try measuresJson(.{ .bytes = .{ .data = swept.items, .origin = "data.sp" } }, .hspice, &text, &json);
+    try measuresJson(.{ .bytes = .{ .data = swept.items, .origin = "data.sp" } }, &text, &json);
     const parsed = try expectSameResults(text.written(), json.written());
     defer parsed.deinit();
     const results = jsonResults(parsed);
@@ -2580,6 +2687,31 @@ test "--emir (#237): without a .tran, the .op or the .dc's first point: every st
     }
 }
 
+test "--emir (#237): a portnum V's z0 writes no entry, and the port is one source between n+ and n-" {
+    // Red before: the z0 wrote two terminals under the instance name
+    // "resistor", and V1's p sat at net `v1#res`.
+    var r = try emirRun("emir port\nV1 a 0 dc 1 portnum 1 z0 50\nR1 a 0 50\n.op\n.end\n", 1, .{ 0, 0 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    const terms = doc.get("terminals").?.array.items;
+    const sources = doc.get("sources").?.array.items;
+    try t.expectEqual(@as(usize, 2), terms.len);
+    try t.expectEqual(@as(usize, 2), sources.len);
+    for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+        const o = entry.object;
+        try t.expect(std.ascii.eqlIgnoreCase(if (std.mem.eql(u8, key, "sources")) "v1" else "r1", o.get("instance").?.string));
+        const p = std.mem.eql(u8, "p", o.get("terminal").?.string);
+        try t.expect(std.ascii.eqlIgnoreCase(if (p) "a" else "0", o.get("net").?.string));
+        // Oracle: 1 V behind z0 = 50 into R1 = 50 is 10 mA, into R1's p
+        // and out of the port's.
+        const into = p != std.mem.eql(u8, key, "sources");
+        try t.expectApproxEqAbs(@as(f64, if (into) 1e-2 else -1e-2), emirField(entry, "avg"), 1e-12);
+    };
+    try expectKcl(doc, 1e-12);
+}
+
 test "--emir (#237): a CMOS inverter driving C: the load's EM_AVG is C·V·f, so is the supply's mean, and the peak is the PMOS saturation current at the edge" {
     // mn, with a drain resistance, is the first card and the only mos1
     // instance not fully collapsed; a batch that narrows partitions its
@@ -2651,32 +2783,6 @@ test "--emir (#237): a CMOS inverter driving C: the load's EM_AVG is C·V·f, so
     } else return error.TestUnexpectedResult;
     try t.expectApproxEqRel(-3 * c * vdd / span, emirField(supply, "avg"), 1e-2);
     try expectKcl(doc, 1e-9);
-}
-
-test "--emir (#237): a Spectre analysis's emirfile, or emirformat alone, turns it on and names the file" {
-    for ([_][]const u8{
-        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\ntran1 tran stop=10n emirfile=\"hot.emir\"\n",
-        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\nop1 dc emirformat=ascii\n",
-    }, [_][]const u8{ "hot.emir", "emir.emir.json" }, [_][]const u8{ "tran", "op" }) |source, file, kind| {
-        const p = try api.Problem.init(t.allocator, t.io, .{
-            .source = .{ .bytes = .{ .data = source, .origin = "emir.scs" } },
-            .dialect = .spectre,
-        });
-        defer p.deinit();
-        try t.expectEqualStrings(file, p.emir_file() orelse return error.TestUnexpectedResult);
-        try p.run_all();
-        var text: std.Io.Writer.Allocating = .init(t.allocator);
-        defer text.deinit();
-        try t.expect(try p.write_emir_json(&text.writer, "emir.scs", 0));
-        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, text.written(), .{});
-        defer parsed.deinit();
-        try t.expectEqualStrings(kind, parsed.value.object.get("analysis").?.string);
-        // Oracle: Ohm's law, 3 mA into R1's p.
-        for (parsed.value.object.get("terminals").?.array.items) |term| {
-            const sign: f64 = if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) 1 else -1;
-            try t.expectApproxEqAbs(sign * 3e-3, emirField(term, "avg"), 1e-12);
-        }
-    }
 }
 
 test "Options.point.tangent_step with live parameters: the deck's own transient prints the tangents append_points gives" {
@@ -2868,10 +2974,10 @@ const LaneRun = struct {
         r.measures.deinit(t.allocator);
     }
 
-    /// Runs `source` (HSPICE, bypass off) with `.lanes` on or off and
+    /// Runs `source` (bypass off) with `.lanes` on or off and
     /// appends its points.
     fn add(r: *LaneRun, source: []const u8, lanes: bool) !void {
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "lane.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "lane.sp" } }, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
         defer p.deinit();
         try p.run_all();
         for (0..p.query_count()) |i| {
@@ -3203,7 +3309,7 @@ const Points = struct {
     }
 
     fn collect(ps: *Points, source: []const u8, lanes: bool) !void {
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "chain.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "chain.sp" } }, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
         defer p.deinit();
         // One failed point does not hide its peers' results. Keep its
         // actual failure below, not the result accessor's ResultUnavailable.
@@ -3287,7 +3393,6 @@ const GpuPoint = struct {
 fn gpuChainPoints(source: []const u8, gpu: bool, point: @FieldType(api.Options, "point")) ![]GpuPoint {
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
-        .dialect = .hspice,
         .backend = .{ .backend = if (gpu) .cuda else .cpu, .lanes = gpu },
         .point = point,
     });
@@ -3374,7 +3479,6 @@ fn expectGpuPoint(cpu: GpuPoint, gpu: GpuPoint) !void {
 fn staticPoints(source: []const u8, gpu: bool) ![]GpuPoint {
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "gpu-static.sp" } },
-        .dialect = .hspice,
         .backend = .{ .backend = if (gpu) .cuda else .cpu, .lanes = gpu },
     });
     defer p.deinit();
@@ -3497,7 +3601,6 @@ test "GPU lane measure bound (06 6.8): device passes under abort_after fail and 
 fn gpuMeasRun(source: []const u8, early: bool) !struct { points: []GpuPoint, text: []u8 } {
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
-        .dialect = .hspice,
         .backend = .{ .backend = .cuda, .lanes = true },
         .point = .{ .measures_only = !early, .early_stop = early },
     });
@@ -3598,5 +3701,282 @@ test "GPU lane lockstep (#208): mixed sizing, moved edge, extreme wire, failed p
                 } else first_replica = j;
             }
         }
+    }
+}
+
+/// Tiny corpus decks `auto` prices on the CPU: cpu 4-64 ms, auto 265-465 ms
+/// while the driver started before the price (price plan, stage 1).
+const tiny_decks = [_][]const u8{
+    "tran/rc_pulse_history_trap.sp",  "op/gigaohm_load.sp",
+    "dc/device_mos1_body_effect.sp",  "dc/device_bsim4_pmos.sp",
+    "ac/bench_bjt_common_emitter.sp", "tran/device_mos1_large_signal.sp",
+    "tran/device_mos6_inverter.sp",   "op/controlled_source_scaling.sp",
+};
+
+test "auto: a deck priced on the CPU never starts the GPU driver (price plan stage 1)" {
+    // Oracle: one count per gompute entry that can start the driver
+    // (`gpu/driver.zig`), whatever the executor believes it ran.
+    const touches = &@import("analysis").driver_test_hooks.touches;
+    for (tiny_decks) |name| {
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "tests/conformance/tests/netlist/{s}", .{name});
+        const before = touches.load(.monotonic);
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .file = path }, .backend = .{ .backend = .auto, .gpu_quiet = true } });
+        defer p.deinit();
+        try p.run_all();
+        const after = touches.load(.monotonic);
+        if (after != before) std.debug.print("{s}: {d} driver entries under auto\n", .{ name, after - before });
+        try t.expectEqual(before, after);
+    }
+}
+
+test "auto: a .step deck's GPU lane policy makes no driver entry (price plan stage 2, T2)" {
+    // Oracle: the driver-entry counter (`gpu/driver.zig`). The lane policy
+    // reads the card's FP64 rate from the machine file, never the driver.
+    const touches = &@import("analysis").driver_test_hooks.touches;
+    const before = touches.load(.monotonic);
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .file = "tests/conformance/tests/netlist/variants/step_alter_keeps_steps.sp" }, .backend = .{ .backend = .auto, .gpu_quiet = true } });
+    defer p.deinit();
+    try p.run_all();
+    try t.expectEqual(before, touches.load(.monotonic));
+}
+
+/// Runs corpus deck `name` under `auto`, checks whether its Problem found a
+/// calibration (`calibrated`), and returns the GPU driver entries it made.
+fn autoRun(name: []const u8, calibrated: bool) !u32 {
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "tests/conformance/tests/netlist/{s}", .{name});
+    const touches = &@import("analysis").driver_test_hooks.touches;
+    const before = touches.load(.monotonic);
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .file = path }, .backend = .{ .backend = .auto, .gpu_quiet = true } });
+    defer p.deinit();
+    try t.expectEqual(calibrated, p.machine != null);
+    try p.run_all();
+    const made = touches.load(.monotonic) - before;
+    if (made != 0) std.debug.print("{s}: {d} driver entries under auto\n", .{ name, made });
+    return made;
+}
+
+test "auto: no calibration keeps the driver unloaded and notes it once; the fixture's prices it without the driver (price plan stage 2)" {
+    // Oracles: the driver-entry counter (`gpu/driver.zig`) and the note
+    // counter (`machine.zig`), whatever the executor believes it ran.
+    const m = @import("analysis").machine;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [128]u8 = undefined;
+    const root = try std.mem.printSentinel(&root_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}, 0);
+    // Restored after: later tests read the real cache root.
+    var old_buf: [512]u8 = undefined;
+    const old: ?[:0]const u8 = if (std.c.getenv("XDG_CACHE_HOME")) |v| try std.mem.printSentinel(&old_buf, "{s}", .{v}, 0) else null;
+    defer _ = if (old) |v| setenv("XDG_CACHE_HOME", v, 1) else unsetenv("XDG_CACHE_HOME");
+    try t.expectEqual(@as(c_int, 0), setenv("XDG_CACHE_HOME", root, 1));
+
+    // An empty cache root: no file, so `auto` keeps everything on the CPU.
+    const decks = tiny_decks ++ [_][]const u8{"variants/step_alter_keeps_steps.sp"};
+    for (decks) |name| try t.expectEqual(@as(u32, 0), try autoRun(name, false));
+    // The note: once per process, only with kernels and a driver in sysfs.
+    const v = m.vendor orelse return;
+    const live = m.identity("", v);
+    const notes: u32 = @intFromBool(live.driver.len > 0);
+    try t.expectEqual(notes, m.test_hooks.notes.load(.monotonic));
+
+    // The fixture's constants on this machine's identity: loaded, priced, and
+    // still no driver entry (the tiny decks price CPU; the `.step` deck's
+    // lane policy reads FP64 1:64 from the file).
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var calibration = try m.parse(arena.allocator(), m.test_hooks.fixture);
+    calibration.id = live;
+    try m.write(t.allocator, &calibration, .{ .xdg_cache_home = root });
+    for (decks) |name| try t.expectEqual(@as(u32, 0), try autoRun(name, true));
+    try t.expectEqual(notes, m.test_hooks.notes.load(.monotonic));
+}
+
+test "ngspice's .pss card and ESPice's oscillator card find one ring oscillator's period" {
+    // Metamorphic: the ring of tests/conformance/tests/netlist/pss/
+    // ring_oscillator.sp under `.pss v(c1) 300k 256` and under ngspice's
+    // `.pss 300k 100u c1 256 10 50 5e-3` (inp2dot.c:662-701; 100 us is the
+    // 30 guess periods ESPice settles by default) is one oscillator, so one
+    // period. ngspice-45's settled transient puts it at 3.52176 us, to the
+    // corpus deck's 1e-3.
+    const ring = "ring\nr1 x1 c1 1k\nc1 c1 0 1n\nr2 x2 c2 1k\nc2 c2 0 1n\nr3 x3 c3 1k\nc3 c3 0 1n\n" ++
+        "b1 x1 0 v=-tanh(3*v(c3))\nb2 x2 0 v=-tanh(3*v(c1))\nb3 x3 0 v=-tanh(3*v(c2))\n";
+    const espice = try pssPeriod(ring ++ ".pss v(c1) 300k 256\n.end\n");
+    const ngspice = try pssPeriod(ring ++ ".pss 300k 100u c1 256 10 50 5e-3\n.end\n");
+    try t.expectEqual(espice, ngspice);
+    try t.expectApproxEqRel(@as(f64, 3.52176e-6), ngspice, 1e-3);
+}
+
+test "ngspice's .pss whose oscnob names no net picks its phase node and finds the ring's period" {
+    // Metamorphic: INPtermInsert makes a node of any oscnob (inp2dot.c:
+    // 676-678) and only dcpss.c:3516 reads it, so `.pss ... 1 ... uic` on a
+    // ring with no net 1 is the oscillator ESPice's `.pss v(c1)` card
+    // solves: one period, to 1e-3. ngspice-45's settled transient puts it
+    // at 3.52176 us. Red before the pick: InvalidAnalysisArguments.
+    const ring = "ring\nr1 x1 c1 1k\nc1 c1 0 1n\nr2 x2 c2 1k\nc2 c2 0 1n\nr3 x3 c3 1k\nc3 c3 0 1n\n" ++
+        "b1 x1 0 v=-tanh(3*v(c3))\nb2 x2 0 v=-tanh(3*v(c1))\nb3 x3 0 v=-tanh(3*v(c2))\n";
+    const given = try pssPeriod(ring ++ ".pss v(c1) 300k 256\n.end\n");
+    const picked = try pssPeriod(ring ++ ".ic v(c1)=0.1\n.pss 300k 100u 1 256 10 50 5e-3 uic\n.end\n");
+    try t.expectApproxEqRel(given, picked, 1e-3);
+    try t.expectApproxEqRel(@as(f64, 3.52176e-6), picked, 1e-3);
+}
+
+test "ngspice's .pss: colpitt's PWL start-up plays once, and its orbit is ngspice-45's" {
+    // The start-up integrated fixed-step periods each from t = 0, so vee's
+    // 1 ns PWL step replayed every period. ngspice runs one transient to
+    // tstab and shoots on from there (dcpss.c: 3560-3566, 4218). Red:
+    // error.Singular, which outlived that fix: vcc, c2, c1 and ccs are a
+    // capacitor and voltage source loop, whose current rings with
+    // multiplier +1 over the 256 steps, a zero column in the shooting
+    // Jacobian (gdb on unit run 9; 255 steps converge). Golden: ngspice-45 -b -r on this deck with
+    // `.tran 0.5n 520u 500u 0.5n` for the `.pss` (no ngspice build here
+    // implements .pss): v(3)'s rising mid-swing crossings 2.990807822e-07 s
+    // apart, DFT bin 1 at 4096 points a period 0.2514609521 V; reltol=1e-4
+    // moves both by 7e-6. Tolerances: ngspice's steadycoeff, 5e-3, and the
+    // shooting's 1e-3 on the period. Metamorphic: oscnob `osc1`, no net,
+    // picks a phase node and finds the same period.
+    const colpitt = "colpitt\n.model qnl npn(level=1 bf=80 rb=100 ccs=2pf tf=0.3ns tr=6ns cje=3pf cjc=2pf va=50)\n" ++
+        "r1 1 0 1\nq1 2 1 3 qnl\nvcc 4 0 5\nrl 4 2 750\nc1 2 3 500p\nc2 4 3 4500p\nl1 4 2 5uH\nre 3 6 4.65k\n" ++
+        "vee 6 0 dc -10 pwl 0 0 1e-9 -10\n";
+    const given = try pssOrbit(colpitt ++ ".pss 3.1e6 500e-6 3 256 10 50 5e-3\n.end\n", "v(3)");
+    try t.expectApproxEqRel(@as(f64, 2.990807822e-07), given[0], 1e-3);
+    try t.expectApproxEqRel(@as(f64, 0.2514609521), given[1], 5e-3);
+    const picked = try pssOrbit(colpitt ++ ".pss 3.1e6 500e-6 osc1 256 10 50 5e-3\n.end\n", "v(3)");
+    try t.expectApproxEqRel(given[0], picked[0], 1e-3);
+}
+
+test "ngspice's .pss ... uic: hartley starts from the .ic values and its orbit is ngspice-45's" {
+    // uic is ngspice's MODEUIC for the settling transient (psssetp.c:38-
+    // 40): no operating point, vcc ramping from 0 starts the tank (red:
+    // OscillatorDidNotStart, uic ignored and the OP's BJT off). Red after:
+    // NoPeriodicSteadyState at residual 8.8e7: c1 alone holds charge at
+    // nodes 3 and 4, and the seam seed rang their common mode with
+    // multiplier +1 over the 1024 steps, a near-null Newton direction that
+    // moved v(3) by 2e4 V (gdb on unit run 9; 1023 steps converge). Golden:
+    // ngspice-45 -b -r on this deck with `.tran 20u 2 1.8 20u uic` for
+    // the `.pss`: v(2)'s crossings 8.174787063e-03 s apart, DFT
+    // bin 1 1.137868852 V; reltol=1e-4 moves them by 1.2e-5 and 2.6e-5.
+    // Tolerances and the metamorphic pick as for colpitt.
+    const hartley = "hartley\n.model qnl npn(level=1 bf=80 rb=100 ccs=2pf tf=0.3ns tr=6ns cje=3pf cjc=2pf va=50)\n" ++
+        "vcc 1 0 5 pwl 0 0 1e-5 5\nr1 1 2 0.2k\nq1 2 3 0 qnl\nc1 3 4 633n\nl1 3 0 1.5\nl2 0 4 500m\nr2 4 2 100\n";
+    const given = try pssOrbit(hartley ++ ".pss 50 200e-3 2 1024 11 10 5e-3 uic\n.end\n", "v(2)");
+    try t.expectApproxEqRel(@as(f64, 8.174787063e-03), given[0], 1e-3);
+    try t.expectApproxEqRel(@as(f64, 1.137868852), given[1], 5e-3);
+    const picked = try pssOrbit(hartley ++ ".pss 50 200e-3 osc1 1024 11 10 5e-3 uic\n.end\n", "v(2)");
+    try t.expectApproxEqRel(given[0], picked[0], 1e-3);
+}
+
+test "ngspice's .pss on vackar, whose oscillation decays, publishes no periodic steady state" {
+    // Oracle: ngspice-45 -b -r on this deck with `.tran ... uic` for the
+    // `.pss` decays at one T = 5.18886e-7 s: v(4)'s DFT bin 1 is 4.776 V
+    // over 190-200 us, 3.232 V at 2 ms, 1.357 V at 6 ms and 8.5e-4 V at
+    // 40 ms, an e-fold every 4.6 ms (a multiplier of 0.999888 a period).
+    // There is no limit cycle, so ngspice's .pss answer is whatever tstab
+    // leaves. ESPice refuses (NoPeriodicSteadyState) or publishes the
+    // equilibrium, a1 under 1e-2 V. Red: a periodic a1 of 70 V (the
+    // start-up PWL replayed each period), then the unconverged last
+    // iterate published as the steady state.
+    const vackar = "vackar\n.model qnl npn(level=1 bf=80 rb=100 ccs=2pf tf=0.3ns tr=6ns cje=3pf cjc=2pf va=50)\n" ++
+        "vcc 1 0 5 pwl 0 10 1e-9 5\nlrfc 1 2 100u\ncdec 2 0 7n\nq1 3 2 0 qnl\nrb 3 0 4700\nc1 3 4 100p\n" ++
+        "c2 3 0 600p\nc0 4 0 1n\nl1 4 1 6.2u\n";
+    if (pssOrbit(vackar ++ ".pss 1e6 10e-6 4 1024 10 50 5e-3 uic\n.end\n", "v(4)")) |orbit| {
+        try t.expect(orbit[1] < 1e-2);
+    } else |err| try t.expect(err == error.NoPeriodicSteadyState);
+}
+
+// Analytic oracle for the two tests below: on a linear circuit driven by a
+// sampled sine, trapezoid's periodic orbit over N steps of dt is the phasor
+// solution at the warped s = j(2/dt)tan(w dt/2) (the bilinear map of
+// (2/dt)(z-1)/(z+1) at z = exp(j w dt)): DFT bin 1 is |H(s)| and every
+// other bin is zero, the Nyquist bin among them. A trapezoid current no
+// charge backs rings (-1)^k with multiplier +1 over an even N, so it
+// shows up only in that bin. N = 64, T = 1 ms.
+
+test ".pss on a capacitor and voltage source loop: an even step count publishes the warped phasor, the loop current unringing" {
+    // H = s c1 / (s (c1 + c2) + 1/r1): 0.4984268547 at the warped s
+    // (0.4984243361 at s = jw). vs, c1, c2 is a loop: its current rings
+    // in vs's column alone. Red: error.Singular (that column of the
+    // shooting Jacobian is exactly zero); with a gauge that only zeroes the
+    // old trajectory's ringing, i(vs) keeps 2e-5 A of it (gdb, 2026-11-11).
+    const cvloop = "cvloop\nvs a 0 sin(0 1 1k)\nc1 a b 1u\nc2 b 0 1u\nr1 b 0 1k\n.pss 1k 64\n.end\n";
+    try t.expectApproxEqRel(@as(f64, 0.4984268547), (try pssOrbit(cvloop, "v(b)"))[1], 1e-8);
+    try t.expect(try pssRinging(cvloop) < 1e-6);
+}
+
+test ".pss on a floating capacitor island: an even step count publishes the warped phasor, the island unringing" {
+    // Nodal: [1/r1 + s c1, -s c1; -s c1, s c1 + 1/(s l1) + 1/r2] v = [1/r1; 0]
+    // at the warped s gives |v(b)| 0.1135029113, |v(c)| 0.0514505927. c1
+    // alone holds charge at b and c, so rows b + c sum no dynamic current.
+    // Red (espice 2026-11-11, unit run 9): bin 1 right, but v(b) and v(c)
+    // ringing at a Nyquist 157 V on a 1 V drive, published as converged.
+    const island = "island\nvs a 0 sin(0 1 1k)\nr1 a b 1k\nc1 b c 1u\nl1 c 0 10m\nr2 c 0 100\n.pss 1k 64\n.end\n";
+    try t.expectApproxEqRel(@as(f64, 0.1135029113), (try pssOrbit(island, "v(b)"))[1], 1e-8);
+    try t.expectApproxEqRel(@as(f64, 0.0514505927), (try pssOrbit(island, "v(c)"))[1], 1e-8);
+    try t.expect(try pssRinging(island) < 1e-6);
+}
+
+test "an empty circuit's .op publishes a plot of no variables and one point (empty-1.sp)" {
+    // Golden: ngspice-44.2 -b -r on tests/regression/misc/empty-1.sp writes
+    // its `.op` as `No. Variables: 0`, `No. Points: 1`; the `.tran` and
+    // `.ac` beside it keep their scale column.
+    const p = try create("empty\n.op\n.tran 0.1m 1m\n.ac lin 3 1kHz 2kHz\n.end\n");
+    defer p.deinit();
+    try p.run_all();
+    const op = try p.result(try find(p, .op));
+    try t.expectEqual(@as(usize, 0), op.varnames.len);
+    try t.expectEqual(@as(usize, 1), op.npoints);
+    try t.expectEqual(@as(usize, 3), (try p.result(try find(p, .ac))).npoints);
+}
+
+/// `card` over V1 (node a) and V2 (node b, at `.param <param>` = 5).
+fn collisionDeck(comptime param: []const u8, comptime card: []const u8) []const u8 {
+    return "* collide\n.param " ++ param ++ "=5\nV1 a 0 1 ac 1\nR1 a 0 1k\nV2 b 0 {" ++ param ++ "}\nR2 b 0 1k\n" ++ card ++ "\n.end\n";
+}
+
+/// Asserts that `a` and `b` publish the same plots, query by query: names,
+/// columns and data bit for bit.
+fn expectSamePlots(a_source: []const u8, b_source: []const u8) !void {
+    const a = try create(a_source);
+    defer a.deinit();
+    const b = try create(b_source);
+    defer b.deinit();
+    try a.run_all();
+    try b.run_all();
+    try t.expectEqual(a.query_count(), b.query_count());
+    for (0..a.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        const ra = try a.result(id);
+        const rb = try b.result(id);
+        try t.expectEqualStrings(ra.plotname, rb.plotname);
+        try t.expectEqual(ra.varnames.len, rb.varnames.len);
+        for (ra.varnames, rb.varnames) |x, y| try t.expectEqualStrings(x, y);
+        try t.expectEqualSlices(u8, std.mem.sliceAsBytes(ra.data), std.mem.sliceAsBytes(rb.data));
+    }
+}
+
+test "a sweep names a source, never the .param of the same name (P3-056)" {
+    // Metamorphic: renaming `.param v1` to `p` changes no card's swept
+    // quantity, so every sweep-taking card publishes the same bytes with
+    // the name colliding (`v1`) and without (`p`). ngspice's `.dc` looks a
+    // name up among the devices only (dctrcurv.c:156-247).
+    const cards = [_][]const u8{
+        ".dc V1 1 3 1",                   ".dc V1 1 3 1 R2 1k 2k 1k",
+        ".dc R2 1k 2k 1k sweep V1 1 3 1", ".tran 1u 2u sweep V1 1 3 1",
+        ".step V1 1 3 1\n.op",            ".step V1 list 1 2 3\n.op",
+        ".tf v(a) V1",                    ".sens v(a)",
+        ".noise v(a) V1 dec 1 1k 10k",
+    };
+    inline for (cards) |card| try expectSamePlots(collisionDeck("v1", card), collisionDeck("p", card));
+    // Golden: ngspice-44.2 `ngspice -b` on this deck (P3-056's t_both.cir)
+    // prints v(a) = 1, 2, 3 and v(b) = 5 at every point.
+    const p = try create(collisionDeck("v1", ".dc V1 1 3 1"));
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    try t.expectEqual(@as(usize, 3), r.npoints);
+    for (0..3) |k| {
+        const row = r.data[k * r.varnames.len ..][0..r.varnames.len];
+        try t.expectApproxEqAbs(@as(f64, @floatFromInt(k + 1)), row[try columnIndex(r, "v(a)")], 1e-12);
+        try t.expectApproxEqAbs(@as(f64, 5), row[try columnIndex(r, "v(b)")], 1e-12);
     }
 }

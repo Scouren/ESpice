@@ -35,7 +35,7 @@ const c_not_dq = std.StaticStringMap(void).initComptime(.{ .{"hfet1"}, .{"hfet2"
 /// Port bias by position: drain/collector, gate/base, source/emitter, bulk.
 /// Off any region boundary for the default model cards (VTO 0..0.7, PN
 /// junctions forward at 0.7 V); the remaining ports get small offsets,
-/// cycling past the seventh (bsource_q has ten ports).
+/// cycling past the seventh (bsource has ten ports).
 const port_bias = [_]f64{ 0.9137, 0.7213, 0.0, -0.0731, 0.0517, 0.1129, -0.0373 };
 
 fn portBias(k: usize) f64 {

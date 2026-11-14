@@ -1,9 +1,10 @@
 //! The parameter binder: card `name=value` pairs in, a device's Model or
 //! Instance fields written out. eval.zig compiles it into every device
 //! object behind `DeviceVtable.bind_model`/`bind_instance`, so built-in and
-//! runtime-loaded devices bind a card identically. Cites ngspice's
-//! inpgval.c (integer rounding), the bjt.c, dio.c and res.c IOPR tables
-//! (alternate spellings) and LRM §9.19 `$param_given`.
+//! runtime-loaded devices bind a card identically. A model's alternate
+//! spellings (ngspice's IOPR keys) are its own .va's §3.4.7 `aliasparam`
+//! fields, so each binds on that model only. Cites ngspice's inpgval.c
+//! (integer rounding) and LRM §9.19 `$param_given`.
 //!
 //! Contents:
 //! - `pub const Param = struct`
@@ -118,9 +119,9 @@ const linear = struct {
 };
 
 /// Binds `params` onto every scalar field of `target.*`. A field takes the
-/// first pair whose key is its lowercased name; only when there is none do
-/// its alternate spellings (`aliasesOf`) apply, in table order, the last
-/// match winning. Keys matching no field are ignored. On error, fields
+/// first pair whose key is its lowercased name; only when there is none
+/// does its VA spelling apply (`aliasesOf`, a VerA escape). Keys matching
+/// no field are ignored. On error, fields
 /// bound before the failing one keep their new values. Cost: one binary
 /// search per pair, then one probe per field.
 pub fn apply(target: anytype, params: []const Param) BindStatus {
@@ -208,7 +209,7 @@ fn applyKv(target: anytype, params: []const Param) Error!void {
 
 /// The keys `apply` binds on a `T`, sorted and unique: every scalar field's
 /// lowercased name and its `aliasesOf`. A key's index is its `firstPairs`
-/// slot. Two fields may share a key (`vto` is a field and `vt0`'s alias).
+/// slot.
 fn Keys(comptime T: type) type {
     return struct {
         const table: []const []const u8 = blk: {
@@ -302,55 +303,13 @@ fn isScalar(comptime T: type) bool {
     };
 }
 
-/// Card keys accepted for a field besides its own name, in probe order:
-/// ngspice IOPR alternate spellings, then the VA name behind a VerA escape.
-///
-/// The table is shared by every device, so an alias is only safe when no
-/// model declares it as a parameter of its own. That is why dio.c's `js`
-/// for `is` is missing: the MOS models declare both `is` and `js`.
+/// The keys `field` accepts besides its own name: the VA name behind a
+/// VerA escape, or none.
 fn aliasesOf(comptime field: []const u8) []const []const u8 {
-    const pairs = [_][2][]const u8{
-        .{ "vt0", "vto" },
-        .{ "vto", "vt0" },
-        .{ "vaf", "va" },
-        .{ "VAR", "vb" },
-        .{ "ikf", "ik" },
-        .{ "cjs", "ccs" },
-        // BJT depletion-cap alternates (bjt.c IOPR).
-        .{ "vje", "pe" },
-        .{ "mje", "me" },
-        .{ "vjc", "pc" },
-        .{ "mjc", "mc" },
-        .{ "vjs", "ps" },
-        .{ "mjs", "ms" },
-        // Diode alternates (dio.c IOPR). `cjo`/`vj` exist only in diode.va
-        // and vdmos.va, `trs`/`cta`/`tpb` only in diode.va.
-        .{ "tnom", "tref" },
-        .{ "cjo", "cj0" },
-        .{ "cjo", "cj" },
-        .{ "vj", "pb" },
-        .{ "trs", "trs1" },
-        .{ "cta", "ctc" },
-        .{ "tpb", "tvj" },
-        // Resistor noise switch (res.c IOPR, HSPICE NOISE=).
-        .{ "noisy", "noise" },
-    };
     comptime {
-        var out: [pairs.len + 1][]const u8 = undefined;
-        var n: usize = 0;
-        for (pairs) |p| {
-            if (std.mem.eql(u8, field, p[0])) {
-                out[n] = p[1];
-                n += 1;
-            }
-        }
-        // The card keeps the VA spelling of a name VerA escaped.
-        if (escaped(field)) |va| {
-            out[n] = va;
-            n += 1;
-        }
-        const frozen = out;
-        return frozen[0..n];
+        const va = escaped(field) orelse return &.{};
+        const one = [_][]const u8{va};
+        return &one;
     }
 }
 
@@ -407,16 +366,19 @@ test "VerA escapes bind under the VA name; ordinary trailing Z does not" {
     try std.testing.expectEqual(M{ .u0Z = 400, .typeZ = -1, .pubZ = 2, .RZ = 0, .abZ5f_cd = 3, .Z5ain = 50 }, m);
 }
 
-test "first pair wins; an alias applies only when the field's own key is absent" {
-    const M = struct { vt0: f64 = 0, cjo: f64 = 0, cjo__given: bool = false };
+test "first pair wins; another model's spelling binds nothing" {
+    // vt0, cj and cj0 are aliasparams of mos1.va and diode.va, not of this
+    // type: before they moved there, a shared table bound them on every
+    // model with a vto or cjo field (VDMOS's cj0 and pb, which ngspice's
+    // vdmos.c calls unrecognized).
+    const M = struct { vto: f64 = 0, cjo: f64 = 0, cjo__given: bool = false };
     var m: M = .{};
     try apply(&m, &.{
-        .{ .key = "vto", .value = 9 }, .{ .key = "vt0", .value = 1 }, .{ .key = "vt0", .value = 2 },
+        .{ .key = "vt0", .value = 9 }, .{ .key = "vto", .value = 1 }, .{ .key = "vto", .value = 2 },
         .{ .key = "cj", .value = 4 },  .{ .key = "cj0", .value = 3 },
     }).unwrap();
-    // cjo: both aliases present, table order cj0 then cj, the last write stays.
-    try std.testing.expectEqual(M{ .vt0 = 1, .cjo = 4, .cjo__given = true }, m);
-    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{.{ .key = "vt0", .value = null }}));
+    try std.testing.expectEqual(M{ .vto = 1 }, m);
+    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{.{ .key = "vto", .value = null }}));
     try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{ .{ .key = "unknown", .value = null }, .{ .key = "", .value = null } }));
 }
 
@@ -453,19 +415,21 @@ test "apply: errors by status, earlier fields keep their new values" {
     try std.testing.expectEqual(BindStatus.parameter_out_of_range, apply(&m, &.{ .{ .key = "b", .value = 300 }, .{ .key = "a", .value = 1 } }));
     try std.testing.expectEqual(@as(f64, 1), m.a);
     try std.testing.expectEqual(BindStatus.non_finite_parameter, apply(&m, &.{.{ .key = "c", .value = std.math.inf(f64) }}));
-    // An unresolved alias is as fatal as an unresolved name.
-    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{.{ .key = "noise", .value = null }}));
-    try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{.{ .key = "noise", .value = 0 }}));
+    // An unresolved value is as fatal on a bool field.
+    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{.{ .key = "noisy", .value = null }}));
+    try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{.{ .key = "noisy", .value = 0 }}));
     try std.testing.expectEqual(M{ .a = 1, .noisy = false, .noisy__given = true }, m);
     try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{}));
 }
 
 test markKnown {
-    const T = struct { vto: f64 = 0, w: f64 = 0, list: [2]f64 = .{ 0, 0 } };
-    const params = [_]Param{ .{ .key = "vt0", .value = 1 }, .{ .key = "ww", .value = 1 }, .{ .key = "w", .value = 1 }, .{ .key = "list", .value = 1 } };
+    // `vt0` is mos1.va's aliasparam, not this type's; `u0` is the VA name
+    // behind the escaped `u0Z`.
+    const T = struct { vto: f64 = 0, u0Z: f64 = 0, w: f64 = 0, list: [2]f64 = .{ 0, 0 } };
+    const params = [_]Param{ .{ .key = "vt0", .value = 1 }, .{ .key = "u0", .value = 1 }, .{ .key = "ww", .value = 1 }, .{ .key = "w", .value = 1 }, .{ .key = "list", .value = 1 } };
     var known: [params.len]bool = @splat(false);
     markKnown(T, &params, &known);
-    try std.testing.expectEqual([_]bool{ true, false, true, false }, known);
+    try std.testing.expectEqual([_]bool{ false, true, false, true, false }, known);
 }
 
 test BindStatus {
@@ -486,8 +450,9 @@ test BindStatus {
 }
 
 test "apply and markKnown match the linear-scan oracle on random cards" {
-    // Shared keys (`vto` is a field and `vt0`'s alias), two aliases (`cjo`),
-    // VerA escapes, a mixed-case field, a narrow int, a non-scalar field.
+    // Other models' aliasparam spellings (`vt0`, `cj0`, `noise`) beside the
+    // fields they alias there, VerA escapes, a mixed-case field, a narrow
+    // int, a non-scalar field.
     const M = struct {
         vt0: f64 = 0,
         vto: f64 = 0,
@@ -540,23 +505,14 @@ test "the first pair for a key decides, even when it is null or non-finite" {
     try std.testing.expectEqual(M{ .b = 1, .b__given = true }, m);
 }
 
-test "aliases: probed only when the own key is absent, in table order" {
-    const M = struct { vt0: f64 = 0, vto: f64 = 0, cjo: f64 = 0 };
+test "a VA spelling is probed only when the field's own key is absent" {
+    const M = struct { u0Z: f64 = 0 };
     var m: M = .{};
-    // `vt0` is present, so its alias `vto` is never probed for `vt0`, but
-    // `vto` is the `vto` field's own key: the null still fails there.
-    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{ .{ .key = "vt0", .value = 1 }, .{ .key = "vto", .value = null } }));
-    // One key binds both the field it names and the field it aliases.
-    m = .{};
-    try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{.{ .key = "vto", .value = 5 }}));
-    try std.testing.expectEqual(M{ .vt0 = 5, .vto = 5 }, m);
-    // `cj0` probes before `cj`: its null fails though `cj` has a value.
-    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{ .{ .key = "cj", .value = 4 }, .{ .key = "cj0", .value = null } }));
-    // A null alias is harmless when the own key binds first.
-    const C = struct { cjo: f64 = 0 };
-    var c: C = .{};
-    try std.testing.expectEqual(BindStatus.ok, apply(&c, &.{ .{ .key = "cj", .value = null }, .{ .key = "cjo", .value = 7 } }));
-    try std.testing.expectEqual(C{ .cjo = 7 }, c);
+    // `u0z` binds first, so the escape's `u0` is never probed: its null is
+    // harmless. Alone, the null fails.
+    try std.testing.expectEqual(BindStatus.ok, apply(&m, &.{ .{ .key = "u0", .value = null }, .{ .key = "u0z", .value = 7 } }));
+    try std.testing.expectEqual(M{ .u0Z = 7 }, m);
+    try std.testing.expectEqual(BindStatus.unresolved_parameter, apply(&m, &.{.{ .key = "u0", .value = null }}));
 }
 
 test "absent keys leave defaults; card keys match lowercased names exactly" {

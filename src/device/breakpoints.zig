@@ -68,7 +68,7 @@ pub fn spicePwlBreak(m: anytype, t_acc: f64, tq: f64) ?f64 {
     const T = @TypeOf(m.*);
     if (m.waveform != 4 or m.pwl_len <= 0) return null;
     // Slot `k` of the flattened `pwl_times[]`, named as in
-    // frontend/builder.zig pwlSlot.
+    // frontend/Circuit.zig pwlSlot.
     @setEvalBranchQuota(200_000);
     const cap = comptime blk: {
         var c: usize = 0;

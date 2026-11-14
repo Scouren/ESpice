@@ -337,7 +337,9 @@ pub const Session = struct {
     }
 
     pub fn ready(self: *const Session, i: usize) bool {
-        if (self.rows.items(.lanes)[i] != 0 or self.effectiveStatus(i).terminal()) return false;
+        // A split query runs only as the whole rerun `assemble` built.
+        const split = self.rows.items(.lanes)[i] != 0 and self.rows.items(.executor)[i] == null;
+        if (split or self.effectiveStatus(i).terminal()) return false;
         // A result reader waits for its `.tran` to end, whatever the outcome.
         const reads = self.rows.items(.reads)[i];
         if (reads != none and !self.effectiveStatus(@backingInt(reads)).terminal()) return false;
@@ -621,8 +623,9 @@ const Row = struct {
     /// A quantum is in flight; `settle` collects it.
     running: bool = false,
     /// A query split into its lanes (`splitLanes`): its lane rows are the
-    /// `lanes` rows just before it. It never runs; `assemble` gathers its
-    /// result once every lane has ended.
+    /// `lanes` rows just before it. `assemble` gathers its result once
+    /// every lane has ended; it runs only when a `.dc`'s segments disagree
+    /// at a seam, as the sweep run whole.
     lanes: u32 = 0,
     /// On a lane row, the split query it belongs to.
     owner: QueryId = none,

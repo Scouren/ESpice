@@ -15,6 +15,7 @@
 //! - `pub const Waveform = struct`, `Waveform.init(allocator, n_probes: u32, capacity: u32) Allocator.Error!Waveform`,
 //!   `Waveform.initStream(allocator, n_probes: u32, sink: *std.Io.Writer) Allocator.Error!Waveform`,
 //!   `Waveform.stride(self) usize`, `Waveform.record(self: *Waveform, t: f64, x: []const f64, probes: []const u32) RecordError!void`,
+//!   `Waveform.recordStep(self: *Waveform, t: f64, x: []const f64, probes: []const u32, step: Step) RecordError!void`,
 //!   `Waveform.data(self) []f64`, `Waveform.time(self, i: usize) f64`, `Waveform.column(self, c: usize) Column`,
 //!   `Waveform.deinit(self: *Waveform) void`
 
@@ -27,6 +28,9 @@ pub const Method = @import("core").query.Method;
 
 /// `.tran` query options, defined in core/query.zig.
 pub const Options = @import("core").query.Tran;
+
+/// The step that reached a recorded row (core/result.zig).
+pub const Step = @import("core").Step;
 
 /// A borrowed series inside a row-major table: element i is
 /// `base[i * stride]`. Readers walk a waveform column in place instead of
@@ -90,6 +94,9 @@ pub const Waveform = struct {
     /// being built is kept: `data()` is empty and `column`/`time` are
     /// invalid, while `len` still counts the rows written.
     sink: ?*std.Io.Writer = null,
+    /// Set (`.empty`) to keep each row's step, one per row, which only
+    /// `recordStep` appends (`Result.steps`).
+    steps: ?std.ArrayList(Step) = null,
 
     /// Every way `record` fails. On any error the waveform is as it was
     /// except that a streamed row may be partly written to the sink.
@@ -138,6 +145,15 @@ pub const Waveform = struct {
         assert(self.len == len_before + 1);
     }
 
+    /// `record`, and `step`, what reached the point, into `steps` when the
+    /// waveform keeps them. On error neither is appended.
+    pub fn recordStep(self: *Waveform, t: f64, x: []const f64, probes: []const u32, step: Step) RecordError!void {
+        if (self.steps) |*s| try s.ensureUnusedCapacity(self.allocator, 1);
+        try self.record(t, x, probes);
+        if (self.steps) |*s| s.appendAssumeCapacity(step);
+        if (self.steps) |s| assert(s.items.len == self.len);
+    }
+
     /// Returns the recorded rows, borrowed: valid until the next `record`
     /// or `deinit`. A transient `Result.data` is exactly this slice.
     pub fn data(self: Waveform) []f64 {
@@ -164,6 +180,7 @@ pub const Waveform = struct {
     /// Frees the rows; every borrowed `data` or `column` slice dies with them.
     pub fn deinit(self: *Waveform) void {
         self.allocator.free(self.rows);
+        if (self.steps) |*s| s.deinit(self.allocator);
         self.* = undefined;
     }
 

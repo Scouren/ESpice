@@ -15,7 +15,14 @@
 //! reads. The dense tail, where one row per level would leave every lane
 //! but one idle, runs as panels of `panel` rows, one block each by ticket:
 //! a panel's rows gather each earlier panel's columns once it publishes,
-//! then sweep their own diagonal block from shared memory.
+//! then sweep their own diagonal block from shared memory (`lu_tail.zig`).
+//! Two exact levers change the schedule, never a slot's operations or
+//! their order: `lever_g2` (G2 part 1, M3) publishes a column before its
+//! growth test and loads each stored-order step's first flops before the
+//! previous step's barrier; `lever_g7` (G7 stage 1, M2) is `lu_tail.zig`'s;
+//! `lever_runs` (G2 part 2 stage A) takes a supernode run of a column's U
+//! list as one step (`lu_steps.zig`); `lever_tile` (N1, host lanes only)
+//! stops the tickets at `Tab.tile0` and leaves the tail to `lu_tile.zig`.
 //! std only: the kernel root compiles this file for NVPTX and AMDGCN.
 //!
 //! Contents:
@@ -28,9 +35,15 @@
 //! - `pub const tail_max = 5120`
 //! - `pub const narrow_discard: u16 = 0xFFFF`
 //! - `pub const sync_header = 16`
+//! - `pub const lever_g2: u32 = 1`
+//! - `pub const lever_g7: u32 = 2`
+//! - `pub const lever_runs: u32 = 4`
+//! - `pub const lever_tile: u32 = 8`
 //! - `pub const Tab = extern struct`
 //!   - `pub fn syncLen(t: Tab) u32`
 //!   - `pub fn panels(t: Tab) u32`
+//!   - `pub fn tileSync(t: Tab) u32`
+//!   - `pub fn tileWords(t: Tab) u32`
 //! - `pub const HostBufs = lu_host.HostBufs`
 //! - `pub const runHost = lu_host.runHost`
 //! - `pub const HostRefactor = lu_host.HostRefactor`
@@ -41,17 +54,19 @@
 //! - `pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type`
 //!     - `pub const Shared = struct`
 //!     - `pub const SolveShared = struct`
-//!     - `pub const PanelShared = struct`
+//!     - `pub const PanelShared = Tl.PanelShared`
 //!     - `pub fn refactor(comptime D: type, t: Tab, x: P(u32), val: P(f64), a: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool`
 //!     - `pub fn lhead(t: Tab, x: P(u32), val: P(f64), rhs: P(f64), y: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool`
 //!     - `pub fn uhead(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool`
-//!     - `pub fn lpanel(t: Tab, x: P(u32), val: P(f64), y: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool`
-//!     - `pub fn upanel(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool`
+//!     - `pub const lpanel = Tl.lpanel`
+//!     - `pub const upanel = Tl.upanel`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const lu_host = @import("lu_host.zig");
 const lu_tables = @import("lu_tables.zig");
+const lu_tail = @import("lu_tail.zig");
+const lu_steps = @import("lu_steps.zig");
 // `Tab.flags` bits, the encoding `LaneTab.flags` uses.
 /// `Tab.flags` bit of a fabricated (void) pivot, `LaneTab`'s encoding.
 pub const void_bit = @import("lane.zig").void_bit;
@@ -93,12 +108,32 @@ pub const narrow_discard: u16 = 0xFFFF;
 /// `std.atomic.cache_line`: host and device must agree on it.
 pub const sync_header = 16;
 
+/// `Tab.levers` bit of G2 part 1 (`Options.g2`): the refactor publishes a
+/// column before its growth test and issues each stored-order step's first
+/// group of loads before the previous step's barrier.
+pub const lever_g2: u32 = 1;
+
+/// `Tab.levers` bit of G7 stage 1 (`Options.g7`): the tail panels load
+/// their block before the waits and sweep it by in-panel level.
+pub const lever_g7: u32 = 2;
+
+/// `Tab.levers` bit of G2 part 2 stage A (`Options.runs`): a column takes
+/// each supernode run of its U list (C1's `lu_runs` tables) as one step.
+/// Set only when the tables hold runs.
+pub const lever_runs: u32 = 4;
+
+/// `Tab.levers` bit of N1 (`Options.tile`): steps from `Tab.tile0` on run
+/// as `lu_tile.zig`'s tiles on host lanes, after the tickets. Never set
+/// for the device.
+pub const lever_tile: u32 = 8;
+
 /// Offsets (in u32 words) of every table inside the one index buffer, plus
 /// the scalars the kernels read. Passed to each kernel by value.
 ///
 /// Values live column-contiguous in `val`: column k is `[U_k, d_k, L_k]`
-/// at `coff[k]`, and the last slot (`discard`) absorbs the flops of a void
-/// column's rows below its pivot.
+/// at `coff[k]`, and the slot after them (`discard`) absorbs the flops of a
+/// void column's rows below its pivot. Under `lever_runs` the supernode
+/// panels follow it (`lpv`).
 pub const Tab = extern struct {
     n: u32,
     discard: u32,
@@ -161,7 +196,7 @@ pub const Tab = extern struct {
     u_ptr: u32,
     u_col: u32,
     u_slot: u32,
-    /// Length of `val`, `discard` included.
+    /// Length of `val`, `discard` (and the `lever_runs` panels) included.
     n_val: u32,
     /// Length of the index buffer.
     n_idx: u32,
@@ -179,12 +214,56 @@ pub const Tab = extern struct {
     /// `narrow_discard` for the discard slot (`refactor(u16, ...)`); zero:
     /// u32 absolute slots.
     dmap16: u32,
+    /// `lever_g2` and `lever_g7` bits, from `Options`; zero is today's path.
+    levers: u32,
+    /// `lever_g7` tables, empty without it; tail-relative row i (panel
+    /// i / panel): `tl_in[i]`/`tu_in[i]` index its first in-panel entry in
+    /// `tl_*`/`tu_*`, `tl_lv[i]`/`tu_lv[i]` its forward/back in-panel
+    /// level (0 for no in-panel entry, else one past its entries' deepest),
+    /// and `t_nlv[p]`/`t_nlv[np + p]` panel p's forward/back level count.
+    tl_in: u32,
+    tu_in: u32,
+    tl_lv: u32,
+    tu_lv: u32,
+    t_nlv: u32,
+    /// `lever_runs` tables, empty without it: column k's runs are
+    /// `rcol[k]..rcol[k+1]`, run r's six words at `rinfo[6 r..]` (U
+    /// position, length, `val` index of its first step's panel column,
+    /// panel rows, first step minus panel first, `rmap` offset); `rmap`
+    /// the destination slot of each rectangular row; `lpv[q]` the `val`
+    /// slot of L entry q in its panel, or all ones off panels. Columns with
+    /// runs keep `dmap` entries only for U entries outside them.
+    rcol: u32,
+    rinfo: u32,
+    rmap: u32,
+    lpv: u32,
+    /// `lever_tile`: the refactor's tickets end at `tile0` (n without the
+    /// lever); the tail's `tile_np` panels, `tile_tickets` tile tickets
+    /// and tables `tseg`, `tdm`, `tpan` (`lu_tile.Tables`).
+    tile0: u32,
+    tile_np: u32,
+    tile_tickets: u32,
+    tseg: u32,
+    tdm: u32,
+    tpan: u32,
 
     /// u32 words in the sync buffer: header plus three done stamps per
     /// pivot step (refactor, forward row, back row), then one per tail
-    /// panel and direction. Zero it once per table upload.
+    /// panel and direction, then `tileWords`. Zero it once per table
+    /// upload.
     pub fn syncLen(t: Tab) u32 {
+        return tileSync(t) + tileWords(t);
+    }
+
+    /// First sync word of `lever_tile`'s per-run words: a stage per tail
+    /// column, then a done word per panel.
+    pub fn tileSync(t: Tab) u32 {
         return sync_header + 3 * t.n + 2 * panels(t);
+    }
+
+    /// `lever_tile`'s sync words, zeroed before each run; 0 without it.
+    pub fn tileWords(t: Tab) u32 {
+        return t.n - t.tile0 + t.tile_np;
     }
 
     /// Panel blocks of each tail solve.
@@ -227,7 +306,7 @@ comptime {
 
 comptime {
     // Passed to every kernel by value: the layout is the device ABI.
-    assert(@sizeOf(Tab) == 208);
+    assert(@sizeOf(Tab) == 272);
 }
 
 /// The kernel bodies over the pointer type `Sy.P` (a global pointer on the
@@ -239,6 +318,8 @@ comptime {
 pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
     return struct {
         const P = Sy.P;
+        const Tl = lu_tail.Tail(Sy);
+        const St = lu_steps.Steps(Sy);
 
         /// Refactor block scratch: the ticket, the poll windows' first
         /// unfinished step (two, alternating), the column max per lane, and
@@ -249,9 +330,14 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
         /// Head block scratch: the ticket.
         pub const SolveShared = struct { k: u32 };
 
-        /// Panel block scratch: the ticket, each row's running value and
-        /// its next entry.
-        pub const PanelShared = struct { k: u32, a: [panel]f64, e: [panel]u32, mask: [panel]u64, d: [panel]f64, blk: [panel][panel]f64 };
+        /// Panel block scratch; see `lu_tail.Tail.PanelShared`.
+        pub const PanelShared = Tl.PanelShared;
+
+        /// The forward tail panel; see `lu_tail.Tail.lpanel`.
+        pub const lpanel = Tl.lpanel;
+
+        /// The back tail panel; see `lu_tail.Tail.upanel`.
+        pub const upanel = Tl.upanel;
 
         /// Refactors the pivot step its ticket names: zero its slots, scatter
         /// A's column, replay the flops, test and scale the pivot, publish.
@@ -260,14 +346,17 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
         /// it and a device block calls it once.
         pub fn refactor(comptime D: type, t: Tab, x: P(u32), val: P(f64), a: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
             comptime assert(D == u16 or D == u32);
-            const k = takeTicket(sy, 0, sh, tid);
-            if (k >= t.n) return false;
+            const k = Tl.takeTicket(sy, 0, sh, tid);
+            // `lever_tile`: the tail is `lu_tile.zig`'s (tile0 == n without).
+            if (k >= t.tile0) return false;
             const width = x[t.coff + k + 1] - x[t.coff + k];
             const bad = if (width <= cap)
                 column(D, true, &sh.w, t, x, val, a, sy, stamp, sh, tid, nt, k)
             else
                 column(D, false, val, t, x, val, a, sy, stamp, sh, tid, nt, k);
             if (bad) _ = @atomicRmw(u32, &sy[1], .Max, t.n - k, .monotonic);
+            // `lever_g2`: `column` published the step before its growth test.
+            if (t.levers & lever_g2 != 0) return true;
             Sy.barrier();
             if (tid == 0) Sy.release(&(sy + sync_header)[k], stamp);
             return true;
@@ -278,7 +367,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
         /// then its own stamp. Returns false once the tickets run out, so
         /// a host thread loops on it and a device block calls it once.
         pub fn lhead(t: Tab, x: P(u32), val: P(f64), rhs: P(f64), y: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
-            const c = takeTicket(sy, 2, sh, tid);
+            const c = Tl.takeTicket(sy, 2, sh, tid);
             if (c >= t.l_chunks) return false;
             if (sy[1] != 0) return true;
             const done = sy + sync_header + t.n;
@@ -288,7 +377,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 const e0 = x[t.l_ptr + r];
                 const e1 = x[t.l_ptr + r + 1];
                 var e = e0;
-                while (e < e1) : (e += 1) wait(&done[x[t.l_col + e]], stamp);
+                while (e < e1) : (e += 1) Tl.wait(&done[x[t.l_col + e]], stamp);
                 y[r] = gather(-rhs[x[t.perm_in + r]], x, val, y, t.l_col, t.l_slot, e0, e1);
                 Sy.release(&done[r], stamp);
             }
@@ -301,7 +390,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
         /// in the host's descending k. Sets dx[q[i]] = z[i]; y ends holding
         /// z.
         pub fn uhead(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
-            const c = takeTicket(sy, 3, sh, tid);
+            const c = Tl.takeTicket(sy, 3, sh, tid);
             if (c >= t.u_chunks) return false;
             if (sy[1] != 0) return true;
             const done = sy + sync_header + 2 * t.n;
@@ -313,7 +402,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 var e = e0;
                 while (e < e1) : (e += 1) {
                     const k = x[t.u_col + e];
-                    if (k < t.t0) wait(&done[k], stamp);
+                    if (k < t.t0) Tl.wait(&done[k], stamp);
                 }
                 const acc = gather(y[i], x, val, y, t.u_col, t.u_slot, e0, e1);
                 const z = acc / val[x[t.coff + i] + x[t.up + i + 1] - x[t.up + i]];
@@ -324,153 +413,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             return true;
         }
 
-        /// The forward tail for the panel its ticket names: its rows take
-        /// every earlier panel's columns as each publishes (a row's
-        /// subtractions stay in ascending column order), then sweep their
-        /// own panel's columns from a dense copy in shared memory, and
-        /// publish. The rows leave `y` holding L^-1 for the tail. `sh` is a
-        /// `*PanelShared`. Returns false once the tickets run out.
-        pub fn lpanel(t: Tab, x: P(u32), val: P(f64), y: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
-            const b = takeTicket(sy, 4, sh, tid);
-            const np = t.panels();
-            if (b >= np) return false;
-            if (sy[1] != 0) return true;
-            const done = sy + sync_header + 3 * t.n;
-            const r0 = b * panel;
-            const r1 = @min(r0 + panel, t.n - t.t0);
-            var i = r0 + tid;
-            while (i < r1) : (i += nt) {
-                sh.a[i - r0] = y[t.t0 + i];
-                sh.e[i - r0] = x[t.tl_ptr + i];
-            }
-            var j: u32 = 0;
-            while (j < b) : (j += 1) {
-                if (tid == 0) wait(&done[j], stamp);
-                Sy.barrier();
-                i = r0 + tid;
-                while (i < r1) : (i += nt) {
-                    const ga = gatherUntil(true, sh.a[i - r0], x, val, y + t.t0, t.tl_col, t.tl_slot, sh.e[i - r0], x[t.tl_ptr + i + 1], (j + 1) * panel);
-                    sh.a[i - r0] = ga.acc;
-                    sh.e[i - r0] = ga.e;
-                }
-            }
-            loadBlock(x, val, t.tl_ptr, t.tl_col, t.tl_slot, r0, r1, sh, tid, nt);
-            var c = r0;
-            while (c < r1) : (c += 1) {
-                // Row c holds every subtraction from columns before it.
-                Sy.barrier();
-                const yc = sh.a[c - r0];
-                if (yc == 0) continue;
-                const bit = @as(u64, 1) << @intCast(c - r0);
-                i = r0 + tid;
-                while (i < r1) : (i += nt) {
-                    if (sh.mask[i - r0] & bit != 0) sh.a[i - r0] -= sh.blk[i - r0][c - r0] * yc;
-                }
-            }
-            Sy.barrier();
-            i = r0 + tid;
-            while (i < r1) : (i += nt) y[t.t0 + i] = sh.a[i - r0];
-            Sy.barrier();
-            if (tid == 0) Sy.release(&done[b], stamp);
-            return true;
-        }
-
-        /// The back tail for the panel its ticket names, last panel first:
-        /// its rows take every later panel's columns as each publishes
-        /// (descending), then sweep their own panel from its last row, each
-        /// row dividing by its pivot when its turn comes, and publish z into
-        /// `y` and `dx`.
-        pub fn upanel(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
-            const b = takeTicket(sy, 5, sh, tid);
-            const np = t.panels();
-            if (b >= np) return false;
-            if (sy[1] != 0) return true;
-            const done = sy + sync_header + 3 * t.n + np;
-            const pb = np - 1 - b;
-            const r0 = pb * panel;
-            const r1 = @min(r0 + panel, t.n - t.t0);
-            var i = r0 + tid;
-            while (i < r1) : (i += nt) {
-                sh.a[i - r0] = y[t.t0 + i];
-                sh.e[i - r0] = x[t.tu_ptr + i];
-            }
-            var j = np - 1;
-            while (j > pb) : (j -= 1) {
-                if (tid == 0) wait(&done[j], stamp);
-                Sy.barrier();
-                i = r0 + tid;
-                while (i < r1) : (i += nt) {
-                    const ga = gatherUntil(false, sh.a[i - r0], x, val, y + t.t0, t.tu_col, t.tu_slot, sh.e[i - r0], x[t.tu_ptr + i + 1], j * panel);
-                    sh.a[i - r0] = ga.acc;
-                    sh.e[i - r0] = ga.e;
-                }
-            }
-            loadBlock(x, val, t.tu_ptr, t.tu_col, t.tu_slot, r0, r1, sh, tid, nt);
-            // The panel's pivots, staged with the block.
-            i = r0 + tid;
-            while (i < r1) : (i += nt) sh.d[i - r0] = val[x[t.t_diag + i]];
-            var c = r1;
-            while (c > r0) {
-                c -= 1;
-                Sy.barrier();
-                if (tid == (c - r0) % nt) {
-                    const z = sh.a[c - r0] / sh.d[c - r0];
-                    sh.a[c - r0] = z;
-                    y[t.t0 + c] = z;
-                    dx[x[t.q + t.t0 + c]] = z;
-                }
-                Sy.barrier();
-                const zc = sh.a[c - r0];
-                if (zc == 0) continue;
-                const bit = @as(u64, 1) << @intCast(c - r0);
-                i = r0 + tid;
-                while (i < c) : (i += nt) {
-                    if (sh.mask[i - r0] & bit != 0) sh.a[i - r0] -= sh.blk[i - r0][c - r0] * zc;
-                }
-            }
-            Sy.barrier();
-            if (tid == 0) Sy.release(&done[pb], stamp);
-            return true;
-        }
-
         // ---- private ----
-
-        inline fn wait(p: anytype, stamp: u32) void {
-            // Ends: the awaited column belongs to an earlier ticket, and a
-            // step waits only on earlier ones, so the earliest unfinished
-            // step never waits and always publishes.
-            var spins: u32 = 0;
-            while (Sy.acquire(p) != stamp) : (spins +%= 1) Sy.pause(spins);
-        }
-
-        inline fn takeTicket(sy: P(u32), which: u32, sh: anytype, tid: u32) u32 {
-            if (tid == 0) sh.k = @atomicRmw(u32, &sy[which], .Add, 1, .monotonic);
-            Sy.barrier();
-            return sh.k;
-        }
-
-        /// Lane 0 waits for step p0's source; lane t > 0 checks step
-        /// p0 + t's once and records the first unfinished one in
-        /// `sh.first[par]`. After the caller's barrier, every source that
-        /// read done is visible to the whole block.
-        inline fn pollWindow(t: Tab, x: P(u32), done: P(u32), stamp: u32, sh: anytype, par: u1, p0: u32, up1: u32, tid: u32) void {
-            const p = p0 + tid;
-            if (p >= up1) return;
-            const src = &done[x[t.ui + p]];
-            if (tid == 0) {
-                wait(src, stamp);
-            } else if (Sy.acquire(src) != stamp) {
-                _ = @atomicRmw(u32, &sh.first[par], .Min, p, .monotonic);
-            }
-        }
-
-        /// Flop i's destination: an absolute value slot or `t.discard`.
-        inline fn slotAt(comptime D: type, x: P(u32), t: Tab, i: u32, base: u32) u32 {
-            if (D == u32) return x[t.dmap + i];
-            // A narrow dmap starts the index buffer (`t.dmap` is 0).
-            const rel = @as(P(u16), @ptrCast(x))[i];
-            return if (rel == narrow_discard) t.discard else base + rel;
-        }
 
         /// Column k's replay on `w`: the block's scratch (`local`, indexed
         /// from the column's first slot, discard slot last) or `val` itself.
@@ -484,7 +427,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             // this column (or the discard slot) into w.
             const o: u32 = if (local) 0 else base;
             const S = struct {
-                inline fn at(dst: u32, b: u32, wd: u32) u32 {
+                pub inline fn at(dst: u32, b: u32, wd: u32) u32 {
                     return if (local) @min(dst -% b, wd) else dst;
                 }
             };
@@ -501,14 +444,20 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             const up1 = x[t.up + k + 1];
             const w0 = x[t.wlev + k];
             const w1 = x[t.wlev + k + 1];
-            if (w0 == w1) {
+            const early = t.levers & lever_g2 != 0;
+            const runs = t.levers & lever_runs != 0;
+            if (w0 == w1 and runs and x[t.rcol + k] < x[t.rcol + k + 1]) {
+                St.storedRuns(D, S, w, o, t, x, val, done, stamp, sh, tid, nt, k, base, width);
+            } else if (w0 == w1 and early) {
+                St.storedEarly(D, S, w, o, t, x, val, done, stamp, sh, tid, nt, k, base, width);
+            } else if (w0 == w1) {
                 // Stored U order; the L rows of one U entry are distinct. A
                 // step's end barrier doubles as the next one's wait barrier.
                 // Sources are polled a window at a time, one lane per step:
                 // steps before `ready` need no poll of their own.
                 var ready = up0;
                 var par: u1 = 0;
-                if (up0 < up1) pollWindow(t, x, done, stamp, sh, par, up0, up1, tid);
+                if (up0 < up1) St.pollWindow(t, x, done, stamp, sh, par, up0, up1, tid);
                 Sy.barrier();
                 if (up0 < up1) {
                     ready = @max(@min(sh.first[par], up0 + nt), up0 + 1);
@@ -532,19 +481,19 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                         var lv: [U]f64 = undefined;
                         var wv: [U]f64 = undefined;
                         inline for (0..U) |m| {
-                            dst[m] = S.at(slotAt(D, x, t, d + j + @as(u32, m) * nt, base), base, width);
+                            dst[m] = S.at(St.slotAt(D, x, t, d + j + @as(u32, m) * nt, base), base, width);
                             lv[m] = val[l0 + j + m * nt];
                         }
                         inline for (0..U) |m| wv[m] = w[dst[m]];
                         inline for (0..U) |m| w[dst[m]] = wv[m] - lv[m] * u;
                     }
                     while (j < len) : (j += nt) {
-                        const dst = S.at(slotAt(D, x, t, d + j, base), base, width);
+                        const dst = S.at(St.slotAt(D, x, t, d + j, base), base, width);
                         w[dst] -= val[l0 + j] * u;
                     }
                     d += len;
                     const poll = more and p + 1 >= ready;
-                    if (poll) pollWindow(t, x, done, stamp, sh, par, p + 1, up1, tid);
+                    if (poll) St.pollWindow(t, x, done, stamp, sh, par, p + 1, up1, tid);
                     Sy.barrier();
                     if (poll) {
                         ready = @max(@min(sh.first[par], p + 1 + nt), p + 2);
@@ -559,7 +508,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 // Gather form: wait for every source once, then per level
                 // each item runs its slot's contributions in stored order.
                 var p = up0 + tid;
-                while (p < up1) : (p += nt) wait(&done[x[t.ui + p]], stamp);
+                while (p < up1) : (p += nt) Tl.wait(&done[x[t.ui + p]], stamp);
                 Sy.barrier();
                 var lev = w0;
                 while (lev < w1) : (lev += 1) {
@@ -592,6 +541,10 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             const end = o + width;
             const flags = x[t.flags + k];
             var bad = false;
+            // `lever_g2` runs the growth tree after the release, on these.
+            var grow = false;
+            var cm: f64 = 0;
+            var piv: f64 = 0;
             if (flags & void_bit != 0) {
                 if (tid == 0) w[diag] = 1;
                 var l = diag + 1 + tid;
@@ -604,7 +557,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                     // cmax is a max: exact in any order. It drops a NaN
                     // the host's bit-pattern max keeps; the slot scan below
                     // fails that step instead.
-                    var cm: f64 = @abs(dv);
+                    cm = @abs(dv);
                     var l = diag + 1 + tid;
                     // IEEE `/`. A Markstein division (one reciprocal, five
                     // FMAs a slot, same bits) measured 5-7% slower on the
@@ -617,16 +570,11 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                         w[l] = v / dv;
                     }
                     if (t.growth > 0 and flags & scaled_bit == 0) {
-                        // A tree over the lanes (nt is a power of two); only
-                        // lane 0 reads the verdict.
-                        sh.red[tid] = cm;
-                        Sy.barrier();
-                        var h = nt / 2;
-                        while (h > 0) : (h /= 2) {
-                            if (tid < h) sh.red[tid] = @max(sh.red[tid], sh.red[tid + h]);
-                            Sy.barrier();
-                        }
-                        bad = @abs(dv) < t.growth * sh.red[0];
+                        // Uniform over the block: dv and the flags are.
+                        if (early) {
+                            grow = true;
+                            piv = dv;
+                        } else bad = growthFails(sh, cm, dv, t.growth, tid, nt);
                     }
                 }
             }
@@ -641,57 +589,30 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 nonfinite |= @intFromBool(!std.math.isFinite(v));
                 if (local) val[base + s] = v;
             }
+            // The panels the runs read, before the column is published.
+            if (runs) St.copyPanel(t, x, val, w, o, k, up1 - up0, width, tid, nt);
+            if (early) {
+                // Every lane's slots are out: waiters need the values, not
+                // the verdict (the fail word is read after the launch).
+                Sy.barrier();
+                if (tid == 0) Sy.release(&done[k], stamp);
+                if (grow) bad = growthFails(sh, cm, piv, t.growth, tid, nt);
+            }
             return bad or nonfinite != 0;
         }
 
-        /// Each row's remaining entries (all inside rows r0..r1's panel)
-        /// into `sh.blk`, flagged in `sh.mask`; the barrier after it is the
-        /// caller's first step.
-        inline fn loadBlock(x: P(u32), val: P(f64), ptr: u32, col: u32, slot: u32, r0: u32, r1: u32, sh: anytype, tid: u32, nt: u32) void {
-            var i = r0 + tid;
-            while (i < r1) : (i += nt) {
-                var m: u64 = 0;
-                var e = sh.e[i - r0];
-                const e1 = x[ptr + i + 1];
-                while (e < e1) : (e += 1) {
-                    const c = x[col + e] - r0;
-                    sh.blk[i - r0][c] = val[x[slot + e]];
-                    m |= @as(u64, 1) << @intCast(c);
-                }
-                sh.mask[i - r0] = m;
+        /// The growth test: whether |dv| < growth * (the column max over the
+        /// lanes' `cm`), as a tree (nt a power of two) whose barriers every
+        /// lane reaches. A max: exact in any order.
+        inline fn growthFails(sh: anytype, cm: f64, dv: f64, growth: f64, tid: u32, nt: u32) bool {
+            sh.red[tid] = cm;
+            Sy.barrier();
+            var h = nt / 2;
+            while (h > 0) : (h /= 2) {
+                if (tid < h) sh.red[tid] = @max(sh.red[tid], sh.red[tid + h]);
+                Sy.barrier();
             }
-        }
-
-        const Ga = struct { acc: f64, e: u32 };
-
-        /// `acc` minus val[slot[e]] * yt[col[e]] from entry e on while the
-        /// column is on the near side of `bound`: col[e] < bound with the
-        /// columns ascending (`below`), col[e] >= bound with them
-        /// descending. Skips yt == 0; eight entries' loads go out before
-        /// their subtractions.
-        inline fn gatherUntil(comptime below: bool, acc0: f64, x: P(u32), val: P(f64), yt: P(f64), col: u32, slot: u32, e0: u32, e1: u32, bound: u32) Ga {
-            const S = struct {
-                inline fn in(c: u32, b: u32) bool {
-                    return if (below) c < b else c >= b;
-                }
-            };
-            const U = 8;
-            var acc = acc0;
-            var e = e0;
-            while (e + U <= e1 and S.in(x[col + e + U - 1], bound)) : (e += U) {
-                var yv: [U]f64 = undefined;
-                var lv: [U]f64 = undefined;
-                inline for (0..U) |u| {
-                    yv[u] = yt[x[col + e + u]];
-                    lv[u] = val[x[slot + e + u]];
-                }
-                inline for (0..U) |u| acc = if (yv[u] != 0) acc - lv[u] * yv[u] else acc;
-            }
-            while (e < e1 and S.in(x[col + e], bound)) : (e += 1) {
-                const yk = yt[x[col + e]];
-                if (yk != 0) acc -= val[x[slot + e]] * yk;
-            }
-            return .{ .acc = acc, .e = e };
+            return @abs(dv) < growth * sh.red[0];
         }
 
         /// acc minus val[slot[e]] * y[col[e]] for e in e0..e1 in order,

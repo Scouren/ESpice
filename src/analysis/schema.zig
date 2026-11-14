@@ -39,13 +39,19 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
         .pxf => |o| 1 + (1 + 2 * @as(usize, o.n_harmonics)) * topology.n,
         .hbxf => |o| 1 + try hbSidebands(allocator, o) * topology.n,
         .hblin => |o| 1 + o.ports.len * o.ports.len + @intFromBool(o.noise and o.ports.len >= 2),
-        .sp => |o| @import("ac/sp.zig").columns(@import("ac/sp.zig").modeCount(o.ports), o.lin),
-        // The parameters `.sens` lists, which isSensParam narrows (#154).
-        .sens => try countParams(allocator, topology, @import("sweep/sens.zig").isSensParam),
+        .sp => |o| @import("ac/sp.zig").columns(@import("ac/sp.zig").modeCount(o.ports), deck.probes.len, o),
+        // The parameters `.sens` lists, which isSensParam narrows (#154); the
+        // AC form adds the frequency and two columns per AC source.
+        .sens => |o| try countParams(allocator, topology, o.card_names, @import("sweep/sens.zig").isSensParam) +
+            (if (o.ac == null) 0 else 1 + 2 * o.ac_sources.len),
         .dcmatch, .dcsens, .acmatch => blk: {
             const groups = switch (query) {
                 inline .dcmatch, .dcsens, .acmatch => |o| o.variations.starts.len -| 1,
                 else => 0,
+            };
+            const names = switch (query) {
+                inline .dcmatch, .dcsens, .acmatch => |o| o.card_names,
+                else => unreachable, // else: this prong admits only the three
             };
             const extra: usize = switch (query) {
                 .dcmatch => 1,
@@ -53,7 +59,7 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
                 else => 0,
             };
             if (groups != 0) break :blk groups + extra;
-            break :blk try countParams(allocator, topology, null) + extra;
+            break :blk try countParams(allocator, topology, names, null) + extra;
         },
         else => deck.probes.len + 1,
     };
@@ -83,21 +89,25 @@ fn hbSidebands(allocator: std.mem.Allocator, o: requests.HbLptv) !usize {
 }
 
 /// How many of `topology`'s device parameters `keep(type_name, param_name)`
-/// admits, all of them for null. A batch with a `param_layout` is counted
-/// from it, which leaves the template's Model rows shared.
-fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, comptime keep: ?fn ([]const u8, []const u8) bool) !usize {
+/// admits, all of them for null, leaving out an internal add's
+/// (`names.internal`), which no analysis lists. A batch with a
+/// `param_layout` is counted from it, which leaves the template's Model rows
+/// shared.
+fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, names: requests.CardNames, comptime keep: ?fn ([]const u8, []const u8) bool) !usize {
     var refs: std.ArrayList(ParamRef) = .empty;
     defer refs.deinit(allocator);
     var n: usize = 0;
-    for (topology.batches) |b| {
+    for (topology.batches, topology.batch_types) |b, t| {
         if (b.hooks.param_layout) |layout| {
             const l = try layout(b.ctx).unwrap();
-            for (l.fields) |f| n += l.count * @intFromBool(if (keep) |k| k(b.type_name, f.name) else true);
+            var listed: usize = 0;
+            for (0..l.count) |id| listed += @intFromBool(!names.internal(t, @intCast(id)));
+            for (l.fields) |f| n += listed * @intFromBool(if (keep) |k| k(b.type_name, f.name) else true);
             continue;
         }
         refs.clearRetainingCapacity();
         try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
-        for (refs.items) |r| n += @intFromBool(if (keep) |k| k(b.type_name, r.param_name) else true);
+        for (refs.items) |r| n += @intFromBool(!names.internal(t, r.index) and if (keep) |k| k(b.type_name, r.param_name) else true);
     }
     return n;
 }

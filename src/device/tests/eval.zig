@@ -1454,6 +1454,79 @@ test "GPU inventory: every built-in model evaluates on the GPU" {
     }
 }
 
+test "GPU census: built-in models the lanes or the HB samples turn down, by name" {
+    // Oracle: two name lists read off VerA's generated declarations
+    // (`State`, `state_class`, `limit`, `updateState`, `stateCtl`,
+    // `status_sites`, `delays`, Instance `__held__`/`__analog_op__absdelay__`
+    // fields) by a separate scan of the generated model sources on
+    // 2026-11-11, not by these predicates. The predicates mirror the hooks
+    // `batch.zig` sets and the refusals that read them:
+    // - lanes (`gpu_drive.gpuLaneRefusal`, `lanes.staticRefusal`): host-
+    //   stepped (state hooks, no state kernel), `commit_state`,
+    //   `predict_first_iterate`, Newton history, a load check;
+    // - HB samples (`lanes_samples.Samples.init`, UnsupportedSampleState):
+    //   any state hook, `status`, a delay, or any of the above.
+    // kinduc's lane refusal is by type name, not a trait: not listed here.
+    // kinduc left the samples list when `ddt(-m*V(br2))` made its coupling a plain charge, with no path-latch state (oracle: hb/kinduc_pair.sp).
+    // A model that gains or loses one fails here with its list printed.
+    const t = impl.test_access.traits;
+    const models = @import("models");
+    @setEvalBranchQuota(20_000_000);
+    const got = comptime blk: {
+        var lane: []const u8 = "";
+        var sample: []const u8 = "";
+        for (@typeInfo(models).@"struct".decl_names) |name| {
+            const D = @field(models, name);
+            if (!@hasDecl(D, "eval")) continue;
+            const timer = t.skipsTimerState(D);
+            const delay = t.hasAbsdelayState(D);
+            const update = @hasDecl(D, "updateState") and !delay and !timer;
+            const ctl = @hasDecl(D, "stateCtl") and !timer;
+            const commit = @hasDecl(D, "updateState") and delay;
+            const newton = @hasDecl(D, "advanceIteration") or @hasDecl(D, "checkConvergence");
+            const hooks = commit or newton or t.predictsOverDeltaOld2(D) or t.load_check.get(t.baseName(D)) != null;
+            if (hooks or (!t.hasStateKernel(D) and (update or ctl))) lane = lane ++ " " ++ name;
+            if (hooks or update or ctl or @hasDecl(D, "status_sites") or @hasDecl(D, "delays")) sample = sample ++ " " ++ name;
+        }
+        break :blk .{ lane, sample };
+    };
+    const want_lane =
+        \\coupled_tlines cswitch hfet1 lossy_tline ltra mosvar r3_cmc sparam_1
+        \\sparam_2 sparam_3 sparam_4 tline vccs_delay vccs_laplace vccs_pole
+        \\vcvs_delay vcvs_laplace vcvs_pole vswitch wline_1 wline_2 wline_3
+        \\wline_4
+    ;
+    const want_sample =
+        \\asmesd asmesd_dio asmhemt b3soidd b3soifd bsim1 bsim4va bsimbulk bsimcmg
+        \\bsimimg bsimsoi_va coupled_ltra coupled_ltra3 coupled_ltra4
+        \\coupled_tlines cswitch gummel_poon hfet1 hfet2 hicumL2_va hisim2_va
+        \\hisimhv_va hisimsoi hisimsotb jfet2 l_utsoi lossy_tline ltra mes
+        \\mesa mextram mextram_t mos1 mos2 mos3 mos6 mos9 mosvar mvsg psp104
+        \\psp104_nqs psp104t r3_cmc sparam_1 sparam_2 sparam_3 sparam_4 tline txl
+        \\vbic13_4t vccs_delay vccs_laplace vccs_pole vcvs_delay vcvs_laplace
+        \\vcvs_pole vdmos vswitch wline_1 wline_2 wline_3 wline_4
+    ;
+    const Names = struct {
+        // Name by name: `want` wraps at newlines, `got` is space-separated.
+        fn same(want: []const u8, have: []const u8) bool {
+            var w = std.mem.tokenizeAny(u8, want, " \n");
+            var h = std.mem.tokenizeScalar(u8, have, ' ');
+            while (true) {
+                const a = w.next();
+                const b = h.next();
+                if (a == null or b == null) return a == null and b == null;
+                if (!std.mem.eql(u8, a.?, b.?)) return false;
+            }
+        }
+    };
+    inline for (.{ .{ "lanes", want_lane, got[0] }, .{ "samples", want_sample, got[1] } }) |c| {
+        if (!Names.same(c[1], c[2])) {
+            std.debug.print("gpu census ({s}):{s}\n", .{ c[0], c[2] });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
 test "Dual: sel takes b at a ±0 indicator and a at any other, NaN included" {
     // `sel` computes `c.v != 0.0` on the bits (#25); this pins the bit trick
     // to the float compare. The miscompile it dodges needs a stripped object
@@ -1588,4 +1661,145 @@ test "BSIM4 linked admission and limited planes agree with forced wide across mo
     // vtable reports whether its BSIM4 object compiled the narrow family.
     try std.testing.expect(admitted == 0 or admitted == 2);
     std.debug.print("bsim4-mode-gate: checked={d} admitted={d}\n", .{ checked, admitted });
+}
+
+// The #256 generator and the C4 lever's review rule.
+test {
+    _ = @import("bypass.zig");
+    _ = @import("census.zig");
+}
+
+test "a bypass replay stamps the plain evaluation's linearization at its recording" {
+    try checkBypassReplay(false);
+}
+
+test "a bypass replay moves the source row of a gate tied to its source" {
+    try checkBypassReplay(true);
+}
+
+/// Records one mos1 instance at x0 and replays it at a nearby x1. Oracle:
+/// the plain evaluation (which never bypasses) at x0 gives f0 and the
+/// assembled Jacobian G0; the replay must stamp G0 itself and f0 + G0 (x1 -
+/// x0), and re-read the charges at x1 exactly. `tied`: the gate shares the
+/// source's node (a depletion load), so the source row follows the unwritten
+/// gate row.
+fn checkBypassReplay(tied: bool) !void {
+    const D = @import("models").mos1;
+    const n = contract.nU(D);
+    // Node 0 is ground: the instance sits on nodes 1..n, x[0] stays 0.
+    const m = n + 1;
+    const U = D.U;
+    const vt = deviceVtable(D, "mos1_bypass_test");
+    const a = std.testing.allocator;
+    var rows: [m * m]u32 = undefined;
+    var columns: [m + 1]u32 = undefined;
+    for (&rows, 0..) |*row, i| row.* = @intCast(i % m);
+    for (&columns, 0..) |*column, i| column.* = @intCast(i * m);
+    const pattern: impl.test_access.PatternView = .{ .col_ptr = &columns, .row_idx = &rows, .n = m, .trash_slot = m * m };
+    const Planes = struct {
+        g: [m * m + 1]f64 = @splat(0),
+        c: [m * m + 1]f64 = @splat(0),
+        rhs: [m + 1]f64 = @splat(0),
+        q: [m + 1]f64 = @splat(0),
+        fn run(self: *@This(), f: anytype, b: Batch, x: []const f64) void {
+            self.* = .{};
+            f(b.ctx, &.{ .g_vals = &self.g, .c_vals = &self.c, .rhs = &self.rhs, .q_vec = &self.q }, 0, 1, x, 0);
+        }
+    };
+    // Tied: series resistors keep the internal nodes and branch currents,
+    // so the source row carries its branch current's entry.
+    var model: D.Model = .{ .vto = if (tied) -0.7 else 0.7, .kp = 110e-6, .gamma = 0.4, .lambda = 0.04, .phi = 0.65, .w = 0.5e-6, .l = 0.18e-6, .cgso = 1e-10, .cgdo = 1e-10, .rd = if (tied) 10 else 0, .rs = if (tied) 10 else 0 };
+    D.derive(Real, &model);
+    const instance: D.Instance = .{};
+    const collapse = D.collapse(Real, &model, &instance);
+    var nodes: [n]u32 = undefined;
+    for (&nodes, collapse, 0..) |*node, alias, u| node.* = 1 + if (alias) |root| root else @as(u32, @intCast(u));
+    if (tied) nodes[@backingInt(U.g)] = nodes[@backingInt(U.s)];
+    const proto = try vt.proto_create(a).unwrap();
+    defer proto.destroy(proto.ctx, a);
+    try vt.proto_add(proto.ctx, a, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
+    const b = try proto.finalize(proto.ctx, a, pattern).unwrap();
+    defer b.hooks.deinit(b.ctx, a);
+    b.hooks.clear_limits.?(b.ctx);
+    b.hooks.set_sim_state(b.ctx, .{ .kind = .tran, .analog_initial = false, .iteration = 2 });
+    b.hooks.set_bypass.?(b.ctx, .{ .reltol = 1e-4, .vntol = 1e-6, .abstol = 1e-12 });
+    const store: *DeviceBatch(D) = @ptrCast(@alignCast(b.ctx));
+
+    // Per unknown in `U` order (d g s b di si, then the two series
+    // currents), its value and its move; a collapsed alias takes its root's.
+    // Within both bypass tests: |dx| under reltol |x| + vntol (abstol for a
+    // current), |G0 dx| under reltol |f0| + abstol. Tied: the di and si
+    // rows sum the series resistor's 1e-3 A and the drain's 7.5e-5 A, so
+    // |f0| is ~9e-4, and each resistor's voltage moves 5e-7 (5e-8 A).
+    const at = [n]f64{ 1.0, 1.2, 0.1, -0.2, 0.99, 0.11, 1e-5, -1e-5 };
+    const step = if (tied)
+        [n]f64{ 3e-6, 2e-6, -1e-6, 1e-6, 2.5e-6, -1.5e-6, 1e-10, -1e-10 }
+    else
+        [n]f64{ 3e-6, 2e-6, -1e-6, 1e-6, 2e-6, -2e-6, 1e-10, -1e-10 };
+    var x0: [m]f64 = @splat(0);
+    var x1: [m]f64 = @splat(0);
+    for (nodes, collapse, at, step) |node, alias, v, dv| if (alias == null) {
+        x0[node] = v;
+        x1[node] = v + dv;
+    };
+
+    var plain0: Planes = .{};
+    plain0.run(b.eval, b, &x0);
+    var plain1: Planes = .{};
+    plain1.run(b.eval, b, &x1);
+    var got: Planes = .{};
+    // The recording is a plain evaluation that also keeps its writes.
+    got.run(b.eval_newton, b, &x0);
+    try std.testing.expectEqual(@as(usize, 0), store.bypass.?.hits.load(.monotonic));
+    try std.testing.expectEqualSlices(f64, &plain0.g, &got.g);
+    try std.testing.expectEqualSlices(f64, &plain0.rhs, &got.rhs);
+    got.run(b.eval_newton, b, &x1);
+    try std.testing.expectEqual(@as(usize, 1), store.bypass.?.hits.load(.monotonic));
+    try std.testing.expectEqualSlices(f64, &plain0.g, &got.g);
+    try std.testing.expectEqualSlices(f64, &plain0.c, &got.c);
+    try std.testing.expectEqualSlices(f64, &plain1.q, &got.q);
+    // ParEval's twin (`Hooks.stage`): the same recording and replay, staged
+    // per tape position and summed into each cell in tape order (ParEval's
+    // reduce), is the serial replay bit for bit. While the serial recording
+    // credited a tied gate's source residual to the gate row and the staged
+    // one to the source row, tran/device_mos6_inverter differed between 1
+    // and 2 device threads.
+    const tapes = b.hooks.scatter_tapes(b.ctx);
+    const ns = tapes.slots.len;
+    const nr = tapes.rows.len;
+    const stage = try a.alloc(f64, 2 * ns + 2 * nr);
+    defer a.free(stage);
+    const sg = stage[0..ns];
+    const sc = stage[ns..][0..ns];
+    const sr = stage[2 * ns ..][0..nr];
+    const sq = stage[2 * ns + nr ..][0..nr];
+    var staged: Planes = .{};
+    for ([_]*const [m]f64{ &x0, &x1 }) |xs| {
+        @memset(stage, -0.0);
+        b.hooks.stage(b.ctx, &.{ .g_vals = sg, .c_vals = sc, .rhs = sr, .q_vec = sq }, 0, 1, xs, 0, .newton);
+        staged = .{};
+        for (tapes.slots, sg, sc) |slot, gv, cv| {
+            staged.g[slot] += gv;
+            staged.c[slot] += cv;
+        }
+        for (tapes.rows, sr, sq) |row, rv, qv| {
+            staged.rhs[row] += rv;
+            staged.q[row] += qv;
+        }
+    }
+    // The staged planes key their own recording: one more miss, one more hit.
+    try std.testing.expectEqual(@as(usize, 2), store.bypass.?.hits.load(.monotonic));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&got.g), std.mem.asBytes(&staged.g));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&got.c), std.mem.asBytes(&staged.c));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&got.rhs), std.mem.asBytes(&staged.rhs));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&got.q), std.mem.asBytes(&staged.q));
+    // Row r moves by sum_c G0[r][c] (x1[c] - x0[c]); slot c * m + r.
+    var moved: [m]f64 = @splat(0);
+    var largest: f64 = 0;
+    for (1..m) |r| {
+        for (1..m) |c| moved[r] += plain0.g[c * m + r] * (x1[c] - x0[c]);
+        largest = @max(largest, @abs(moved[r]));
+    }
+    try std.testing.expect(largest > 1e-12);
+    for (1..m) |r| try std.testing.expectApproxEqAbs(moved[r], got.rhs[r] - plain0.rhs[r], 1e-6 * largest);
 }

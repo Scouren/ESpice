@@ -19,6 +19,7 @@
 //!   `seedUic`, `opStart`, `finish`, `runCtx`, `sayNames`, `executeBatch`,
 //!   `executeGpuBatch`, `runGpuWave`, `runGpuOps`, `executeGpuFreqBatch`,
 //!   `precompute`, `frequencyPlan`, `gpuMembers`)
+//! - `pub const LanePlan`, `lanePlan`, `borrow_min_weight`, `borrow_min_nnz`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,8 +32,8 @@ const op = @import("dc/op.zig");
 const opvars_post = @import("post/opvars.zig");
 const gpu = @import("gpu/context.zig");
 const gpu_lu = @import("gpu/lu.zig");
-const gpu_devices = @import("gpu/devices.zig");
 const par_eval = @import("par_eval.zig");
+const price = @import("price.zig");
 const ParEval = par_eval.ParEval;
 const worker = @import("worker.zig");
 const exec_config = @import("exec_config.zig");
@@ -113,6 +114,9 @@ pub const Executor = struct {
     /// No query copies this one's circuit once it completes (a final plan
     /// and no readers), so a GPU batch frees it with its wave.
     no_readers: bool = false,
+    /// A `.dc` segment's seam solutions (`RunCtx.seam`), which
+    /// `Session.assemble` reads once every segment has ended.
+    seam: []f64 = &.{},
 
     /// What one `wait` saw: a checkpoint, the result, an error or a cancel.
     pub const Outcome = Controller.Outcome;
@@ -148,11 +152,13 @@ pub const Executor = struct {
                 return error.InvalidOperatingPoint;
         }
         // Device operating-point variables come from the recorded rows
-        // (`label`), so a transient keeps every row they read.
+        // (`label`), so a transient keeps every row they read, and the step
+        // that reached each, over which they replay the integrator.
         var own = job;
         if (deck.opvars.len != 0 and own == .tran) {
             own.tran.point.measures_only = false;
             own.tran.point.early_stop = false;
+            own.tran.point.steps = true;
         }
         const self = try allocator.create(Executor);
         self.* = .{
@@ -204,7 +210,11 @@ pub const Executor = struct {
         const lu_threads: u8 = @intCast(@min(if (config.solver_threads > 1) config.solver_threads else config.device_threads, 16));
         self.circuit.configure(.{ .io = self.io, .threads = config.solver_threads, .lu_threads = lu_threads }, config.knobs);
         self.circuit.ws_pool = config.ws_pool;
+        // Every copy follows `temper`, a dependent's too: its own sweep may
+        // move the temperature.
+        self.circuit.temper = self.deck.temper;
         if (self.initial) |source| self.x = try self.work.allocator().dupe(f64, source.operatingPoint().?);
+        if (self.job == .dc and self.job.dc.lane != null) self.seam = try self.work.allocator().alloc(f64, 2 * self.circuit.n);
         // A dependent copies its prerequisite's circuit, variant included.
         if (self.initial == null) try self.installVariant();
         try self.bindAcOverrides();
@@ -230,7 +240,7 @@ pub const Executor = struct {
             if (refs.len != 0) try self.circuit.setParams(refs, values, temp == null);
         }
         if (temp) |t| {
-            self.circuit.setCircuitTemp(@floatCast(t));
+            try self.circuit.setCircuitTemp(@floatCast(t));
             try self.circuit.recompute();
         }
     }
@@ -347,45 +357,68 @@ pub const Executor = struct {
         // Borrowed lanes serve the device stamp and the multicore refactor;
         // both are bitwise their one-thread forms, so only speed moves.
         var lanes = self.config.device_threads;
+        // An explicit ESPICE_THREADS stamps on a ParEval whatever the weight,
+        // one lane per `lane_min_weight` up to its count.
+        var eval_lanes = lanes;
+        // Lever p1: the plan, not the pool's grant, prices the device.
+        var priced_lanes = eval_lanes;
         var borrowed: u32 = 0;
+        const perf = self.config.knobs.perf;
+        // C6 step 1 (#253): lanes held for the LU alone, until it admits a width.
+        var loan: exec_config.LaneLoan = undefined;
         if (self.config.thread_pool) |pool| if (self.circuit.ws == null) {
-            const want = wantLanes(&self.circuit);
+            const plan = lanePlan(deviceWeight(&self.circuit), self.circuit.nnz);
+            // C6 step 3: the wider cap, measured against the shipped 8.
+            const want = ThreadPool.queryWant(plan.want, perf.c6);
             borrowed = pool.take(want - 1);
             lanes = 1 + borrowed;
+            eval_lanes = if (plan.eval) lanes else 1;
+            priced_lanes = if (plan.eval) plan.want else 1;
             var execution = self.circuit.solver_execution;
             execution.lu_threads = @intCast(@min(lanes, 16));
             self.circuit.configure(execution, self.circuit.knobs);
+            if (perf.c6 and !plan.eval and borrowed > 0) {
+                loan = .{ .pool = pool, .held = &borrowed };
+                self.circuit.lane_loan = &loan;
+            }
         };
-        defer if (self.config.thread_pool) |pool| pool.give(borrowed);
+        // `settleLaneLoan` lowers `borrowed` by what it already gave back.
+        defer {
+            self.circuit.lane_loan = null;
+            if (self.config.thread_pool) |pool| pool.give(borrowed);
+        }
         var par: ?ParEval = null;
-        if (lanes > 1) {
+        if (eval_lanes > 1) {
             // At most one stamp lane per `lane_min_weight`: a lane with less
-            // costs its two barriers a pass more than its share saves. One
-            // lane still stages and reduces, so the 1-vs-N oracle
+            // costs its barriers a pass more than its share saves. One lane
+            // still stages and reduces, so the 1-vs-N oracle
             // (tools/determinism.sh) keeps comparing that path to the serial one.
-            const stamp_lanes: u32 = @intCast(@max(1, @min(lanes, deviceWeight(&self.circuit) / lane_min_weight)));
-            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, stamp_lanes);
+            const stamp_lanes: u32 = @intCast(@max(1, @min(eval_lanes, deviceWeight(&self.circuit) / lane_min_weight)));
+            const levers: par_eval.Levers = .{ .c6 = perf.c6, .c7 = perf.c7, .n8 = perf.n8, .n3 = perf.n3 };
+            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, stamp_lanes, levers);
             self.circuit.par_eval = &par.?;
+            // C7 step 2's census: statistics only.
+            if (self.config.knobs.tran_stats) par.?.printCensus();
         }
         defer {
+            self.circuit.reduce_a = false;
             self.circuit.par_eval = null;
             if (par) |*p| p.deinit();
         }
-        // The query's device eval and device LU open on the least loaded
-        // device (multi-GPU stage 2); one device keeps them on it. An
-        // explicit `--backend cpu` opens no device: reading the device table
-        // starts the driver, ~140 ms a run on a machine with a GPU.
-        const devices = gpu_devices;
-        const placed: devices.Placement = if (self.config.backend == .cpu) .{ .slot = null, .prev = devices.ordinal } else devices.place();
-        defer placed.release();
-        const gpu_context = try self.prepareGpu(lanes);
+        // The device eval and the device LU each place the query on the
+        // least loaded device (multi-GPU stage 2) only once the price admits
+        // them (`GpuContext.init`, `GpuLu`): reading the device table starts
+        // the driver, 265-465 ms of wall on a tiny deck `auto` keeps on the CPU.
+        const gpu_context = try self.prepareGpu(if (perf.p1) priced_lanes else lanes);
+        // C7: the reduce forms A (and the companion rows) on the host only.
+        if (par) |*p| self.circuit.reduce_a = p.formsA() and gpu_context == null;
         // The bypass serves host evaluations only.
         if (self.config.knobs.bypass and gpu_context == null) {
             // A tenth of reltol: a replay's current error is about reltol
             // times the device currents, which a net current that nearly
             // cancels (a supply at a switching edge) would show at full reltol.
             const tol = self.deck.deck_tol;
-            self.circuit.setBypass(.{ .reltol = tol.reltol / 10, .vntol = tol.vntol, .abstol = tol.abstol });
+            self.circuit.setBypass(.{ .reltol = tol.reltol / 10, .vntol = tol.vntol, .abstol = tol.abstol, .c4 = self.config.knobs.perf.c4, .hold = self.config.knobs.perf.c4h, .stats = self.config.knobs.tran_stats });
         }
         defer if (gpu_context) |g| {
             // `refuseLatched` reads statuses off the host instances.
@@ -393,7 +426,7 @@ pub const Executor = struct {
             self.circuit.detachGpu();
             g.deinit();
         };
-        const lu_context = self.prepareGpuLu();
+        const lu_context = self.prepareGpuLu(gpu_context == null);
         defer {
             self.circuit.lu = null;
             if (lu_context) |l| l.deinit();
@@ -480,6 +513,7 @@ pub const Executor = struct {
             .measures = self.deck.measures,
             .source = if (self.source) |s| s.result() else null,
             .emir_ports = self.deck.emir_ports,
+            .seam = self.seam,
         };
     }
 
@@ -493,7 +527,7 @@ pub const Executor = struct {
     /// with its device operating-point variables (`post/opvars.zig`).
     fn label(self: *Executor, result_in: types.Result) !types.Result {
         var res = result_in;
-        if (self.recordsOpvars()) res = try opvars_post.publish(self.results.allocator(), self.allocator, &self.circuit, self.deck, res);
+        if (self.recordsOpvars()) res = try opvars_post.publish(self.results.allocator(), self.allocator, &self.circuit, self.deck, res, self.job);
         // Copies of one card at several temperatures keep apart by name.
         if (queryTemp(self.job)) |temp| res.plotname = try self.results.allocator().print("{s} (temp={d})", .{ res.plotname, temp });
         if (queryVariant(self.job)) |v| res.plotname = try self.results.allocator().print("{s} ({s})", .{ res.plotname, self.deck.variants.labelAt(v) });
@@ -524,22 +558,27 @@ pub const Executor = struct {
     /// The device LU: `Knobs.gpu_lu` (`ESPICE_GPU_LU=1`) forces it on under a
     /// GPU backend, any other value off; otherwise it runs where the matrix is big enough to be
     /// worth asking the driver, on every pivot epoch with enough flops per
-    /// column or in all (`GpuLu.admits`), whatever the card's FP64 rate. A
-    /// driver that refuses leaves the host LU.
-    fn prepareGpuLu(self: *Executor) ?*gpu_lu.GpuLu {
+    /// column or in all (`GpuLu.admits`), whatever the card's FP64 rate. The
+    /// context starts no driver: its kernels load on the first admitted
+    /// epoch, and a driver that refuses them leaves the host LU. `place`:
+    /// no device eval placed this query, so the device LU places itself.
+    fn prepareGpuLu(self: *Executor, place: bool) ?*gpu_lu.GpuLu {
         // A lone operating point refactors on the device (logic_bsim4_10k
         // under `cuda`: 57 iterations, 6.3 s against 7.5-40 s of host LU).
-        if (self.config.backend == .cpu or (self.config.gpu_lanes and self.config.may_batch and self.job == .op)) return null;
+        if (self.config.backend == .cpu or price.opOnHost(self.config.knobs.perf.p1, self.config.gpu_lanes and self.config.may_batch, self.job == .op)) return null;
         var forced = false;
         if (self.config.knobs.gpu_lu) |on| {
             if (!on) return null;
             forced = true;
-        } else if (self.circuit.n < gpu_lu_min_n) return null;
+        } else if ((!self.config.knobs.perf.p1 and self.circuit.n < gpu_lu_min_n) or !self.config.gpuPriced()) return null;
         const context = gpu_lu.GpuLu.init(self.allocator, self.circuit.n, self.circuit.nnz, self.config.knobs) catch |err| {
             if (forced) std.debug.print("warning: device LU unavailable ({s})\n", .{@errorName(err)});
             return null;
         };
         context.forced = forced;
+        context.place = place;
+        // P1: the calibration file prices the device LU's rent-or-buy.
+        if (self.config.knobs.perf.p1) context.rent.machine = self.config.machine;
         self.circuit.lu = context;
         return context;
     }
@@ -547,11 +586,12 @@ pub const Executor = struct {
     fn prepareGpu(self: *Executor, lanes: u32) !?*gpu.GpuContext {
         // Under GPU lanes the operating points run on the CPU workers, in
         // parallel, and only the transients' lanes take the device.
-        if (self.config.backend == .cpu or (self.config.gpu_lanes and self.job == .op)) return null;
+        if (self.config.backend == .cpu or price.opOnHost(self.config.knobs.perf.p1, self.config.gpu_lanes, self.job == .op)) return null;
+        if (!self.config.gpuPriced()) return null;
         const explicit = self.config.gpu_explicit or self.config.backend != .auto;
         const c = &self.circuit;
         const host: gpu.Host = .{ .batches = c.batches, .planes = c.ownPlanes(), .n = c.n, .trash_slot = c.trash_slot, .has_charge = c.has_charge, .knobs = c.knobs };
-        const context = gpu.GpuContext.init(self.allocator, host, self.config.gpu_driver, explicit, lanes, dispatch.expectedEvals(self.job)) catch |err| {
+        const context = gpu.GpuContext.init(self.allocator, host, self.config.gpu_driver, explicit, lanes, dispatch.expectedEvals(self.job), self.config.machine) catch |err| {
             if (!gpu.fallsBack(self.config.backend, explicit, err)) {
                 std.log.warn("--backend {s}: GPU unavailable ({s}); detected GPU hardware: {s}", .{ @tagName(self.config.backend), @errorName(err), gpu.detectedHardware() });
                 return err;
@@ -576,25 +616,41 @@ const gpu_lu_min_n = 10_000;
 /// circuit) from which extra lanes pay: about 800 BSIM4 instances. ParEval
 /// measured 3.3x on 4,000 bsim4 at 8 threads and no gain on 4,000 mos1,
 /// whose summed weight sits below this (`gpu/context.zig` cost notes).
-const borrow_min_weight: u64 = 4_000_000;
+pub const borrow_min_weight: u64 = 4_000_000;
 /// Device weight per ParEval lane. ReleaseSafe, alone on 32 cores, at 1 / 2
 /// / 8 threads: vacask_rc (weight ~150, 1M steps) 6.0 / 9.2 / 12.1 s,
 /// hspice_samples (8) 0.7 / 1.3 / 6.8 s, vacask_graetz (4 diodes, ~1,200)
-/// 39.7 / 32.7 / 25.6 s, device_mos6_inverter (~90,000) 0.81 / 0.49 / 0.19 s.
-/// 512 keeps each lane at half the ideal speedup or better on these.
+/// 39.7 / 32.7 / 25.6 s, device_mos6_inverter (~90,000) 0.81 / 0.49 / 0.19 s
+/// (#248). 512 keeps each lane at half the ideal speedup or better on these.
 const lane_min_weight: u64 = 512;
 /// Matrix entries from which a refactor may be thick enough for the
 /// multicore LU; its own per-epoch admission (`direct.zig`) still decides.
-const borrow_min_nnz: u32 = 50_000;
+pub const borrow_min_nnz: u32 = 50_000;
+
+/// What a pooled query borrows (`lanePlan`).
+pub const LanePlan = struct {
+    /// Lanes to ask the pool for, the query's own included; 1 below both gates.
+    want: u32,
+    /// Whether the device stamp runs a ParEval on the lanes it gets.
+    eval: bool,
+};
+
+/// The lane plan of a pooled query whose circuit has device weight
+/// `weight` (`par_eval.instanceWeight` summed over its instances) and
+/// `nnz` matrix entries. Only the weight gate stamps on the borrowed
+/// lanes; past the nnz gate alone they serve the multicore LU. On
+/// stress/scaling_rc_ladder_100k (200k linear instances) a ParEval cost
+/// 22.5 G user cycles against 5.3 G without, at equal wall time, since its
+/// reduce walks every cell the serial baseline copy skips.
+pub fn lanePlan(weight: u64, nnz: u32) LanePlan {
+    const eval = weight >= borrow_min_weight;
+    const want: u32 = if (eval or nnz >= borrow_min_nnz) ThreadPool.per_query else 1;
+    return .{ .want = want, .eval = eval };
+}
 
 // ---- private ----
 
-/// Lanes for a query of `ckt`: 1 below both gates.
-fn wantLanes(ckt: *const types.Circuit) u32 {
-    return if (deviceWeight(ckt) >= borrow_min_weight or ckt.nnz >= borrow_min_nnz) ThreadPool.per_query else 1;
-}
-
-/// `ParEval.instanceWeight` summed over every instance of `ckt`.
+/// `ckt`'s device weight: `par_eval.instanceWeight` over its instances.
 fn deviceWeight(ckt: *const types.Circuit) u64 {
     var weight: u64 = 0;
     for (ckt.batches) |b| weight += @as(u64, b.count) * par_eval.instanceWeight(b);

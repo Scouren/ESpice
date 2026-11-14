@@ -20,8 +20,8 @@ and a model you load yourself run through the same code.
 | Sources | independent V and I, VCVS, VCCS, CCCS, CCVS, behavioural B (V, I and charge forms), Laplace, pole-zero and delay E/G forms | `V`, `I`, `E`, `G`, `F`, `H`, `B` |
 | Switches | voltage- and current-controlled | `S`, `W` |
 | Transmission lines | lossless `T`, LTRA (`O`), TXL (`Y`), coupled CPL lines of 2 to 4 conductors (`P`), uniform RC (`U`) | `T`, `O`, `Y`, `P`, `U` |
-| HSPICE data elements | S-parameter blocks of 1 to 4 ports, W-element lines of 1 to 4 conductors | `S`, `W` in the HSPICE dialect |
-| Diode | junction diode, JUNCAP2 200.6.2, DIODE_CMC 3.0, ASM-ESD 101.1 | `D`, `N` |
+| Data elements (ESPice's, HSPICE's spelling) | S-parameter blocks of 1 to 4 ports, W-element lines of 1 to 4 conductors: an `S` or `W` card with a `key=value` field (`mname=`, `rlgcmodel=`, `n=`, `l=`, ...); one with none is ngspice's switch | `S`, `W` |
+| Diode | junction diode (with [self-heating](#diode-self-heating)), JUNCAP2 200.6.2, DIODE_CMC 3.0, ASM-ESD 101.1 | `D`, `N` |
 | BJT | Gummel-Poon, VBIC 1.3 (4 terminal), HICUM/L2 3.2.0, HICUM/L0 2.1.0, Mextram 505.6 (with and without self-heating) | `Q`, `N` |
 | MOSFET | MOS levels 1, 2, 3, 6, 9; BSIM1, BSIM2, BSIM3, BSIM4; BSIM-SOI 101.0, B3SOI-FD, B3SOI-DD; BSIM-IMG 103.1, BSIM-CMG 112.1, BSIM-BULK 107.2.1; L-UTSOI 102.9; HiSIM2, HiSIM_HV 2.5.1, HiSIM_SOI 1.5, HiSIM_SOTB 1.3; PSP 103.8.2 and 104.1 (QS, NQS and self-heating); MOSVAR 1.4; VDMOS | `M`, `N` |
 | HEMT | ASM-HEMT 101.6, MVSG_CMC 5.0 | `N` |
@@ -33,6 +33,38 @@ and CPL algorithms. Two approximate line models, `lossy_tline` and
 `coupled_tlines`, also ship; the only card that uses one is an `O` card
 for a static RG line (no L or C), which gets `lossy_tline`. A lossless LC
 `O` card runs as a `T` line.
+
+A line's length follows ngspice. A `Y` card's `len=` replaces its model's
+`length=`, and a `Y` card's `length=` is ignored with a warning, as ngspice
+ignores it. A `P` card's `len=` or `length=` replaces its model's. An `O`
+card takes no length or line constant: its length is the model's `len=`,
+and a card `len=`, `length=` or `r=` is refused with `UnknownParameter`,
+as ngspice refuses it. An LTRA model without `len=`, one that spells it
+`length=` included, is refused with `UnsupportedTransmissionLineParameters`
+("lossy line length must be given"), as ngspice refuses it.
+
+An `O` or `T` card's initial conditions (`v1=`, `v2=`, `i1=`, `i2=`, or
+`ic=v1,i1,v2,i2`) are ignored without `uic`, as in ngspice, where the
+operating point replaces them. Under `.tran ... uic` (or `.pss ... uic`)
+ngspice starts the line's history from them, which ESPice does not model
+yet: a `T` card, or an LC, RC or RLC `O` line, that carries them is refused
+with `UnsupportedCard`. An RG `O` line ignores them under `uic` too, as
+ngspice's does.
+
+A `Y` card whose model has R/L < 5e5 and G < 1e-2, `r=0` included, runs
+ngspice's lossless TXL line (ReadTxL in `txlsetup.c`); `r=0` with G of
+1e-2 or more would reach a fit that divides by R/L, and is refused. Its
+step control departs from ngspice's on purpose. ngspice bounds no step on
+that line (`txlload.c:118` tests `!tx->lsl`), and a step longer than the
+delay reads the delayed port values by interpolating toward the unknowns
+it is solving for (`txlload.c:221-228`). ESPice keeps every TXL step under
+0.9 of the line's delay, so each delayed read comes from accepted history.
+A short line costs more points and stays nearer the exact delay line: on a
+0.5 ns line under `.tran 1n 40n`, between a 50 Ω source and a 100 Ω load,
+ngspice 44.2 takes 77 points and ESPice 116, and v(out) at 13 ns, exactly
+0.5 V, reads 0.5001793 V in ngspice and 0.5000000 V in ESPice. The deck
+`tran/txl_tran_lossless_step_bound.sp` holds ESPice to the exact delay
+line within 1e-5 V.
 
 ## Model type and LEVEL
 
@@ -66,8 +98,53 @@ out) choose the device. The tables follow ngspice's `inpdomod.c`.
 ngspice has no built-in level for BSIM-CMG, L-UTSOI, BSIM-BULK or BSIM-IMG;
 those four are HSPICE's numbers.
 
-`.model name VDMOS(...)` selects VDMOS whatever the level (N-channel only:
-a `pchan` model is refused). An `N` card whose
+`.model name VDMOS(...)` selects VDMOS whatever the level; `VDMOSP`, or
+`pchan` on the card, makes it P-channel. Where ngspice releases disagree,
+VDMOS follows ngspice 45. THETA degrades the mobility by THETA·(vgs − von),
+as 45 does; 44.2 uses THETA·vgs, which sinks 15% less current at THETA =
+0.1, VTO = 2 V and vgs = 3 V (`noise/ngspice_vdmos_theta.sp`). LAMBDA scales the current by 1 + LAMBDA·vds
+on the signed vds, so a reversed channel carries less current, as in ngspice;
+ngspice's gds keeps +LAMBDA's slope there, so its reverse-mode AC and noise
+differ from ESPice's exact slope by twice that term. With RQ and
+VQ given, the drain resistance grows with vds as in ngspice; ngspice reads
+that resistance off the previous iteration, so its AC and noise leave out
+its vds slope, which ESPice keeps. Where a released ngspice has a bug that
+master has fixed, ESPice follows master and cites the commit (VDMOS gate-cap
+m scaling: 2bc63e, 6bd5c2). The instance `m` is `m` parallel copies. Master's
+m changes to VDMOS, one more that no ngspice makes, and what ESPice does with
+each:
+
+- CGS, CGDMIN and CGDMAX are multiplied by `m` (2bc63e "VDMOS scaling
+  fixed", moved per instance by 6bd5c2); 44.2 and 45 leave them unscaled
+  (vdmosload.c:71-74). ESPice multiplies them.
+- Flicker noise: 44.2 and 45 divide KF·|cd|^AF by `m`; master (2bc63e)
+  divides it by nothing. ESPice sums the copies, m·KF·|cd/m|^AF =
+  KF·|cd|^AF·m^(1−AF): m^(1−AF) times master's, equal only at AF = 1, and
+  m^(2−AF) times 44.2's and 45's, equal only at AF = 2.
+- CTHJ is multiplied by `m` (2bc63e, vdmosload.c and vdmosacld.c), and so
+  are 1/RTHJC and 1/RTHCA (2bc63e in vdmosload.c, 6bd5c2 in vdmosacld.c).
+  They belong to the thermal node, which ESPice refuses.
+- IBV, in no ngspice version: ESPice multiplies it by `m`, as IS is and as
+  the diode's is (diotemp.c:211-213), so x_bv is one copy's. 44.2, 45 and
+  master take IBV unscaled (45's vdmostemp.c:136), which moves x_bv by
+  about NBV·Vt·ln(m), 18 mV at m = 2, and halves the m = 2 breakdown
+  current of `op/vdmos_breakdown_m.sp`.
+
+The body diode's breakdown knee x_bv is solved to 1e-9 of IBV, where
+ngspice's vdmostemp.c stops once it is within reltol·IBV (one pass at the
+default reltol) and the junction diode stops where diotemp.c does, so with
+IBV near IS·BV/Vt (IS = 1 nA, BV = 20 V, IBV = 1.5 µA in
+`src/tests/breakdown.zig`) ESPice's VDMOS breakdown current at −BV is 0.1%
+below ngspice's.
+
+The gate-drain charge is the exact integral of ngspice's atan/tanh Cgd law
+(devsup.c:654-665). ngspice instead accumulates q += Δv·(C_n + C_(n−1))/2
+(vdmosload.c:509-513), which is not a state function: over
+`tran/vdmos_gate_charge.sp`'s −10 V to 5 V and back gate cycle its charge
+misses by 2.4e-14 C of a 1.2e-8 C swing, a gap that shrinks with the step
+squared.
+
+An `N` card whose
 `.model` type is a model's Verilog-A module name, the name ngspice loads it
 under as OSDI, selects the built-in model: `psp103va`, `pspnqs103va`,
 `psp103tva`, `psp104va`, `pspnqs104va`, `psp104tva`, `juncap200`, `bsimimg`,
@@ -95,6 +172,40 @@ and the card. So is a card whose model is another element's type (a `D`
 card on an `NPN` model), as ngspice's "incorrect model type". ESPice never
 substitutes a different model. P-type MESA (`PMF` at levels 2 to 4) is
 refused too: the model has no polarity parameter.
+
+**Polarity** follows ngspice 44.2. The card's type sets it first: `NMOS`,
+`NPN`, `NJF`, `NMF` and `NHFET` are N; `PMOS`, `PNP`, `PJF`, `PMF`,
+`PHFET`, `VDMOS PCHAN` and `VDMOSP` are P. Each of those type words written
+again on the card is a flag that sets it anew, in card order, and the last
+one wins: `.model m nmos level=1 pmos` is P. A flag counts only where
+ngspice's parameter table for that model holds it. Elsewhere
+(`nmos level=1 npn`, `vdmos pmos`) it warns
+`unrecognized parameter (npn) - ignored` and changes nothing. A `type=` key
+never sets the polarity on these cards. On MOS levels 1, 2, 3, 6 and 9,
+VDMOS, and every BJT, JFET,
+MESFET, MESA and HFET level ngspice has, ngspice drops the model, so the
+card is refused with `UnsupportedCard`. On the other levels it warns and is
+ignored, as is a model's own polarity key that ngspice's table lacks
+(`jtype`, `ztype`, `type_nfet`, `ty`). A polarity key on the instance card
+(`m1 d g s b nm type=-1`) is refused with `UnknownParameter`, as ngspice
+stops on it. A JUNCAP2 diode card's `type=` and a Verilog-A module card's
+(`.model p psp103va type=-1`) are the model's own parameter and set it.
+`.mosra` and a MOSFET's op-vars read the polarity the card bound.
+
+## Diode self-heating
+
+`D1 a c tj model thermal` heats the junction when the card meets all
+three of ngspice's conditions: a third node, the `thermal` flag (or
+`thermal=1` on the model card), and a non-zero `rth0` on the model card. A
+card that misses any of them runs isothermal, as in ngspice. `v(tj)` is
+the junction's rise in kelvin over the instance's ambient (`temp=`, or
+`.temp` plus `dtemp=`), not its absolute temperature. `rth0` (K/W) and
+`cth0` (J/K, default 1e-5) belong to the whole instance: `m` and `area`
+scale the power, not them. AC and noise include the thermal pole at
+`1/(2*pi*rth0*cth0)`. ngspice 44.2 and 45 leave it out, so above that
+frequency their `v(tj)` differs from ESPice's. `@d1[p]` is the electrical
+power, as in ngspice. VDMOS self-heating is still refused
+(`UnsupportedSelfHeating`).
 
 ## Model licences
 
@@ -133,7 +244,8 @@ Divider with a Verilog-A resistor: 3 devices
 `v(out)` is 0.75 V: the 3k Verilog-A resistor under the 1k R1.
 
 `.include` of a file ending in `.va`, `.vams` or `.veriloga` loads it the
-same way, and a Verilog-1364 design (`.v`, `.sv`, or the `.verilog` card)
+same way, from where ngspice finds an include: the working directory first,
+then beside the file that names it. `.hdl` reads beside the deck. A Verilog-1364 design (`.v`, `.sv`, or the `.verilog` card)
 works too. A `.model` card can name the module as its type
 (`.model myres vres r=3k`), and an instance then names the model.
 

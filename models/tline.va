@@ -36,8 +36,14 @@ module tline(p1, n1, p2, n2);
     parameter real nl = 0.25 from (0:inf);   // line length in wavelengths at f
     parameter real td = nl / f from (0:inf); // delay [s]
 
-    // ngspice IC=V1,I1,V2,I2: delay history at t <= 0. The host seeds the
-    // absdelay ring with these at MODEINITTRAN; Verilog-A cannot preload it.
+    // ngspice IC=V1,I1,V2,I2: under uic, the delay history at t <= 0
+    // (traload.c:61-66, 79-86). KNOWN GAP: declared and read by nothing;
+    // the host seeds the absdelay ring from the start vector, and this
+    // module cannot tell a uic start from the transient's operating point.
+    // So no card reaches them: net_lines.zig addTline refuses a T card's
+    // v1, v2, i1, i2 and ic= under uic, drops them without it (as ngspice),
+    // and refuses ic_v1..ic_i2 by name (tran/ltra_tran_uic_initial_conditions.sp).
+    // They get wired when a uic route lands (a uic bit in the analysis).
     parameter real ic_v1 = 0.0;              // V(p1,n1) at t <= 0 [V]
     parameter real ic_i1 = 0.0;              // I(br1)   at t <= 0 [A]
     parameter real ic_v2 = 0.0;              // V(p2,n2) at t <= 0 [V]

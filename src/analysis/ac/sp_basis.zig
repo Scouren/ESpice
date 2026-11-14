@@ -1,14 +1,14 @@
-//! Mixed-mode ports [SA Ch.17] as a change of basis. A balanced port has two
-//! legs, each a single-ended port against the shared reference, and two
-//! modes: differential, (a+ - a-)/sqrt 2 against 2 z0, and common,
-//! (a+ + a-)/sqrt 2 against z0/2. These are the power waves of V+ - V- and
-//! of (V+ + V-)/2, so S over the modes is M S_legs M^T for the orthogonal M,
-//! and Y, Z, H and the noise parameters follow from it unchanged. Modes are
-//! ordered as HSPICE maps them to Touchstone (S13 = SDC11 for two balanced
-//! ports): each port's first mode (single-ended or differential) in port
-//! order, then the common modes of the balanced ports in port order. Legs
-//! follow the same order, so with no balanced port M is the identity and is
-//! not stored.
+//! Mixed-mode ports [SA Ch.17] as a change of basis. A balanced port (two
+//! portnum V cards on one port number) has two legs, each a single-ended
+//! port against its own n- with the port's z0, and two modes: differential,
+//! (a+ - a-)/sqrt 2 against 2 z0, and common, (a+ + a-)/sqrt 2 against
+//! z0/2. These are the power waves of V+ - V- and of (V+ + V-)/2, so S over
+//! the modes is M S_legs M^T for the orthogonal M, and Y, Z, H and the
+//! noise parameters follow from it unchanged. Modes are ordered as HSPICE
+//! maps them to Touchstone (S13 = SDC11 for two balanced ports): each
+//! port's first mode (single-ended or differential) in port order, then the
+//! common modes of the balanced ports in port order. Legs follow the same
+//! order, so with no balanced port M is the identity and is not stored.
 //! In: the query's ports. Out: the legs the solves run over, M and each
 //! mode's z0.
 //! Cites HSPICE [SA Ch.17]; Bockelman and Eisenstadt, IEEE Trans. MTT 43(7),
@@ -74,6 +74,7 @@ pub const Basis = struct {
             };
             legs[c] = legs[k];
             legs[c].node = minus.node;
+            legs[c].neg = minus.neg;
             legs[c].branch = minus.branch;
             m[k * nl + k] = r;
             m[k * nl + c] = -r;
@@ -130,16 +131,21 @@ pub const Basis = struct {
 };
 
 test Basis {
-    // A balanced port and a single-ended one: legs (+, single, -), M
-    // orthogonal, so the identity S stays the identity over the modes.
+    // A balanced port and a single-ended one: legs (+, single, -), each
+    // against its own n-, M orthogonal, so the identity S stays the
+    // identity over the modes.
     const ports = [_]Port{
-        .{ .node = 1, .branch = 4, .balanced = .{ .node = 2, .branch = 5 } },
+        .{ .node = 1, .branch = 4, .balanced = .{ .node = 2, .neg = 7, .branch = 5 } },
         .{ .node = 3, .branch = 6 },
     };
     var b = try Basis.init(testing.allocator, &ports, .{ false, false });
     defer b.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 3), b.legs.len);
     try testing.expectEqual(@as(u32, 2), b.legs[2].node);
+    try testing.expectEqual(@as(u32, 7), b.legs[2].neg);
+    try testing.expectEqual(@as(u32, 5), b.legs[2].branch);
+    try testing.expectEqual(@as(u32, 0), b.legs[0].neg);
+    for (b.legs) |leg| try testing.expect(leg.balanced == null);
     try testing.expectEqualSlices(f64, &.{ 100, 50, 25 }, b.z0);
     var s: [2 * 9]f64 = @splat(0);
     for (0..3) |i| s[(i * 3 + i) * 2] = 1;

@@ -125,12 +125,14 @@ pub const Tolerances = struct {
     itl1: u16 = 100,
     itl2: u16 = 50,
     itl4: u16 = 10,
+    /// `.options dv`, volts: the Newton bound on each node voltage's update; null is no bound.
+    dv: ?f64 = null,
     /// Coulombs; charge floor of the transient truncation-error estimate.
     chgtol: f64 = 1e-14,
     /// Factor by which the truncation-error estimate is assumed to overshoot.
     trtol: f64 = 7.0,
-    /// `.options temp` for this query alone, in degC (one entry of an HSPICE
-    /// `.temp` list); null runs at the deck temperature.
+    /// `.options temp` for this query alone, in degC (one point of a
+    /// `.step temp`); null runs at the deck temperature.
     temp_c: ?f64 = null,
     /// Row of `Deck.variants` this query runs; null runs the nominal circuit.
     variant: ?u32 = null,

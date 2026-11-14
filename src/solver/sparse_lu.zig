@@ -20,6 +20,7 @@
 //!   - `pub const test_access = if (@import("builtin").is_test) .{`
 //!   - `pub fn refactor(self: *Self, col_ptr: []const u32, vals: []const f64, growth_limit: f64) error{SingularMatrix}!void`
 //!   - `pub const Replay = lu_replay.Replay`
+//!   - `pub const NoWait = lu_replay.NoWait`
 //!   - `pub fn replay(self: *Self, col_ptr: []const u32, vals: []const f64, growth_limit: f64) Replay`
 //!   - `pub fn solve(self: *Self, b: []const f64, x: []f64) void`
 //!   - `pub fn solveT(self: *Self, b: []const f64, x: []f64) void`
@@ -37,6 +38,8 @@ const assert = std.debug.assert;
 const num = @import("core").numerics;
 const lu_factor = @import("lu_factor.zig");
 const lu_replay = @import("lu_replay.zig");
+const lu_runs = @import("lu_runs.zig");
+const lu_runs_census = @import("lu_runs_census.zig");
 /// `-Dlu-instrument`: compiles the `ZP_LU_STATS` fill print and census.
 pub const instrument = @import("build_options").lu_instrument;
 const Allocator = std.mem.Allocator;
@@ -151,6 +154,15 @@ pub const SparseLu = struct {
     /// Print every full factor's fill and census (`direct.Knobs.stats`);
     /// read only under `instrument`.
     stats: bool = false,
+    /// Lever C1 (`direct.Knobs.perf.c1`): each `factor` builds `runs`, and
+    /// `refactor` then applies supernode runs as dense panel updates,
+    /// bitwise the column loop. Off leaves `runs` empty.
+    runs_on: bool = false,
+    /// Lever C1's run tables of the current pivot epoch (`lu_runs.zig`).
+    runs: lu_runs.Tables = .{},
+    /// Lever C8: `factorPass` starts each column from `prev` under the
+    /// threshold test (`lu_reorder.zig`'s retry). False outside it.
+    want_prev: bool = false,
     /// DFS workspace, alive only inside `factor` (`scratch_u32`): the
     /// per-column visit mark (pivot step + 1), the reach in finish order,
     /// the DFS stack, and each stacked row's resume offset into its L
@@ -248,6 +260,7 @@ pub const SparseLu = struct {
             gpa.free(s);
         inline for (.{ &self.tape, &self.lsrc, &self.tv, &self.panels, &self.panel_rows, &self.panel_vals, &self.void_slots, &self.li, &self.lx, &self.ui, &self.ux }) |l|
             l.deinit(gpa);
+        self.runs.deinit(gpa);
     }
 
     /// Full symbolic and numeric factorization. Per column: DFS reach,
@@ -310,6 +323,12 @@ pub const SparseLu = struct {
                 return error.SingularMatrix;
         }
         assert(self.factored);
+        if (self.runs_on) lu_runs.build(self, gpa) catch |err| {
+            self.factored = false;
+            return err;
+        };
+        if (instrument and self.stats)
+            lu_runs_census.print(self, gpa, col_ptr) catch |e| std.debug.print("lu-runs: {s}\n", .{@errorName(e)});
         if (!repivot) self.base_lu = self.li.items.len + self.ui.items.len;
     }
 
@@ -342,11 +361,15 @@ pub const SparseLu = struct {
             if (vals[p] != 0) return error.SingularMatrix;
         }
         if (self.tv.items.len != 0) return lu_replay.refactorTape(self, vals, growth_limit);
+        if (self.runs.admitted) return lu_replay.refactorPanels(self, col_ptr, vals, growth_limit);
         return lu_replay.refactorColumns(self, col_ptr, vals, growth_limit);
     }
 
     /// One factor's slices for a column replay (`lu_replay.zig`).
     pub const Replay = lu_replay.Replay;
+    /// The `ready` argument of `Replay.columnPanels` for a schedule whose
+    /// U steps are final before each column starts.
+    pub const NoWait = lu_replay.NoWait;
 
     /// The column replay's inputs for new `vals`, for `refactorColumns` and
     /// for callers that replay columns in their own schedule
@@ -370,6 +393,7 @@ pub const SparseLu = struct {
             .col_ptr = col_ptr,
             .vals = vals,
             .growth_limit = growth_limit,
+            .runs = self.runs.view(),
         };
     }
 
@@ -594,6 +618,13 @@ fn factorLifecycle(gpa: Allocator, sys: TestSystem, q: []const u32) !void {
     var x: [64]f64 = undefined;
     lu.solve(b[0..n], x[0..n]);
     try testing.expect(sys.residual(sys.vals, x[0..n], b[0..n], false) <= 1e6);
+}
+
+test {
+    _ = lu_runs;
+    _ = @import("lu_reorder.zig");
+    _ = @import("lu_reorder_tests.zig");
+    _ = lu_runs_census;
 }
 
 test "factor, refactor and both solves leave a small scaled residual on random systems" {

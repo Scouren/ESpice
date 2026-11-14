@@ -57,6 +57,7 @@ module mos2(d, g, s, b);
 
     // ---- channel (Grove-Frohman) ---------------------------------------
     parameter real vto    = 0.0;                 // zero-bias threshold      [V]
+    aliasparam vt0 = vto;                    // ngspice mos2.c:120 IOPR spelling
     parameter real kp     = 0.0    from [0:inf); // transconductance    [A/V^2]
     parameter real gamma  = 0.0    from [0:inf); // body-effect coeff    [V^0.5]
     parameter real phi    = 0.6    from (0:inf); // surface potential        [V]
@@ -453,9 +454,19 @@ module mos2(d, g, s, b);
             cgs_f = 0.0;
             cgd_f = 0.0;
         end else if (vgst <= 0.0) begin
+            // Weak inversion splits by vds like the linear region
+            // (devsup.c DEVqmeyer): cgd = 0 here swapped the caps at the
+            // vds = 0 mode flip and Newton 2-cycled there at any dt.
             cgb_f = -vgst*coxm/(2.0*phit);
             cgs_f = vgst*coxm/(1.5*phit) + coxm/3.0;
             cgd_f = 0.0;
+            if (vdsx < vdsp) begin
+                vddif  = 2.0*vdsp - vdsx;
+                vddif1 = vdsp - vdsx;
+                vddif2 = vddif*vddif;
+                cgd_f = cgs_f*(1.0 - vdsp*vdsp/vddif2);
+                cgs_f = cgs_f*(1.0 - vddif1*vddif1/vddif2);
+            end
         end else if (vdsp <= vdsx) begin
             cgb_f = 0.0;
             cgs_f = coxm/3.0;

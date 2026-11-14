@@ -96,10 +96,11 @@ pub fn sameLaneJob(a: requests.Query, b: requests.Query) bool {
 
 /// Kinds a lane batch runs: `.op`, `.dc`, `.tran`, `.pss`, the AC family
 /// (`execution.freqLaneKind`), and the lane rows a split `.mc` or `.temp`
-/// became (`splitLanes`).
+/// became (`splitLanes`). A `.pss` spectrum is not: it reads its period
+/// query's rows (`Session.linkReaders`), so it shoots nothing to batch.
 pub fn batchable(job: requests.Query) bool {
     return switch (job) {
-        .pss => true,
+        .pss => |o| o.harms == 0,
         // `--emir` reads each query's own host batches (#237).
         inline .op, .dc => |o| !o.emir,
         .tran => |o| !o.point.emir,
@@ -214,13 +215,14 @@ pub fn hashFields(h: *std.hash.Wyhash, value: anytype) void {
 }
 
 /// How many lane rows `append` splits `job` into (#213): one per `.mc`
-/// trial or variant and per `.temp` temperature, each solved alone; 0 for
-/// a job it keeps whole.
+/// trial or variant, per `.temp` temperature and per `.dc` segment
+/// (`Dc.segments`), each solved alone; 0 for a job it keeps whole.
 pub fn splitLanes(job: requests.Query) u32 {
     const n: usize = switch (job) {
         .mc => |o| if (o.lane != null) 0 else if (o.variants.count != 0) o.variants.count else o.n_trials,
         // Unvalidated: NaN and huge spans fail the comparison.
         .temp => |o| if (o.lane == null and o.t_step > 0 and (o.t_stop - o.t_start) / o.t_step < max_split) temp_sweep.numPoints(o) else 0,
+        .dc => |o| if (o.lane == null) o.segments() else 0,
         else => 0,
     };
     return if (n >= 2 and n <= max_split) @intCast(n) else 0;

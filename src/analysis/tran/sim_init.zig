@@ -14,11 +14,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
 const converger = @import("solver").converger;
+const circuit_devices = @import("../circuit_devices.zig");
 const Stream = @import("measure").Stream;
 const root = @import("../types.zig");
 const host_ops = @import("host_ops.zig");
 const integrator = @import("integrator.zig");
 const Sim = @import("Sim.zig");
+const bound_lanes = @import("bound_lanes.zig");
 const Tangents = @import("Tangents.zig");
 const tran_types = @import("types.zig");
 
@@ -28,6 +30,19 @@ const TranHook = Sim.TranHook;
 const lteSnap = host_ops.lteSnap;
 const nextBp = Sim.nextBp;
 const newtonOptions = Sim.newtonOptions;
+
+/// `Sim.rebase_batches`, `rebase_rows` and `q_scratch`, owned together.
+const Narrow = struct {
+    batches: []u32 = &.{},
+    rows: []u32 = &.{},
+    scratch: []f64 = &.{},
+
+    fn free(self: Narrow, gpa: std.mem.Allocator) void {
+        gpa.free(self.scratch);
+        gpa.free(self.rows);
+        gpa.free(self.batches);
+    }
+};
 
 /// Everything `simulateWith` did before its step loop, in its order:
 /// scratch, the charge rings, uic bookkeeping, the baseline, history
@@ -124,6 +139,38 @@ pub fn init(
     const lte_state = try allocator.alloc(f64, if (n_qt > 0) n_parts * n_lt else 0);
     errdefer allocator.free(lte_state);
     const qt_ring = ring(lte_state, n_parts);
+    // N3 part 2. Off the paths whose step-end re-read is not `rebase`'s
+    // host one at the accept pass's time: OPtran (t_dev = 0), tangents
+    // (`advance` restamps between) and a VPI host.
+    const narrow: Narrow = if (ckt.knobs.perf.n3 and has_charge and ckt.has_state_q and
+        !options.sources_at_zero and tangents == null and ckt.vpi == null)
+        try narrowRebase(ckt, allocator)
+    else
+        .{};
+    errdefer narrow.free(allocator);
+    // N7: the order <= 2 bound on the evaluation's lanes, past the size a
+    // pass's wake and join pay for.
+    const n_bound = if (n_qt > 0) n_lt else n;
+    const lanes: usize = if (ckt.par_eval) |pe| pe.n_lanes else 1;
+    const bound_chunk = bound_lanes.chunkOf(@max(n_bound, 1), lanes);
+    const bound_mins = try allocator.alloc(f64, if (ckt.knobs.perf.n7 and lanes > 1 and n_bound >= bound_lanes.min_states)
+        std.math.divCeil(usize, n_bound, bound_chunk) catch unreachable
+    else
+        0);
+    errdefer allocator.free(bound_mins);
+    // N3 part 1: the serial host passes record what the accept pass reuses
+    // (`circuit_devices.acceptStaged`); `Sim.deinit` turns it off.
+    if (ckt.knobs.perf.n3 and has_charge and ckt.gpuContext() == null)
+        circuit_devices.setChargeTracking(ckt, true);
+    errdefer circuit_devices.setChargeTracking(ckt, false);
+    // N6's census, stats only, over the serial host passes; `Sim.deinit`
+    // prints it. A batch whose snapshots fail to allocate runs without.
+    if (ckt.knobs.tran_stats and ckt.gpuContext() == null and ckt.par_eval == null) for (ckt.batches) |b| {
+        if (b.hooks.census) |census| _ = census(b.ctx, true);
+    };
+    errdefer if (ckt.knobs.tran_stats) for (ckt.batches) |b| {
+        if (b.hooks.census) |census| _ = census(b.ctx, false);
+    };
 
     s.* = .{
         .ckt = ckt,
@@ -135,6 +182,7 @@ pub fn init(
         .tangents = tangents,
         .stream = stream,
         .ws = ws,
+        .nr_opts = newtonOptions(options),
         .n = n,
         .has_charge = has_charge,
         .x_try = x_try,
@@ -153,6 +201,11 @@ pub fn init(
         .qt_i_prev = lte_state[0 .. lte_state.len / n_parts],
         .qt_ring = qt_ring,
         .qt_g = qt_ring[n_hist],
+        .rebase_batches = narrow.batches,
+        .rebase_rows = narrow.rows,
+        .q_scratch = narrow.scratch,
+        .bound_mins = bound_mins,
+        .bound_chunk = bound_chunk,
         // Set below, in `simulateWith`'s order.
         .effective_dt_max = undefined,
         .delmin = undefined,
@@ -172,6 +225,7 @@ pub fn init(
         .dt_old = undefined,
         .steps = 0,
         .stats_on = ckt.knobs.tran_stats,
+        .clock = .{ .io = ws.prof.io },
         .st = .{},
         .order = 1,
         .run_order = 1,
@@ -284,7 +338,7 @@ pub fn init(
             .q_cur = {},
             .has_charge = has_charge,
         }, options);
-        try waveform.record(0, x0, probes);
+        try waveform.recordStep(0, x0, probes, .{ .h = 0, .method = .backward_euler });
         if (stream) |sm| sm.feed(0, x0, waveform.data());
     }
     if (s.vpi) |v| v.accept(v.ctx, true, false);
@@ -311,6 +365,58 @@ pub fn init(
 }
 
 // ---- private ----
+
+/// A batch whose charges can move between the accept pass and `rebase`:
+/// it stages (`update_state`, which also clears `analog_initial`), keeps
+/// delay history (`commit_state`) or latches at the commit (`state_ctl`).
+fn keepsState(b: @import("device").abi.Batch) bool {
+    return b.hooks.update_state != null or b.hooks.commit_state != null or b.hooks.state_ctl != null;
+}
+
+/// N3 part 2's tables: the rows every stateful charge batch stamps (its
+/// `scatter_tapes` rows, a superset of its charge rows), and the charge
+/// batches to re-read, those stateful ones and every one stamping such a
+/// row, so each copied row's sum has all its terms. Empty when no charge
+/// batch would be left out.
+/// ponytail: per batch, as the hooks show it. Re-reading only the batches
+/// whose charge reads a state the commit writes, and within those the
+/// instances whose commit moved it, needs that per-model fact from VerA.
+fn narrowRebase(ckt: *const root.Circuit, gpa: std.mem.Allocator) !Narrow {
+    const n: usize = ckt.n;
+    // Row n is the trash every ground stamp lands on: never copied, and
+    // marking it would pull in every batch with a grounded charge.
+    const touched = try gpa.alloc(bool, n + 1);
+    defer gpa.free(touched);
+    @memset(touched, false);
+    for (ckt.batches) |b| if (b.has_charge and keepsState(b)) {
+        for (b.hooks.scatter_tapes(b.ctx).rows) |r| {
+            assert(r <= n);
+            touched[r] = r < n;
+        }
+    };
+    var picked: std.ArrayList(u32) = .empty;
+    defer picked.deinit(gpa);
+    var skipped = false;
+    for (ckt.batches, 0..) |b, i| {
+        if (b.hooks.eval_q == null) continue;
+        const reread = keepsState(b) or for (b.hooks.scatter_tapes(b.ctx).rows) |r| {
+            if (touched[r]) break true;
+        } else false;
+        if (reread) try picked.append(gpa, @intCast(i)) else skipped = true;
+    }
+    if (!skipped) return .{};
+    var rows: std.ArrayList(u32) = .empty;
+    defer rows.deinit(gpa);
+    for (touched[0..n], 0..) |hit, r| if (hit) try rows.append(gpa, @intCast(r));
+    const scratch = try gpa.alloc(f64, n + 1);
+    errdefer gpa.free(scratch);
+    const rows_owned = try rows.toOwnedSlice(gpa);
+    errdefer gpa.free(rows_owned);
+    const batches_owned = try picked.toOwnedSlice(gpa);
+    assert(batches_owned.len > 0);
+    return .{ .batches = batches_owned, .rows = rows_owned, .scratch = scratch };
+}
+
 /// The t = 0 row: `x` itself after an operating point. Under uic no
 /// operating point ran and `x` holds only the `.ic` values, which break KVL
 /// (V1 = 2 V read as 0 V, #161), so the row is instead one step solve over

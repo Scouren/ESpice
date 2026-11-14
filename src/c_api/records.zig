@@ -160,13 +160,13 @@ const ProgressEvent = @typeInfo(@FieldType(api.QueryInfo, "progress")).optional.
 comptime {
     if (header.ESPICE_NO_QUERY != no_query) @compileError("include/espice.h ESPICE_NO_QUERY drifted");
     if (header.ESPICE_PLOT_TITLE != no_query) @compileError("include/espice.h ESPICE_PLOT_TITLE drifted");
+    if (header.ESPICE_NGSPICE != 0) @compileError("include/espice.h ESPICE_NGSPICE drifted");
 }
 
 // Enums cross the boundary as tag values, so each is pinned to the header's
 // ESPICE_<NAME> constants: a reordered or renamed tag fails the build.
 comptime {
     pinTags(Code, .{});
-    pinTags(api.Dialect, .{});
     pinTags(api.Request, .{});
     pinTags(api.Format, .{});
     pinTags(api.Status, .{ .failed = "QUERY_FAILED" });
@@ -213,6 +213,8 @@ comptime {
 pub fn status(err: anyerror) u32 {
     const code: Code = switch (err) {
         error.InvalidArgument, error.InvalidConcurrency, error.InvalidComponent, error.QueryNotReady, error.DuplicateQuery => .invalid_argument,
+        // A dialect other than ngspice: spice2rack translates it first.
+        error.UnsupportedDialect => .invalid_argument,
         // Malformed caller input (analysis cards, query options, directive edits), not a numerical failure.
         error.InvalidAnalysisArguments, error.InvalidQueryOptions, error.UnsupportedDirectiveMutation => .invalid_argument,
         // A live parameter name the deck does not define or declare.

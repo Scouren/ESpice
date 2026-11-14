@@ -1,0 +1,4 @@
+* deck.hsp: the HSPICE-named input of the spicerack/ checks in tests/test_correctness.zig
+* The fake spice2rack never reads it, and it holds no circuit: read
+* natively, it cannot give twin.sp's results.
+.end

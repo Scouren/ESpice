@@ -9,14 +9,21 @@
 // L1 and L2 own their self flux, so a self term here would count the winding
 // inductance twice; a flipped sign breaks passivity.
 //
-// `k` holds the MUTUAL INDUCTANCE M = k*sqrt(L1*L2) in henries, not the
-// dimensionless coefficient: only the builder knows L1/L2, and it writes M
-// back into `model.k`. The default 0 leaves an unresolved coupling inert.
+// `k` holds the MUTUAL INDUCTANCE M = k*sqrt(L1*L2) in henries at the
+// windings' nominal values, not the dimensionless coefficient: only the
+// builder knows L1/L2, and it writes M back into `model.k`. The default 0
+// leaves an unresolved coupling inert.
+//
+// Temperature: ngspice's M reads each L after its temperature update
+// (muttemp.c:50-56 on indtemp.c:63-79), so M(T) = k*sqrt(|L1(T)*L2(T)|) is
+// the nominal M times sqrt(|f1*f2|), each f the winding's own
+// 1 + tc1*dt + tc2*dt^2. The builder copies each L card's tnom, temp,
+// dtemp, tc1 and tc2 into `l1*`/`l2*`; with no tempco both f are 1 exactly.
 //
 // `br1`/`br2` are terminals because that is Verilog-A's only handle on an
 // unknown the module does not own. The builder (addKinduc) binds them to
 // L1/L2's branch-current unknowns, so V(brX) reads that current and I(brX)
-// writes that inductor's KVL row: `I(br1) <+ -k*ddt(V(br2))` is Q[br1] = -k*x.br2.
+// writes that inductor's KVL row: `I(br1) <+ ddt(-m*V(br2))` is Q[br1] = -m*x.br2.
 
 `include "constants.vams"
 `include "disciplines.vams"
@@ -25,10 +32,29 @@ module kinduc(br1, br2);
     inout br1, br2;
     electrical br1, br2;
 
-    parameter real k = 0.0;  // H  resolved mutual inductance M (sign = polarity)
+    parameter real k = 0.0;        // H         resolved nominal M (sign = polarity)
+    parameter real l1tnom = 27.0;  // degC      L1's nominal temperature
+    parameter real l1temp = 27.0;  // degC      L1's absolute override
+    parameter real l1dtemp = 0.0;  // degC      L1's offset, unless l1temp
+    parameter real l1tc1 = 0.0;    // 1/degC    L1's linear tempco
+    parameter real l1tc2 = 0.0;    // 1/degC^2  L1's quadratic tempco
+    parameter real l2tnom = 27.0;  // degC      the same for L2
+    parameter real l2temp = 27.0;
+    parameter real l2dtemp = 0.0;
+    parameter real l2tc1 = 0.0;
+    parameter real l2tc2 = 0.0;
+
+    real t1, t2, m;
 
     analog begin
-        I(br1) <+ -k * ddt(V(br2));
-        I(br2) <+ -k * ddt(V(br1));
+        t1 = $temperature - 273.15 + l1dtemp;
+        if ($param_given(l1temp)) t1 = l1temp;
+        t1 = t1 - l1tnom;
+        t2 = $temperature - 273.15 + l2dtemp;
+        if ($param_given(l2temp)) t2 = l2temp;
+        t2 = t2 - l2tnom;
+        m = k * sqrt(abs((1.0 + t1 * (l1tc1 + l1tc2 * t1)) * (1.0 + t2 * (l2tc1 + l2tc2 * t2))));
+        I(br1) <+ ddt(-m * V(br2));
+        I(br2) <+ ddt(-m * V(br1));
     end
 endmodule

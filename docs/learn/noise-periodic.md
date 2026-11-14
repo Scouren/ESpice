@@ -95,7 +95,7 @@ output node: it reports the last node the deck names, `out` here.
 Related cards: `.pnoise` (noise around the periodic solution), `.pxf`
 (transfer from every source), `.hbac`, `.hbnoise` and `.hbxf` (the same on
 the harmonic-balance solution), `.qpss` (two incommensurate tones) and
-`.hbosc` / `.pss v(node) f` for oscillators. The
+`.hb v(node) f` / `.pss v(node) f` for oscillators. The
 [analyses reference](../using/analyses.md) has them all.
 
 ## Exercises

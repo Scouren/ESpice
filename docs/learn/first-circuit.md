@@ -67,7 +67,7 @@ a path to ground from every node, or it has no DC solution.
 for the DC operating point. `.end` marks the end of the deck; anything
 after it is ignored.
 
-**Case.** The ngspice and HSPICE dialects ignore case: `R1` and `r1` name the
+**Case.** ESPice ignores case: `R1` and `r1` name the
 same element, and result columns come out lowercase (`v(out)`).
 
 ## Values and suffixes

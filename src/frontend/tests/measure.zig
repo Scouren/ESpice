@@ -4,7 +4,7 @@
 //! error only from `ParseError`, `OutOfMemory` or the context's own.
 const std = @import("std");
 const core = @import("core");
-const measure = @import("../measure.zig");
+const measure = @import("../Parse/measure.zig");
 const Smith = std.testing.Smith;
 const Seeded = @import("seeded.zig").Seeded;
 

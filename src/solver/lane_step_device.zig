@@ -6,10 +6,11 @@
 //!
 //! Contents:
 //! - `pub fn predict(n_lanes: u64, n: u64, sc: P(LaneScalars), cur: P(f64), prev: P(f64), x: P(f64), x_old: P(f64)) callconv(gompute.kernel_callconv) void`
-//! - `pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip_qt: P(f64), n_hist: u64, n_qt: u64, lte_in: P(lk.LteIn), out: P([2]f64)) callconv(gompute.kernel_callconv) void`
-//! - `pub fn accept(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, charge: u64, sc: P(LaneScalars), mask: P(u8), x: P(f64), cur: P(f64), prev: P(f64), q: P(f64), ring: P(f64), ip: P(f64), ring_qt: P(f64), ip_qt: P(f64)) callconv(gompute.kernel_callconv) void`
+//! - `pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip_qt: P(f64), n_hist: u64, n_qt: u64, lte_in: P(lk.LteIn), out: P([2]f64), gear: P(lk.LaneGear), out_gear: P([2]f64)) callconv(gompute.kernel_callconv) void`
+//! - `pub fn accept(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, charge: u64, sc: P(LaneScalars), mask: P(u8), x: P(f64), cur: P(f64), prev: P(f64), q: P(f64), ring: P(f64), ip: P(f64), ring_qt: P(f64), ip_qt: P(f64), perm_q: P(u8), perm_qt: P(u8), gear: P(lk.LaneGear)) callconv(gompute.kernel_callconv) void`
 //! - `pub fn rebase(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, sc: P(LaneScalars), mask: P(u8), q: P(f64), ring: P(f64), ip: P(f64), ring_qt: P(f64), ip_qt: P(f64)) callconv(gompute.kernel_callconv) void`
 //! - `pub fn gather(n_lanes: u64, sc: P(LaneScalars), x: P(f64), probes: P(u32), n_probes: u64, out: P(f64)) callconv(gompute.kernel_callconv) void`
+//! - `pub fn lteFix(n_lanes: u64, m: u64, n_lt: u64, mask: P(u8), slot0: P(u8), dst: P(u32), src: P(u32), q: P(f64), ring_qt: P(f64)) callconv(gompute.kernel_callconv) void`
 //! - `pub fn stepBegin(n_lanes: u64, steps: P(lk.LaneStep), sc: P(LaneScalars), sims: P(SimState), lte_in: P(lk.LteIn), round: P(u8), ops: P(u8), acc: P(u8)) callconv(gompute.kernel_callconv) void`
 //! - `pub fn settle(n_lanes: u64, steps: P(lk.LaneStep), active: P(u8), decide: P(u8), sc: P(LaneScalars)) callconv(gompute.kernel_callconv) void`
 //! - `pub fn setLimw(n_lanes: u64, mask: P(u8), limw: P(u32), value: u64) callconv(gompute.kernel_callconv) void`
@@ -48,8 +49,10 @@ pub fn predict(n_lanes: u64, n: u64, sc: P(LaneScalars), cur: P(f64), prev: P(f6
 /// The step's LTE bounds per round lane, from its tape ring (lane-major:
 /// entry j of lane l's physical slot k at `(k * n_qt + j) * N + l`):
 /// `out[l] = { del at the step's method, del of the order-2 promotion
-/// probe (order-1 lanes) }`.
-pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip_qt: P(f64), n_hist: u64, n_qt: u64, lte_in: P(lk.LteIn), out: P([2]f64)) callconv(gompute.kernel_callconv) void {
+/// probe (order-1 lanes) }`; in a gear-3..6 run (`lk.gear_run`) the order
+/// control's asks too, `out_gear[l] = { del one order down, one up }`
+/// (NaN where `Sim.end` cannot ask).
+pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip_qt: P(f64), n_hist: u64, n_qt: u64, lte_in: P(lk.LteIn), out: P([2]f64), gear: P(lk.LaneGear), out_gear: P([2]f64)) callconv(gompute.kernel_callconv) void {
     const l = lane();
     if (l >= n_lanes) return;
     const s = sc[l];
@@ -63,7 +66,20 @@ pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip
     const ip = ip_qt + L;
     const method: u8 = @intCast(s.method);
     const c = lte_in[l];
-    const del = lk.stepBound(method, method, q[0], q[1], q[2], q[3], ip, m, N, c);
+    var del: f64 = undefined;
+    if (s.flags & lk.gear_run != 0) {
+        const gr = gear[l];
+        var qg: [8]P(f64) = undefined;
+        for (0..8) |k| qg[k] = ring_qt + @as(usize, perm_qt[L * nh + @min(k, nh - 1)]) * m * N + L;
+        const down: u8 = if (method >= 3) method - 1 else 0;
+        const up: u8 = if (method >= 2 and method < gr.top) method + 1 else 0;
+        const nan: f64 = @bitCast(@as(u64, 0x7ff8000000000000));
+        out_gear[l] = .{
+            if (down != 0) lk.stepBoundGear(down, method, qg, ip, m, N, c, gr) else nan,
+            if (up != 0) lk.stepBoundGear(up, method, qg, ip, m, N, c, gr) else nan,
+        };
+        del = if (method >= 3) lk.stepBoundGear(method, method, qg, ip, m, N, c, gr) else lk.stepBound(method, method, q[0], q[1], q[2], q[3], ip, m, N, c);
+    } else del = lk.stepBound(method, method, q[0], q[1], q[2], q[3], ip, m, N, c);
     const del2 = if (method == 0) lk.stepBound(@intCast((s.flags >> 4) & 3), method, q[0], q[1], q[2], q[3], ip, m, N, c) else del;
     out[l] = .{ del, del2 };
 }
@@ -73,10 +89,12 @@ pub fn lte(n_lanes: u64, sc: P(LaneScalars), ring_qt: P(f64), perm_qt: P(u8), ip
 /// into the row ring's logical slot 0, and `advanceCurrent` (`ip = ag0 (q0
 /// - q1) - history`) over rows and over the tape. The slots are the
 /// pre-rotation ones in `sc[l].sq`/`sqt`; the host has rotated the
-/// permutations for the next step already.
-pub fn accept(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, charge: u64, sc: P(LaneScalars), mask: P(u8), x: P(f64), cur: P(f64), prev: P(f64), q: P(f64), ring: P(f64), ip: P(f64), ring_qt: P(f64), ip_qt: P(f64)) callconv(gompute.kernel_callconv) void {
+/// permutations for the next step already. At gear-3..6 the older slots
+/// come from `perm_q`/`perm_qt`, which `apply` uploads after this kernel,
+/// so the device's are still pre-rotation.
+pub fn accept(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, charge: u64, sc: P(LaneScalars), mask: P(u8), x: P(f64), cur: P(f64), prev: P(f64), q: P(f64), ring: P(f64), ip: P(f64), ring_qt: P(f64), ip_qt: P(f64), perm_q: P(u8), perm_qt: P(u8), gear: P(lk.LaneGear)) callconv(gompute.kernel_callconv) void {
     const tid = gompute.globalIdX(block);
-    _ = n_hist; // the lane-major tape ring needs no per-lane base
+    const nh: usize = @intCast(n_hist);
     if (tid >= (n + n_qt) * n_lanes) return;
     const l: usize = @intCast(tid % n_lanes);
     if (mask[l] == 0) return;
@@ -91,12 +109,25 @@ pub fn accept(n_lanes: u64, n: u64, n_qt: u64, n_hist: u64, charge: u64, sc: P(L
         if (charge == 0) return;
         const q0 = q[i];
         ring[(@as(usize, s.sq[0]) * nn + e) * N + l] = q0;
+        if (s.method >= 3) {
+            var h: [8]f64 = @splat(0);
+            h[0] = q0;
+            for (1..@as(usize, s.method) + 1) |k| h[k] = ring[(@as(usize, perm_q[l * nh + k]) * nn + e) * N + l];
+            ip[i] = lk.companionGear(false, @intCast(s.method), gear[l].ag, h, 0);
+            return;
+        }
         const q1 = ring[(@as(usize, s.sq[1]) * nn + e) * N + l];
         const q2 = ring[(@as(usize, s.sq[2]) * nn + e) * N + l];
         ip[i] = advance(s, q0, q1, q2, ip[i]);
     } else {
         const j = e - nn;
         const m: usize = @intCast(n_qt);
+        if (s.method >= 3) {
+            var h: [8]f64 = @splat(0);
+            for (0..@as(usize, s.method) + 1) |k| h[k] = ring_qt[(@as(usize, perm_qt[l * nh + k]) * m + j) * N + l];
+            ip_qt[j * N + l] = lk.companionGear(false, @intCast(s.method), gear[l].ag, h, 0);
+            return;
+        }
         const q0 = ring_qt[(@as(usize, s.sqt[0]) * m + j) * N + l];
         const q1 = ring_qt[(@as(usize, s.sqt[1]) * m + j) * N + l];
         const q2 = ring_qt[(@as(usize, s.sqt[2]) * m + j) * N + l];
@@ -141,6 +172,17 @@ pub fn gather(n_lanes: u64, sc: P(LaneScalars), x: P(f64), probes: P(u32), n_pro
     if (sc[l].flags & 1 == 0) return;
     const k: usize = @intCast(tid / n_lanes);
     out[l * @as(usize, @intCast(n_probes)) + k] = x[@as(usize, probes[k]) * @as(usize, @intCast(n_lanes)) + l];
+}
+
+/// `lk.lteFix` per lane of `mask` on its tape ring slot `slot0[l]`, after
+/// a charge pass: one thread per lane, `m` entries each.
+pub fn lteFix(n_lanes: u64, m: u64, n_lt: u64, mask: P(u8), slot0: P(u8), dst: P(u32), src: P(u32), q: P(f64), ring_qt: P(f64)) callconv(gompute.kernel_callconv) void {
+    const l = lane();
+    if (l >= n_lanes) return;
+    if (mask[l] == 0) return;
+    const L: usize = l;
+    const N: usize = @intCast(n_lanes);
+    lk.lteFix(@intCast(m), dst, src, q + L, ring_qt + @as(usize, slot0[l]) * @as(usize, @intCast(n_lt)) * N + L, N);
 }
 
 /// `lk.stepBegin` per lane: the round's scalars, `SimState`, LTE inputs and
@@ -230,7 +272,7 @@ pub fn stepEndB(n_lanes: u64, steps: P(lk.LaneStep), best: P(f64), report: P(lk.
     if (l >= n_lanes) return;
     const s = &steps[l];
     lk.stepEndB(s, best[l]);
-    report[l] = .{ .t_new = s.t_new, .t = s.t, .dt = s.dt, .attempted_dt = s.attempted_dt, .attempts = s.attempts, .steps = s.steps, .event = s.event, .status = s.status };
+    report[l] = .{ .t_new = s.t_new, .t = s.t, .dt = s.dt, .attempted_dt = s.attempted_dt, .attempts = s.attempts, .steps = s.steps, .event = s.event, .status = s.status, .method = s.step_method };
 }
 
 /// The round's report and probe rows of every lane into ring slot

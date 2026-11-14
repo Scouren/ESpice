@@ -2,8 +2,8 @@
 //! analyses, variants, saves and refusals, against hand-worked expectations
 //! (and, for runtime-registered devices, the same model built in).
 const std = @import("std");
-const input = @import("../prepare.zig");
-const analyses = @import("../analyses.zig");
+const input = @import("../Jobs.zig");
+const analyses = @import("../Jobs/analyses.zig");
 const netlist = @import("netlist");
 const core = @import("core");
 const requests = @import("core").query;
@@ -18,13 +18,13 @@ fn build(sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: netli
     return input.build(&lib, sim_arena, parse_arena, nl);
 }
 
-fn prepare(io: std.Io, session: std.mem.Allocator, source: input.Source, dialect: input.Dialect) !netlist.Netlist {
-    return input.prepare(io, session, source, dialect, &.{}, .{});
+fn prepare(io: std.Io, session: std.mem.Allocator, source: input.Source) !netlist.Netlist {
+    return input.prepare(io, session, source, &.{});
 }
 const resolveQueries = input.resolveQueries;
 
 fn parse(arena: std.mem.Allocator, src: []const u8) !netlist.Netlist {
-    return netlist.parse(arena, src, .ngspice);
+    return netlist.parse(arena, src);
 }
 
 /// The only card of `src`, with output node row 1 and no reference.
@@ -46,34 +46,45 @@ test "analysis directives dispatch every implemented capability and reject malfo
     // `.fft` reads the deck's `.tran`, `.acmatch` its `.ac`.
     const ctx: analyses.CardContext = .{ .arena = a, .tran = .{ .t_stop = 10e-6, .dt_init = 1e-6 }, .ac = .{ .f_start = 10, .f_stop = 100 } };
     const directives = [_][]const u8{
-        ".ac dec 2 10 100",                     ".dc vin 0 1 0.1",                            ".dcmatch v(out)",
-        ".disto dec 2 10 100",                  ".envelope 1m 5m",                            ".four 1k v(out)",
-        ".hb 1k",                               ".matex 1u 10u",                              ".mc 4",
-        ".noise v(out) vin dec 2 10 100",       ".op",                                        ".pac 1k dec 2 10 100",
-        ".pnoise v(out) vin dec 2 10 100 1k 0", ".pss 1k 128",                                ".pxf 1k dec 2 10 100",
-        ".pz",                                  ".qpss 1k 1414 1 1",                          ".sens v(out)",
-        ".sp dec 2 10 100",                     ".stb vin dec 2 10 100",                      ".temp -40 125 55",
-        ".tf v(out) vin",                       ".tran 1u 10u",                               ".tran_noise 1u 10u",
-        ".hbac dec 2 10 100 1k",                ".hbnoise v(out) vin dec 2 10 100 1k 4 2",    ".hbxf v(out) dec 2 10 100 1k",
-        ".phasenoise v(out) dec 2 10 100 1meg", ".lstb mode=single vsource=vin dec 2 10 100", ".acxf v(out) dec 2 10 100",
-        ".dcxf v(out) tf",                      ".dcinc",                                     ".fft v(out)",
-        ".acmatch v(out)",                      ".dcsens v(out)",                             ".hblin dec 2 10 100",
+        ".ac dec 2 10 100",                           ".dc vin 0 1 0.1",              ".dcmatch v(out)",
+        ".disto dec 2 10 100",                        ".envelope 1m 5m",              ".four 1k v(out)",
+        ".hb 1k",                                     ".matex 1u 10u",                ".mc 4",
+        ".noise v(out) vin dec 2 10 100",             ".op",                          ".pac 1k dec 2 10 100",
+        ".pnoise v(out) vin dec 2 10 100 1k 0",       ".pss 1k 128",                  ".pxf 1k dec 2 10 100",
+        ".pz",                                        ".qpss 1k 1414 1 1",            ".sens v(out)",
+        ".sp dec 2 10 100",                           ".stb vin dec 2 10 100",        ".tf v(out) vin",
+        ".tran 1u 10u",                               ".trannoise 1u 10u",            ".hbac dec 2 10 100 1k",
+        ".hbnoise v(out) vin dec 2 10 100 1k 4 2",    ".hbxf v(out) dec 2 10 100 1k", ".phasenoise v(out) dec 2 10 100 1meg",
+        ".lstb mode=single vsource=vin dec 2 10 100", ".acxf v(out) dec 2 10 100",    ".dcxf v(out) tf",
+        ".dcinc",                                     ".fft v(out)",                  ".acmatch v(out)",
+        ".dcsens v(out)",                             ".hblin dec 2 10 100",
     };
-    const kinds = @typeInfo(requests.Kind).@"enum".field_names;
+    // The temperature sweep query has no card: every `.temp` is
+    // configuration, as in ngspice 44.2, and `.dc temp` sweeps.
+    const all = @typeInfo(requests.Kind).@"enum".field_names;
+    const kinds = comptime blk: {
+        var out: [all.len - 1][:0]const u8 = undefined;
+        var k: usize = 0;
+        for (all) |name| if (!std.mem.eql(u8, name, "temp")) {
+            out[k] = name;
+            k += 1;
+        };
+        break :blk out;
+    };
     try std.testing.expectEqual(kinds.len, directives.len);
     inline for (directives, kinds) |directive, name| {
         const id = @field(requests.Kind, name);
-        const job = (try analyses.buildJob(try card(a, directive), sources, cards, ctx)).?;
+        const job = try analyses.buildJob(try card(a, directive), sources, cards, ctx);
         try std.testing.expectEqual(id, std.meta.activeTag(job));
         if (job == .pss) try std.testing.expectEqual(@as(f64, 1e-3), job.pss.period);
     }
     const malformed = [_][]const u8{
-        ".ac dec 0 1 10",                  ".ac dec -1 1 10",     ".ac dec 2.5 1 10",                      ".ac dec 2 10 1",
-        ".ac lin 2 -1 10",                 ".dc missing 0 1 0.1", ".dc vin 0 1 0",                         ".dc vin 0 1 -1",
-        ".dc vin 0 1 1 missing 0 1 1",     ".tran 0 1u",          ".tran 1u 2u 2u",                        ".pss 0",
-        ".pss 1k 2m v(out) 128 4 50 1m",   ".mc 65536",           ".pnoise v(out) vin dec 2 10 100 1k -1", ".pz in 0 out 0 vol pz",
-        ".tf v(out) missing",              ".temp -300 125 55",   ".lstb mode=diff vsource=vin",           ".lstb mode=single vsource=vin,vin",
-        ".lstb mode=sideways vsource=vin", ".dcxf v(out) zin",    ".acxf v(out) dec 2 10 100 tf extra",
+        ".ac dec 0 1 10",                    ".ac dec -1 1 10",                 ".ac dec 2.5 1 10",                      ".ac dec 2 10 1",
+        ".ac lin 2 -1 10",                   ".dc missing 0 1 0.1",             ".dc vin 0 1 0",                         ".dc vin 0 1 -1",
+        ".dc vin 0 1 1 missing 0 1 1",       ".tran 0 1u",                      ".tran 1u 2u 2u",                        ".pss 0",
+        ".pss 1k 2m out 128 4 50 1m bad",    ".mc 65536",                       ".pnoise v(out) vin dec 2 10 100 1k -1", ".pz in 0 out 0 vol pz",
+        ".tf v(out) missing",                ".dc temp -300 125 55",            ".dc vin 0 1 1 temp -300 20 10",         ".lstb mode=diff vsource=vin",
+        ".lstb mode=single vsource=vin,vin", ".lstb mode=sideways vsource=vin", ".dcxf v(out) zin",                      ".acxf v(out) dec 2 10 100 tf extra",
     };
     for (malformed) |directive| {
         if (analyses.buildJob(try card(a, directive), sources, cards, ctx)) |_| {
@@ -83,14 +94,202 @@ test "analysis directives dispatch every implemented capability and reject malfo
     }
     // `.lstb` without its own sweep takes the deck's `.ac` grid, and needs one.
     const bare = try card(a, ".lstb mode=single vsource=vin");
-    try std.testing.expectEqual(@as(f64, 100), (try analyses.buildJob(bare, sources, cards, ctx)).?.lstb.sweep.f_stop);
+    try std.testing.expectEqual(@as(f64, 100), (try analyses.buildJob(bare, sources, cards, ctx)).lstb.sweep.f_stop);
     try std.testing.expectError(error.MissingAnalysisCard, analyses.buildJob(bare, sources, cards, .{ .arena = a }));
     // HB and QPSS drive from whatever sources the deck stamps, current ones
     // included, so a deck without a V card is valid.
     const no_v: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
     for ([_][]const u8{ ".hb 1k", ".qpss 1k 1414 1 1" }) |directive| _ = try analyses.buildJob(try card(a, directive), no_v, cards, ctx);
-    // A single `.temp` is deck configuration, not a query.
-    try std.testing.expectEqual(null, try analyses.buildJob(try card(a, ".temp 50"), sources, cards, ctx));
+}
+
+// Oracle: ngspice 44.2 -b on `v1 a 0 1` / `r1 a 0 1k tc1=0.01` / `.op`,
+// each order measured ("Doing analysis at TEMP = ..."): only the last
+// `.temp` counts and it beats every `.options temp`, before or after it;
+// a `.temp` of other than one value warns and runs at 27 degC; without
+// `.temp`, the last `.options temp` wins.
+test ".temp and .options temp give ngspice 44.2's temperature in every order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const u8, f64 }{
+        .{ ".temp 50\n.options temp=30\n", 50 },
+        .{ ".options temp=30\n.temp 50\n", 50 },
+        .{ ".temp 25 50\n.options temp=30\n", 27 },
+        .{ ".options temp=30\n.temp 25 50\n", 27 },
+        .{ ".temp 25 50 75\n.options temp=30\n", 27 },
+        .{ ".temp 50\n.temp 25 40\n", 27 },
+        .{ ".temp 25 40\n.temp 50\n", 50 },
+        .{ ".options temp=30\n.options temp=40\n", 40 },
+    };
+    for (cases) |case| {
+        const nl = try parse(a, try std.mem.concat(a, u8, &.{ "t\nv1 a 0 1\nr1 a 0 1k tc1=0.01\n", case[0], ".op\n.end\n" }));
+        try std.testing.expectEqual(@as(?f64, case[1]), (try analyses.deckOptions(nl.deck.config)).temp_c);
+        // `.op` is the only analysis: no `.temp` card is one.
+        try std.testing.expectEqual(@as(usize, 1), nl.deck.analyses.len);
+    }
+}
+
+// Oracle: ngspice 44.2 -b, measured. `.options gmindc= absv= relv= absi=`
+// runs silently with its defaults, and `method=bdf` prints "unsupported
+// integration method" and keeps the method it had.
+test "HSPICE's option names change nothing, and an unknown method keeps the last one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = try analyses.deckOptions((try parse(a, "aliases\n.options gmindc=1e-9 absv=1e-3 relv=1e-2 absi=1e-6\n.end\n")).deck.config);
+    try std.testing.expectEqual(core.numerics.Tolerances{}, aliases.tol);
+    const bdf = try analyses.deckOptions((try parse(a, "bdf\n.options method=bdf\n.end\n")).deck.config);
+    try std.testing.expectEqual(@as(?requests.Method, null), bdf.method);
+    const kept = try analyses.deckOptions((try parse(a, "kept\n.options method=gear method=bdf\n.end\n")).deck.config);
+    try std.testing.expectEqual(requests.Method.gear_2, kept.method.?);
+}
+
+test "ngspice's 7- or 8-argument .pss is ESPice's oscillator card; up to 4 arguments keep ESPice's forms" {
+    // inp2dot.c:662-701: `.pss gfreq tstab oscnob psspoints harms sciter
+    // steadycoeff [uic]`, colpitt_osc_pss.sp's card. The oracle is the
+    // ESPice form written by hand for the same oscillator: guess 3.1 MHz,
+    // 500 us = 1550 guess periods of settling, phase node 3, 256 samples.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Pss = struct {
+        /// The `.pss` query of `card_text` in a deck whose only net is `3`.
+        fn job(arena_: std.mem.Allocator, card_text: []const u8) !requests.Pss {
+            const nl = try parse(arena_, try std.mem.concat(arena_, u8, &.{ "pss forms\nr1 3 0 1k\nc1 3 0 1n\n", card_text, "\n.end\n" }));
+            const none: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
+            return (try analyses.buildJob(nl.deck.analyses[0], none, &.{}, .{ .arena = arena_ })).pss;
+        }
+    };
+    const espice = try Pss.job(a, ".pss v(3) 3.1e6 256 1550");
+    try std.testing.expect(espice.osc_node != 0);
+    // Plus the ngspice card's own keys: harms 10 spectrum rows, sciter 50
+    // as 51 residual tests (ngspice-45 dcpss.c:874, 908: the counter is
+    // bumped before `> sc_iter` is tested) and steadycoeff 5e-3. Red
+    // before: all three dropped.
+    var ngspice = espice;
+    ngspice.harms = 10;
+    ngspice.max_shooting_iter = 51;
+    ngspice.steady_coeff = 5e-3;
+    try std.testing.expectEqual(ngspice, try Pss.job(a, ".pss 3.1e6 500e-6 3 256 10 50 5e-3"));
+    var uic = ngspice;
+    uic.uic = true;
+    try std.testing.expectEqual(uic, try Pss.job(a, ".pss 3.1e6 500e-6 3 256 10 50 5e-3 uic"));
+    // sciter 0 is one test (red before: refused as no count).
+    try std.testing.expectEqual(@as(u16, 1), (try Pss.job(a, ".pss 3.1e6 500e-6 3 256 10 0 5e-3")).max_shooting_iter);
+    // ESPice's driven form is untouched.
+    try std.testing.expectEqual(@as(u32, 0), (try Pss.job(a, ".pss 3.1e6 256")).osc_node);
+    // An oscnob that names no net (ring_osc_pss.sp's `1`) or ground runs,
+    // as in ngspice, whose INPtermInsert makes the node: the solve picks
+    // its phase node. 624 MHz for 500 ns is 312 guess periods.
+    const picked: requests.Pss = .{ .period = 1 / @as(f64, 624e6), .phase_node = .largest_swing, .osc_settle_periods = 312, .n_samples = 1024, .uic = true, .harms = 10, .max_shooting_iter = 6, .steady_coeff = 5e-3 };
+    try std.testing.expectEqual(picked, try Pss.job(a, ".pss 624e6 500n 1 1024 10 5 5e-3 uic"));
+    var grounded = picked;
+    grounded.uic = false;
+    try std.testing.expectEqual(grounded, try Pss.job(a, ".pss 624e6 500n 0 1024 10 5 5e-3"));
+    // 5 and 6 arguments are neither form; an 8th word other than uic is
+    // refused, where ngspice warns and drops it. So are a sciter that is
+    // no count and a steadycoeff that bounds nothing.
+    for ([_][]const u8{ ".pss 3.1e6 500e-6 3 256 10", ".pss 3.1e6 500e-6 3 256 10 50", ".pss 3.1e6 500e-6 3 256 10 50 5e-3 now", ".pss 3.1e6 -1 3 256 10 50 5e-3", ".pss 3.1e6 500e-6 3 256 10 -1 5e-3", ".pss 3.1e6 500e-6 3 256 10 2.5 5e-3", ".pss 3.1e6 500e-6 3 256 10 50 0" }) |text|
+        try std.testing.expectError(error.InvalidAnalysisArguments, Pss.job(a, text));
+}
+
+test ".ac lin admits 0 Hz at both ends; dec and oct do not (ac-zero.sp)" {
+    // ngspice runs tests/regression/misc/ac-zero.sp's `.ac lin 1 0Hz 0Hz`
+    // as one point at DC; a geometric grid has no ratio from 0.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sources: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
+    const job = try analyses.buildJob(try card(a, ".ac lin 1 0Hz 0Hz"), sources, &.{}, .{ .arena = a });
+    try std.testing.expectEqual(@as(f64, 0), job.ac.sweep.f_stop);
+    try std.testing.expectEqual(@as(u32, 1), job.ac.sweep.count());
+    try core.validate.validate(job, 3);
+    for ([_][]const u8{ ".ac dec 1 0 0", ".ac oct 1 0 0", ".ac lin 1 0 -1" }) |text|
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.buildJob(try card(a, text), sources, &.{}, .{ .arena = a }));
+}
+
+test ".sp's fifth word is ngspice's donoise, on only at 1 (sp1.sp, sp2.sp)" {
+    // inp2dot.c:1074-1076 reads it as an integer; spsetp.c:80 sets
+    // SPdoNoise = (value == 1), so 0 and 2 both leave it off.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sources: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
+    const cases = [_]struct { []const u8, bool }{
+        .{ ".sp lin 100 1e8 1e9  1", true }, .{ ".sp dec 100 1 1e6 0", false },
+        .{ ".sp dec 100 1 1e6 2", false },   .{ ".sp dec 100 1 1e6", false },
+    };
+    for (cases) |case| {
+        const job = try analyses.buildJob(try card(a, case[0]), sources, &.{}, .{ .arena = a });
+        try std.testing.expectEqual(case[1], job.sp.noise);
+    }
+    try std.testing.expectEqual(@as(u32, 100), (try analyses.buildJob(try card(a, ".sp lin 100 1e8 1e9 1"), sources, &.{}, .{ .arena = a })).sp.sweep.count());
+    for ([_][]const u8{ ".sp lin 100 1e8 1e9 1 1", ".sp lin 100 1e8 1e9 yes" }) |text|
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.buildJob(try card(a, text), sources, &.{}, .{ .arena = a }));
+}
+
+test ".sens <out> ac <sweep> carries the grid and each AC source's drive rows (sens-ac-1.sp, sens-ac-2.sp)" {
+    // inp2dot.c:481-570: `.sens <out> [dc | ac dec|oct|lin n f1 f2]`.
+    // Oracle: the cards by hand. sens-ac-1's `ac=42mA` is the keyword form
+    // of the magnitude (isrc.c:16 `acmag`); an I card 0 -> 1 drives +42 mA
+    // into node 1, a V card its branch row, and `ac 2 90` is 2 at 90
+    // degrees, so its unit phasor is j. `i3` has no AC spec and still has
+    // a row, as ngspice still publishes its `_acmag` and `_acphase`: no
+    // drive, a unit of 1 times its m.
+    var session = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer session.deinit();
+    var parse_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parse_arena.deinit();
+    const nl = try parse(parse_arena.allocator(),
+        \\sens ac
+        \\i1 0 1 dc=1.27 ac=42mA
+        \\r1 1 0 1k
+        \\c1 1 0 100p
+        \\v2 2 0 dc 0 ac 2 90
+        \\r2 2 0 1k
+        \\i3 2 0 dc 1m m=3
+        \\.sens v(1) ac lin 1 1e6 1.1e6
+        \\.sens v(1) dc
+        \\.end
+    );
+    var prepared = try build(session.allocator(), parse_arena.allocator(), nl);
+    defer prepared.deinit();
+    const ac = prepared.deck.queries[0].sens;
+    try std.testing.expectEqual(@as(u32, 1), ac.ac.?.count());
+    try std.testing.expectEqual(@as(f64, 1e6), ac.ac.?.f_start);
+    // Found by name: the rows feed name-keyed columns, and ngspice-44.2's
+    // raw file orders them by device type (i1, i3, ..., v2), not by card.
+    try std.testing.expectEqual(@as(usize, 3), ac.ac_sources.len);
+    const row = struct {
+        fn of(rows: anytype, name: []const u8) !@TypeOf(rows[0]) {
+            for (rows) |r| if (std.mem.eql(u8, r.name, name)) return r;
+            return error.TestExpectedEqual;
+        }
+    }.of;
+    const src3 = try row(ac.ac_sources, "i3");
+    try std.testing.expectEqual([2]f64{ 0, 0 }, [2]f64{ src3.re, src3.im });
+    try std.testing.expectEqual([2]f64{ 3, 0 }, src3.unit);
+    try std.testing.expect(src3.pos != core.GROUND);
+    try std.testing.expectEqual(core.GROUND, src3.neg);
+    const src1 = try row(ac.ac_sources, "i1");
+    try std.testing.expectEqual(core.GROUND, src1.pos);
+    try std.testing.expectEqual(ac.output_node, src1.neg);
+    try std.testing.expectEqual(@as(f64, 0.042), src1.re);
+    try std.testing.expectEqual([2]f64{ 1, 0 }, src1.unit);
+    try std.testing.expectEqual(@as(f64, 0.042), prepared.deck.ac_drive[src1.neg]);
+    const v2 = try row(ac.ac_sources, "v2");
+    try std.testing.expectEqual(core.GROUND, v2.pos);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), v2.im, 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), v2.unit[1], 1e-15);
+    try std.testing.expectApproxEqAbs(@as(f64, 2), prepared.deck.ac_drive[prepared.circuit.n + v2.neg], 1e-15);
+    // The DC form names `dc` explicitly, and stays the DC sensitivity.
+    try std.testing.expectEqual(null, prepared.deck.queries[1].sens.ac);
+    // A short grid, a word other than dc/ac, and ngspice's parameter filter
+    // words (cktsens.c:58-67, not implemented) are refused.
+    const none: core.QueryBindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} };
+    const a = session.allocator();
+    for ([_][]const u8{ ".sens v(out) ac lin 1 1e6", ".sens v(out) tran", ".sens v(out) r1 ac lin 1 1e6 2e6" }) |text|
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.buildJob(try card(a, text), none, &.{}, .{ .arena = a }));
 }
 
 test "deck temperature and tolerances reach statistical and noise jobs" {
@@ -110,8 +309,8 @@ test "duration ceiling option is explicit and TMAX then DELMAX take precedence" 
     defer arena.deinit();
     const a = arena.allocator();
     const nl = try parse(a, "ceiling\n.options tran_ceiling=duration\n.end\n");
-    for ([_]netlist.Dialect{ .ngspice, .hspice }) |dialect| {
-        const o = try analyses.deckOptions(nl.deck.config, dialect);
+    {
+        const o = try analyses.deckOptions(nl.deck.config);
         var implicit: Job = .{ .tran = .{ .t_stop = 100e-9, .t_start = 20e-9, .dt_init = 1e-9 } };
         analyses.applyDeckOptions(&implicit, o);
         try std.testing.expectApproxEqRel(@as(f64, 8e-9), implicit.tran.dt_max.?, 1e-15);
@@ -127,7 +326,7 @@ test "duration ceiling option is explicit and TMAX then DELMAX take precedence" 
     }
     for ([_][]const u8{ "other", "1", "" }) |value| {
         const bad = try parse(a, try std.fmt.allocPrint(a, "bad\n.options tran_ceiling={s}\n.end\n", .{value}));
-        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.deckOptions(bad.deck.config, .ngspice));
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.deckOptions(bad.deck.config));
     }
 }
 
@@ -137,32 +336,35 @@ test "deck options reject invalid numeric conversions before construction" {
     for ([_][]const u8{ "itl1=-1", "itl2=65536", "itl4=0.4", "temp=-300", "tnom=nan", "reltol=-1" }) |option| {
         const source = try std.fmt.allocPrint(arena.allocator(), "invalid options\n.options {s}\n.end\n", .{option});
         const nl = try parse(arena.allocator(), source);
-        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.deckOptions(nl.deck.config, .ngspice));
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.deckOptions(nl.deck.config));
     }
-    const nl = try parse(arena.allocator(), "later wins\n.temp 50\n.options temp=27 method=gear maxord=1\n.end\n");
-    const o = try analyses.deckOptions(nl.deck.config, .ngspice);
-    try std.testing.expectEqual(@as(f64, 27), o.temp_c.?);
+    // `.temp` beats a later `.options temp`, as in ngspice 44.2 (the
+    // precedence test above measures every order).
+    const nl = try parse(arena.allocator(), "temp card wins\n.temp 50\n.options temp=27 method=gear maxord=1\n.end\n");
+    const o = try analyses.deckOptions(nl.deck.config);
+    try std.testing.expectEqual(@as(f64, 50), o.temp_c.?);
     try std.testing.expectEqual(requests.Method.backward_euler, o.method.?);
     // ngspice never rises above order 2: maxord=1 is BE under trap too, and
     // gear keeps Gear-2 at maxord 3..6 (dctran.c:900).
-    const trap1 = try analyses.deckOptions((try parse(arena.allocator(), "trap\n.options maxord=1\n.end\n")).deck.config, .ngspice);
+    const trap1 = try analyses.deckOptions((try parse(arena.allocator(), "trap\n.options maxord=1\n.end\n")).deck.config);
     try std.testing.expectEqual(requests.Method.backward_euler, trap1.method.?);
-    const gear6 = try analyses.deckOptions((try parse(arena.allocator(), "gear\n.options method=gear maxord=6\n.end\n")).deck.config, .ngspice);
+    const gear6 = try analyses.deckOptions((try parse(arena.allocator(), "gear\n.options method=gear maxord=6\n.end\n")).deck.config);
     try std.testing.expectEqual(requests.Method.gear_2, gear6.method.?);
     // The default tmax is min(tstep, (tstop - tstart) / 50) (traninit.c:29).
     var late: Job = .{ .tran = .{ .t_stop = 100e-6, .dt_init = 1e-6, .t_start = 90e-6 } };
     analyses.applyDeckOptions(&late, o);
     try std.testing.expectApproxEqRel(@as(f64, 0.2e-6), late.tran.dt_max.?, 1e-12);
-    // HSPICE: DELMAX caps a .tran that sets no tmax; TNOM and TEMP default to 25.
-    const h = try analyses.deckOptions((try parse(arena.allocator(), "delmax\n.options delmax=2n\n.end\n")).deck.config, .hspice);
+    // DELMAX caps a .tran that sets no tmax [HSPICE CR .OPTION DELMAX];
+    // TNOM defaults to 27 and TEMP stays unset, as in ngspice.
+    const h = try analyses.deckOptions((try parse(arena.allocator(), "delmax\n.options delmax=2n\n.end\n")).deck.config);
     var tran: Job = .{ .tran = .{ .t_stop = 1e-6, .dt_init = 1e-8 } };
     analyses.applyDeckOptions(&tran, h);
     try std.testing.expectEqual(@as(f64, 2e-9), tran.tran.dt_max.?);
-    try std.testing.expectEqual(@as(f64, 25), h.temp_c.?);
-    try std.testing.expectEqual(@as(f64, 25), h.tnom_c);
+    try std.testing.expectEqual(@as(?f64, null), h.temp_c);
+    try std.testing.expectEqual(@as(f64, 27), h.tnom_c);
     // Integer options round as ngspice's floor(0.5 + x).
     const rounded = try parse(arena.allocator(), "rounded\n.options itl4=1.5 itl1=99.4 itl2=2.5\n.end\n");
-    const r = try analyses.deckOptions(rounded.deck.config, .ngspice);
+    const r = try analyses.deckOptions(rounded.deck.config);
     try std.testing.expectEqual(@as(u16, 2), r.tol.itl4);
     try std.testing.expectEqual(@as(u16, 99), r.tol.itl1);
     try std.testing.expectEqual(@as(u16, 3), r.tol.itl2);
@@ -174,7 +376,7 @@ test "deck options reject invalid numeric conversions before construction" {
         .{ "fast accurate=1", 1.75 },   .{ "accurate=0", null },
     }) |case| {
         const source = try std.fmt.allocPrint(arena.allocator(), "runlvl\n.options {s}\n.end\n", .{case[0]});
-        try std.testing.expectEqual(case[1], (try analyses.deckOptions((try parse(arena.allocator(), source)).deck.config, .hspice)).trtol);
+        try std.testing.expectEqual(case[1], (try analyses.deckOptions((try parse(arena.allocator(), source)).deck.config)).trtol);
     }
 }
 
@@ -230,6 +432,35 @@ test "PSP 103 cards run the QS device unless they set SWNQS" {
         var prepared = try build(sa.allocator(), pa.allocator(), nl);
         defer prepared.deinit();
         const want = device.Library.builtin(case[1]);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(@TypeOf(want), prepared.circuit.batch_types, &.{want}));
+    }
+}
+
+test "a diode card builds diode_t exactly on ngspice's self-heating condition" {
+    // diodefs.h:31-33: a third node, the `thermal` flag (the word, or
+    // thermal=1 on the model card, measured on ngspice 44.2) and a given,
+    // non-zero rth0; off it ngspice runs the card isothermal. Red before
+    // diode_t: every card here with a third node or the flag was refused
+    // (UnsupportedSelfHeating).
+    const cases = .{
+        .{ "d1 a 0 tj dm thermal", " rth0=200", "diode_t" },
+        .{ "d1 a 0 tj dm", " rth0=200 thermal=1", "diode_t" },
+        .{ "d1 a 0 tj dm", " rth0=200", "diode" },
+        .{ "d1 a 0 dm thermal", " rth0=200", "diode" },
+        .{ "d1 a 0 tj dm thermal", "", "diode" },
+        .{ "d1 a 0 tj dm thermal", " rth0=0", "diode" },
+        .{ "d1 a 0 dm", " rth0=200", "diode" },
+    };
+    inline for (cases) |case| {
+        var sa = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer sa.deinit();
+        var pa = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer pa.deinit();
+        const nl = try parse(pa.allocator(), "diode pick\n.model dm d is=1e-14" ++ case[1] ++
+            "\nva a 0 0.7\nrtj tj 0 100\n" ++ case[0] ++ "\n.op\n.end\n");
+        var prepared = try build(sa.allocator(), pa.allocator(), nl);
+        defer prepared.deinit();
+        const want = device.Library.builtin(case[2]);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(@TypeOf(want), prepared.circuit.batch_types, &.{want}));
     }
 }
@@ -439,6 +670,63 @@ test "cards without an output measure the last net the deck introduces, whatever
     try std.testing.expectEqual(deck.output_node, deck.queries[3].pac.out_node);
 }
 
+// Oracle: the grid by hand, POI 10, 20 and 40 Hz [CR .AC], which is also
+// the same deck's `.ac` grid. `.pxf v(mid)` names its output; a bare `.pxf`
+// takes the deck's last net, as `.pac` does.
+test ".pac, .pxf and .pnoise read the .ac grid, POI included; .pxf v(out) names its output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nl = try parse(a,
+        \\poi grids
+        \\v1 in 0 dc 0 ac 1 sin(0 1 1k)
+        \\r1 in mid 1k
+        \\r2 mid out 1k
+        \\c1 out 0 1u
+        \\.ac poi 3 10 20 40
+        \\.pac 1k poi 3 10 20 40
+        \\.pxf 1k poi 3 10 20 40
+        \\.pxf v(mid) 1k poi 3 10 20 40
+        \\.pnoise v(out) v1 poi 3 10 20 40 1k
+        \\.pnoise v(out) v1 poi 3 10 20 40 1k 3
+        \\.end
+    );
+    var prepared = try build(a, a, nl);
+    defer prepared.deinit();
+    const q = prepared.deck.queries;
+    try std.testing.expectEqual(6, q.len);
+    try std.testing.expectEqualSlices(f64, &.{ 10, 20, 40 }, q[0].ac.sweep.list);
+    for ([_]core.numerics.FreqSweep{ q[1].pac.sweep, q[2].pxf.sweep, q[3].pxf.sweep, q[4].pnoise.sweep, q[5].pnoise.sweep }) |s| {
+        try std.testing.expectEqual(.poi, s.kind);
+        try std.testing.expectEqualSlices(f64, q[0].ac.sweep.list, s.list);
+    }
+    try std.testing.expectEqual(prepared.deck.output_node, q[1].pac.out_node);
+    try std.testing.expectEqual(prepared.deck.output_node, q[2].pxf.out_node);
+    try std.testing.expectEqualStrings("mid", prepared.circuit.nodeName(q[3].pxf.out_node));
+    try std.testing.expectEqual(@as(f64, 1e3), q[4].pnoise.f_fundamental);
+    try std.testing.expectEqual(7, q[4].pnoise.n_sidebands);
+    try std.testing.expectEqual(3, q[5].pnoise.n_sidebands);
+}
+
+// Oracle: the cards by hand. `.ptdnoise` runs at the fundamental of the
+// deck's first driven `.pss`, 1/(1/1 MHz), as `.hbac` takes the `.hb` tone.
+// An oscillator's `.pss`, whose period is an unknown, gives none, so a deck
+// with only that one has no fundamental to run at.
+test ".ptdnoise takes f0 from the deck's first driven .pss" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = "ptd f0\ni1 0 d sin(1m 0.5m 1meg)\nd1 d 0 dm\n.model dm d is=1e-14\n.pss v(d) 2meg 64\n";
+    const tail = ".ptdnoise v(d) time=250n dec 2 1k 100k\n.end\n";
+    var prepared = try build(a, a, try parse(a, head ++ ".pss 1meg 100\n.pss 3meg 50\n" ++ tail));
+    defer prepared.deinit();
+    const q = prepared.deck.queries;
+    try std.testing.expectEqual(4, q.len);
+    try std.testing.expectEqual(@as(f64, 1e6), q[3].pnoise.f_fundamental);
+    try std.testing.expectApproxEqRel(250e-9, q[3].pnoise.strobe.?, 1e-15);
+    try std.testing.expectError(error.MissingAnalysisCard, build(a, a, try parse(a, head ++ tail)));
+}
+
 test "selected unresolved parameters fail while unused models stay inert" {
     inline for (.{
         ".model nm nmos(level=1 tox={missing})\nm1 out in 0 0 nm\n",
@@ -490,7 +778,7 @@ test "prepared bindings retain model fields and exclude runtime state from param
     var prepared = try build(session.allocator(), parse_arena.allocator(), nl);
     defer prepared.deinit();
     _ = parse_arena.reset(.free_all);
-    const refs = try @import("../variants.zig").collect(session.allocator(), &prepared.circuit);
+    const refs = try @import("../Jobs/variants.zig").collect(session.allocator(), &prepared.circuit);
     var saw_pub = false;
     var resistors: u32 = 0;
     for (0..refs.len) |i| {
@@ -527,7 +815,9 @@ test "selected model integer fields and levels reject out-of-range values" {
 }
 
 test "behavioral sources the tape cannot express are rejected, not opened" {
-    inline for (.{ "v=v(out)+i(r1)", "i=v(out)*x", "i=foo(v(out))", "i=agauss(v(out),1,1)", "i=min(v(a))", "v=v(out)+v(a)+v(b)+v(c)+v(d)+v(e)+v(f)+v(g)+v(h)" }) |output| {
+    // An unknown function is refused as the card is read (src/tests/
+    // unknown_functions.zig).
+    inline for (.{ "v=v(out)+i(r1)", "i=v(out)*x", "i=agauss(v(out),1,1)", "i=min(v(a))" }) |output| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -543,14 +833,14 @@ test "input preparation retains bytes and origin after caller storage changes" {
     var origin = "Models/Deck.cir".*;
     const prepared = try prepare(std.testing.io, arena.allocator(), .{
         .bytes = .{ .data = &source, .origin = &origin },
-    }, .ngspice);
+    });
     @memset(&source, 'x');
     @memset(&origin, 'x');
     try std.testing.expectEqual(@as(u32, 2), prepared.deviceCount());
     try std.testing.expectEqualStrings("retained input", prepared.deck.title);
 }
 
-test "input preparation resolves file includes and selected dialect" {
+test "input preparation resolves file includes" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -563,13 +853,12 @@ test "input preparation resolves file includes and selected dialect" {
         .data = "included input\n.include res.inc\nV1 out 0 1\n.op\n.end\n",
     });
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/input.cir", .{tmp.sub_path});
-    const prepared = try prepare(io, a, .{ .file = path }, .hspice);
+    const prepared = try prepare(io, a, .{ .file = path });
     try std.testing.expectEqual(@as(u32, 2), prepared.deviceCount());
     const from_bytes = try prepare(io, a, .{
         .bytes = .{ .data = "byte input\n.include res.inc\nV1 out 0 1\n.end\n", .origin = path },
-    }, .ngspice);
+    });
     try std.testing.expectEqual(@as(u32, 2), from_bytes.deviceCount());
-    try std.testing.expectEqual(input.Dialect.hspice, input.parseDialect("hs").?);
 }
 
 test "one binder: a runtime-registered device binds a card exactly as the same model built in" {
@@ -596,7 +885,7 @@ test "one binder: a runtime-registered device binds a card exactly as the same m
         \\N1 a 0 rloaded
         \\.model rloaded resistor_rt {s}
         \\.end
-    , .{ pairs, pairs }), .ngspice);
+    , .{ pairs, pairs }));
     var prepared = try input.build(&lib, a, a, nl);
     defer prepared.deinit();
 
@@ -613,7 +902,7 @@ test "one binder: a runtime-registered device binds a card exactly as the same m
     }
 }
 
-/// An HSPICE MOSRA deck around one BSIM3 NMOS; `tail` holds the `.mosra`,
+/// A MOSRA deck around one BSIM3 NMOS; `tail` holds the `.mosra`,
 /// analysis and any extra cards.
 fn mosraDeck(arena: std.mem.Allocator, model: []const u8, tail: []const u8) !netlist.Netlist {
     return netlist.parse(arena, try std.fmt.allocPrint(arena,
@@ -626,7 +915,7 @@ fn mosraDeck(arena: std.mem.Allocator, model: []const u8, tail: []const u8) !net
         \\.appendmodel nra mosra n3 nmos
         \\{s}
         \\.end
-    , .{ model, tail }), .hspice);
+    , .{ model, tail }));
 }
 
 test "a .mosra plans one aged row per reliability time, the total last" {
@@ -667,13 +956,53 @@ test "a .mosra plans one aged row per reliability time, the total last" {
     }
 }
 
+test "a flag-flipped P card labels its op-vars and .mosra row P, as the P kind does" {
+    // Oracle: `nmos level=3 pmos` binds the model `pmos level=3` binds
+    // (ngspice-44.2 reads the flag as a model parameter; src/tests/
+    // card_keys.zig), so its op-vars and .mosra row are the plain card's.
+    // Red before: both read the kind, so the flagged card ran P and reported
+    // N: @m1[id], vgs and vds and the delvto shift with their signs flipped.
+    var sa = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer sa.deinit();
+    var pa = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer pa.deinit();
+    // A MOS3 under P bias, aged by `.mosra`, three terminal op-vars saved.
+    const text =
+        \\polarity labels
+        \\vd d 0 -1.5
+        \\vg g 0 -1.2
+        \\m1 d g 0 0 pm w=10u l=1u
+        \\.model pm {s}
+        \\.model nra mosra level=1 tit0=1e-4 tn=0.25
+        \\.appendmodel nra mosra pm pmos
+        \\.mosra reltotaltime=10 simmode=0
+        \\.save @m1[id] @m1[vgs] @m1[vds]
+        \\.tran 1n 10n
+        \\.end
+    ;
+    const pa_a = pa.allocator();
+    var plain = try build(sa.allocator(), pa_a, try netlist.parse(pa_a, try std.fmt.allocPrint(pa_a, text, .{"pmos level=3"})));
+    defer plain.deinit();
+    var flagged = try build(sa.allocator(), pa_a, try netlist.parse(pa_a, try std.fmt.allocPrint(pa_a, text, .{"nmos level=3 pmos"})));
+    defer flagged.deinit();
+    const want = plain.deck;
+    const got = flagged.deck;
+    try std.testing.expectEqual(@as(usize, 3), want.opvars.len);
+    try std.testing.expect(want.opvars[0].pmos);
+    try std.testing.expectEqual(want.opvars.len, got.opvars.len);
+    for (want.opvars, got.opvars) |w, g| try std.testing.expectEqualDeep(w, g);
+    try std.testing.expectEqualSlices(bool, &.{true}, want.mosra.?.pmos);
+    try std.testing.expectEqualSlices(bool, want.mosra.?.pmos, got.mosra.?.pmos);
+    try std.testing.expectEqualSlices(f64, want.mosra.?.delvto_fresh, got.mosra.?.delvto_fresh);
+}
+
 /// Reads, builds and frees `src` with every table on arenas over `gpa`.
 fn prepareAndBuild(gpa: std.mem.Allocator, lib: *const device.Library, src: []const u8) !void {
     var session = std.heap.ArenaAllocator.init(gpa);
     defer session.deinit();
     var parse_arena = std.heap.ArenaAllocator.init(gpa);
     defer parse_arena.deinit();
-    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, .ngspice, &.{}, .{});
+    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, &.{});
     var prepared = try input.build(lib, session.allocator(), parse_arena.allocator(), nl);
     prepared.deinit();
 }

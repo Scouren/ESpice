@@ -1,8 +1,9 @@
-//! Differential tests of `lines.zig` against `lines_oracle.zig`, the reader
+//! Differential tests of tokenizer.zig's `Lines` against `lines_oracle.zig`, the reader
 //! before its single-scan rewrite: seeded random line soups must read the
-//! same in every dialect. Plus each dialect's line rules, worked by hand.
+//! same. Plus ngspice's line rules, worked by hand.
 const std = @import("std");
-const lines = @import("../lines.zig");
+const spice_number = @import("../Parse/spice_number.zig");
+const tokenizer = @import("../tokenizer.zig");
 const oracle = @import("lines_oracle.zig");
 
 /// Bytes the soup draws from: every byte a line rule reads, plus filler.
@@ -42,12 +43,8 @@ test "logical lines match the pre-rewrite reader on 20000 random soups" {
     var buf: [160]u8 = undefined;
     for (0..20000) |_| {
         const src = soup(r, &buf);
-        try sameLines(lines.ngspice, oracle.ngspice, src);
-        try sameLines(lines.hspice, oracle.hspice, src);
-        try sameLines(lines.spectre, oracle.spectre, src);
+        try sameLines(tokenizer, oracle.ngspice, src);
     }
-    // A Spectre deck that switches into a SPICE region and back.
-    try sameLines(lines.spectre, oracle.spectre, "simulator lang=spice\nr1 a b 1\n+ 2\nsimulator lang=spectre\nr2 (a b) resistor\n");
 }
 
 test "a SPICE literal longer than 64 bytes reads with a `d` exponent" {
@@ -55,8 +52,7 @@ test "a SPICE literal longer than 64 bytes reads with a `d` exponent" {
     // parseFloat and read a longer one as no number at all.
     const zeros: [70]u8 = @splat('0');
     const long = "1" ++ zeros ++ "d-70";
-    try std.testing.expectEqual(@as(?f64, 1), lines.ngspice.parseNum(long));
-    try std.testing.expectEqual(@as(?f64, 1e3), lines.hspice.parseNum(long ++ "k"));
+    try std.testing.expectEqual(@as(?f64, 1), spice_number.spiceNumber(long));
 }
 
 fn expectLines(comptime S: type, src: []const u8, want: []const []const u8) !void {
@@ -69,105 +65,26 @@ fn expectLines(comptime S: type, src: []const u8, want: []const []const u8) !voi
 
 test "ngspice line rules, by ngspice-syntax.md section" {
     // §1.3: an `@` line ends the file.
-    try expectLines(lines.ngspice, "r1 a 0 1\n@ stop\nr2 a 0 1\n", &.{"r1 a 0 1"});
+    try expectLines(tokenizer, "r1 a 0 1\n@ stop\nr2 a 0 1\n", &.{"r1 a 0 1"});
     // §1.6: a `+` line with nothing to continue is ignored; `\\` glues the
     // next line on as it is, `+` and all, with one blank between.
-    try expectLines(lines.ngspice, "+ x\nr1 a 0 1\n", &.{"r1 a 0 1"});
-    try expectLines(lines.ngspice, "r1 a \\\\\n+b 1\n", &.{"r1 a +b 1"});
+    try expectLines(tokenizer, "+ x\nr1 a 0 1\n", &.{"r1 a 0 1"});
+    try expectLines(tokenizer, "r1 a \\\\\n+b 1\n", &.{"r1 a +b 1"});
     // §1.5: a line that is only a `//` comment is a comment line, so the
     // `+` after it continues nothing; a quoted `;` or `$` is text.
-    try expectLines(lines.ngspice, "r1 a 0 1\n// c\n+ 2\n", &.{"r1 a 0 1"});
-    try expectLines(lines.ngspice, "b1 a 0 v='1 ; $x' ; tail\n", &.{"b1 a 0 v='1 ; $x'"});
+    try expectLines(tokenizer, "r1 a 0 1\n// c\n+ 2\n", &.{"r1 a 0 1"});
+    try expectLines(tokenizer, "b1 a 0 v='1 ; $x' ; tail\n", &.{"b1 a 0 v='1 ; $x'"});
     // A `$` inside a name is no comment; after a comma it is.
-    try expectLines(lines.ngspice, "r1 a$b 0 1,$c\n", &.{"r1 a$b 0 1,"});
+    try expectLines(tokenizer, "r1 a$b 0 1,$c\n", &.{"r1 a$b 0 1,"});
     // Blank and comment lines between a card and its `+` line are skipped.
-    try expectLines(lines.ngspice, "r1 a 0\n\n* c\n# d\n$ e\n+ 1\n", &.{"r1 a 0 1"});
+    try expectLines(tokenizer, "r1 a 0\n\n* c\n# d\n$ e\n+ 1\n", &.{"r1 a 0 1"});
+    // inpcom.c:3515-3520: one control byte alone or before a blank (the
+    // DOS `^Z` closing TL072.301) is a comment; before a name byte it is not.
+    try expectLines(tokenizer, ".ends\r\n\x1a", &.{".ends"});
+    try expectLines(tokenizer, "\x1a x\nr1 a 0 1\n\x1ar2 a 0 1\n", &.{ "r1 a 0 1", "\x1ar2 a 0 1" });
 }
 
-test "HSPICE line rules, by hspice-syntax.md rule" {
-    // L6: ` \` continues with one blank, a quote open across it keeps its
-    // `$` as text, and `+` after a break is text.
-    try expectLines(lines.hspice, "v1 a 0 'x $y \\\nz'\n", &.{"v1 a 0 'x $y z'"});
-    try expectLines(lines.hspice, "r1 a \\\\\n+1\n", &.{"r1 a+1"});
-    // L5 then L6: a `+` line with a blank after the `+` still breaks at
-    // its backslashes, and the indented `+` after them is text, the
-    // expression's plus (reported by a user).
-    const quoted = ".param a=1\n+ x = '2u*a{s}\n\t   + 3u*b{s}\n\t   + 1u*b'   $ c\n+ y = 'x*2'\n";
-    try expectLines(lines.hspice, std.fmt.comptimePrint(quoted, .{ " \\\\", " \\\\" }), &.{".param a=1 x = '2u*a+ 3u*b+ 1u*b' y = 'x*2'"});
-    try expectLines(lines.hspice, std.fmt.comptimePrint(quoted, .{ " \\", " \\" }), &.{".param a=1 x = '2u*a + 3u*b + 1u*b' y = 'x*2'"});
-    // L3: a `$` after a number token or a closing quote is a comment.
-    try expectLines(lines.hspice, "r1 a 0 1k$c\nr2 a 0 'p'$c\n", &.{ "r1 a 0 1k", "r2 a 0 'p'" });
-    // L2: `$` and `*` lead comment lines; L5 skips them before a `+`.
-    try expectLines(lines.hspice, "$ x\nr1 a 0\n* y\n+ 1\n", &.{"r1 a 0 1"});
-}
-
-/// Pieces a generated HSPICE statement is cut into: no `$`, `*` or `\`,
-/// so only the break between two pieces decides what lies between them.
-const pieces = [_][]const u8{ "a", "x_n", "=", "'2u*a", "(1 - b)", "+ 3u*b'", "+1", "'x'", "(a+b)" };
-
-test "HSPICE statements read as their pieces joined, however the lines break (L5, L6)" {
-    // Model oracle: a statement is a list of pieces. A column-1 `+` line
-    // and ` \` put one blank between two pieces, `\\` none; the blank
-    // after a `+` and an indent after ` \` change nothing.
-    var prng: std.Random.DefaultPrng = .init(0x6a22);
-    const r = prng.random();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const blanks = [_][]const u8{ "", " ", "\t", " \t " };
-    for (0..2000) |_| {
-        var src: std.ArrayList(u8) = .empty;
-        var want: std.ArrayList([]const u8) = .empty;
-        for (0..r.uintAtMost(usize, 3) + 1) |_| {
-            var line: std.ArrayList(u8) = .empty;
-            try src.appendSlice(a, "r1");
-            try line.appendSlice(a, "r1");
-            for (0..r.uintLessThan(usize, 6)) |_| {
-                const piece = pieces[r.uintLessThan(usize, pieces.len)];
-                const blank = blanks[r.uintLessThan(usize, blanks.len)];
-                const sep = switch (r.uintLessThan(u8, 3)) {
-                    0 => blk: {
-                        try src.print(a, "\n+{s}{s}", .{ blank, piece });
-                        break :blk " ";
-                    },
-                    1 => blk: {
-                        try src.print(a, " \\\n{s}{s}", .{ blank, piece });
-                        break :blk " ";
-                    },
-                    else => blk: {
-                        try src.print(a, "\\\\\n{s}", .{piece});
-                        break :blk "";
-                    },
-                };
-                try line.print(a, "{s}{s}", .{ sep, piece });
-            }
-            try src.append(a, '\n');
-            try want.append(a, line.items);
-        }
-        try expectLines(lines.hspice, src.items, want.items);
-    }
-}
-
-test "Spectre line rules, by spectre-syntax.md section" {
-    // §1.4: an odd run of trailing backslashes continues; an even run is
-    // escaped backslashes, name bytes.
-    try expectLines(lines.spectre, "r1 a\\\\\nr2 b\n", &.{ "r1 a\\\\", "r2 b" });
-    try expectLines(lines.spectre, "r1 a \\\n b\n", &.{"r1 a b"});
-    // §1.3: `*` comments only in the first column; `//` anywhere outside a
-    // string.
-    try expectLines(lines.spectre, "r1 a\n * b\n", &.{ "r1 a", "* b" });
-    try expectLines(lines.spectre, "r1 \"a//b\" // c\n", &.{"r1 \"a//b\""});
-}
-
-test "logical lines per dialect" {
-    try expectLines(lines.ngspice, "", &.{});
-    try expectLines(lines.ngspice, "* c\nr1 a b 1k $ tail\n+ 2 ; more\n\n* mid\n+ 3\n$ only\nc1 x y 1p\r\n", &.{ "r1 a b 1k 2 3", "c1 x y 1p" });
-    // `\\` squeezes the blanks out of the join, ` \` keeps one (HSPICE User
-    // Guide B-2008.09 p. 40); `$` after a number or a comma is a comment (p. 56).
-    try expectLines(lines.hspice, "r1 a b$c 1k $ tail\nr2 a \\\\\nb 2\n+ 3\n", &.{ "r1 a b$c 1k", "r2 ab 2 3" });
-    try expectLines(lines.hspice, "$ note\nr3 a b \\\n  2k$c\nr4 a b 1,$c\n", &.{ "r3 a b 2k", "r4 a b 1," });
-    // No `/* */` in Spectre (spectre-syntax.md §1.3); `*` comments only in
-    // the first column; a SPICE region reads as HSPICE does.
-    try expectLines(lines.spectre, "r1 (a b) resistor r=1k // c\nr2 \"x//y\" b \\\n  r=2\n// note\n+ m=1\n* gone\n", &.{ "r1 (a b) resistor r=1k", "r2 \"x//y\" b r=2 m=1" });
-    try expectLines(lines.spectre, "simulator lang=spice\nR1 a b 1k $ c\n+ tc1=1\nsimulator lang=spectre\nr2 (a b) resistor r=1 $x\n", &.{ "simulator lang=spice", "R1 a b 1k tc1=1", "simulator lang=spectre", "r2 (a b) resistor r=1 $x" });
+test "logical lines" {
+    try expectLines(tokenizer, "", &.{});
+    try expectLines(tokenizer, "* c\nr1 a b 1k $ tail\n+ 2 ; more\n\n* mid\n+ 3\n$ only\nc1 x y 1p\r\n", &.{ "r1 a b 1k 2 3", "c1 x y 1p" });
 }

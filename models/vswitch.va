@@ -26,8 +26,9 @@ module vswitch(p, n, cp, cn);
     parameter real vh   = 0.0;                  // V    hysteresis half-width
     parameter real ron  = 1.0    from (0:inf);  // ohm  on resistance
     parameter real roff = 1.0e12 from (0:inf);  // ohm  off resistance (1/gmin)
-    // Seeds the in-band state (`ON`/`OFF` on the card), so a switch that starts
-    // inside the band has a defined position.
+    // Seeds the in-band state for vh > 0 (`ON`/`OFF` on the card,
+    // `net_devices.switchFlag`), so a switch that starts inside the band has
+    // a defined position.
     parameter integer ic = 0;                   //      >0 = start ON
 
     integer latched;  // held across evaluations: the in-band memory
@@ -45,7 +46,11 @@ module vswitch(p, n, cp, cn);
         lo = vt - abs(vh);
         u  = V(cp, cn);
 
-        @(initial_step) latched = (ic > 0) ? 3 : 2;
+        // The .op's in-band state (swload.c): ON or OFF seeds it at
+        // MODEINITJCT/INITFIX (:43-60) and vh > 0 keeps it (:69-75). For
+        // vh <= 0, :76-88 step from CKTstate1, which no .op writes
+        // (REALLY_OFF), to HYST_ON whatever the flag.
+        @(initial_step) latched = (ic > 0 || vh <= 0.0) ? 3 : 2;
 
         // Leaving the band latches the rail it left by. Entering it: vh >= 0
         // keeps the state; vh < 0 flips to the opposite rail (§1.2 oscillator).

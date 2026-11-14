@@ -23,6 +23,7 @@ const devices = @import("devices.zig");
 const lane_color = @import("lane_color.zig");
 const lanes = @import("lanes.zig");
 const lanes_batch = @import("lanes_batch.zig");
+const lanes_lte = @import("lanes_lte.zig");
 const lanes_newton = @import("lanes_newton.zig");
 const lanes_round = @import("lanes_round.zig");
 const lanes_tick = @import("lanes_tick.zig");
@@ -68,6 +69,8 @@ const Shape = struct {
     stage_slots: usize,
     stage_rows: usize,
     dense_slots: usize,
+    /// A gear-3..6 run: `Sim.init`'s `n_hist` = top order + 2 > 4.
+    gear: bool,
 };
 
 /// Staging cells past the planes, for the hub touches of coloured batches.
@@ -81,6 +84,8 @@ const Tables = struct {
     cur_row: []const u8,
     diag: []const u32,
     probes: []const u32,
+    lte_dst: []const u32,
+    lte_src: []const u32,
 };
 
 /// Uploads every lane after its `Sim.init`: the pattern's tapes, each
@@ -132,7 +137,12 @@ pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, sims: anytype, probe
     errdefer gpa.free(batches);
     var n_up: usize = 0;
     errdefer for (batches[0..n_up]) |*b| b.deinit(gpa);
-    const n_qt: usize = s0.n_qt;
+    // A K card's LTE states: the tape, then its inductor rows (`lanes_lte`).
+    const n_tape: usize = s0.n_qt;
+    const zero, const rows = lteOf(s0);
+    const n_qt: usize = n_tape + rows.len;
+    const fix = try lanes_lte.table(gpa, n_tape, zero, rows);
+    defer fix.deinit(gpa);
     const ps = try gpa.alloc(device_ir.GpuPayload, N);
     defer gpa.free(ps);
     var tape_off: u32 = 0;
@@ -143,7 +153,7 @@ pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, sims: anytype, probe
         tape_off += if (b0.hooks.q_tape) |f| @intCast(f(b0.ctx).len) else 0;
     }
     assert(n_up == batches.len);
-    assert(tape_off == n_qt or n_qt == 0);
+    assert(tape_off == n_tape or n_tape == 0);
     const stage = try colorBatches(gpa, k0, batches, c0, N);
 
     const slot_bytes = (n * n + n) * @sizeOf(f64);
@@ -159,6 +169,7 @@ pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, sims: anytype, probe
         .stage_slots = stage.slots,
         .stage_rows = stage.rows,
         .dense_slots = if (n <= lk.dense_peel_max_n) @min(N, dense_pool_bytes / slot_bytes) else 0,
+        .gear = s0.n_hist > 4,
     };
     const cur_row = try gpa.alloc(u8, n);
     defer gpa.free(cur_row);
@@ -170,6 +181,8 @@ pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, sims: anytype, probe
         .cur_row = cur_row,
         .diag = c0.diag_slots[0..n],
         .probes = probes,
+        .lte_dst = fix.dst,
+        .lte_src = fix.src,
     };
     self.* = .{
         .gpa = gpa,
@@ -197,6 +210,7 @@ pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, sims: anytype, probe
         .dense_slots = @intCast(shape.dense_slots),
         .stage_slots = @intCast(shape.stage_slots),
         .stage_rows = @intCast(shape.stage_rows),
+        .n_fix = @intCast(fix.dst.len),
     };
     try allocBuffers(self, k0, shape, tables);
     errdefer for (&self.bufs) |*b| b.free();
@@ -382,13 +396,18 @@ fn makeBuffer(k0: *Raw, id: Dev, s: Shape, t: Tables) !Buffer {
         .lte_out => z(k0, N * 16),
         .probe_out => z(k0, N * s.n_probes * f8),
         .count, .fails, .first, .over, .slot_next, .ring_slot, .seen, .seen_lo => z(k0, 4),
-        .meas_cols, .meas, .meas_resolved => z(k0, 1),
+        .meas_cols, .meas, .meas_resolved, .force, .stamps => z(k0, 1),
+        .homotopy => z(k0, N * 16),
+        .gear => z(k0, if (s.gear) N * @sizeOf(lk.LaneGear) else 1),
+        .lte_gear => z(k0, if (s.gear) N * 16 else 1),
         .tab_idx => up(k0, bytes(t.tab_idx)),
         .col_ptr => up(k0, bytes(t.col_ptr)),
         .row_idx => up(k0, bytes(t.row_idx)),
         .cur_row => up(k0, t.cur_row),
         .diag => up(k0, bytes(t.diag)),
         .probes => up(k0, bytes(t.probes)),
+        .lte_dst => if (t.lte_dst.len == 0) z(k0, 4) else up(k0, bytes(t.lte_dst)),
+        .lte_src => if (t.lte_src.len == 0) z(k0, 4) else up(k0, bytes(t.lte_src)),
         .dense => k0.alloc(@max(s.dense_slots * (s.n * s.n + s.n) * f8, 1)),
         .peel_idx => k0.alloc(4),
         .peel => k0.alloc(8),
@@ -405,7 +424,8 @@ fn makeBuffer(k0: *Raw, id: Dev, s: Shape, t: Tables) !Buffer {
 /// order.
 fn mirrorCounts(s: Shape) [GpuLanes.pinned_mirrors.len]usize {
     const N = s.N;
-    return .{ N, N, N, N, N, N, N, N, N, N * s.n_hist, N * s.n_hist, N, N, @max(N * s.n_probes, 1), 4, N, max_rounds * N, @max(max_rounds * N * s.n_probes, 1), N };
+    const g = if (s.gear) N else 0;
+    return .{ N, N, N, N, g, g, N, N, N, N, N, N * s.n_hist, N * s.n_hist, N, N, @max(N * s.n_probes, 1), 4, N, max_rounds * N, @max(max_rounds * N * s.n_probes, 1), N };
 }
 
 /// Carves every pinned mirror from one page-locked block, each at a
@@ -507,4 +527,16 @@ fn printProf(self: *const GpuLanes) void {
     const tick_idle = if (tick_capacity == 0) 0 else 1 - @as(f64, @floatFromInt(p.lane_ticks)) / @as(f64, @floatFromInt(tick_capacity));
     std.debug.print("gpu-lanes: idle round={d:.3}% Newton={d:.3}%\n", .{ 100 * round_idle, 100 * tick_idle });
     if (p.phases) std.debug.print("gpu-lanes: direct tick ms eval={d:.1} assemble={d:.1} lu={d:.1} gates={d:.1} state={d:.1}\n", .{ ms(p.tick_ns[0]), ms(p.tick_ns[1]), ms(p.tick_ns[2]), ms(p.tick_ns[3]), ms(p.tick_ns[4]) });
+}
+
+/// `s0`'s `lteSnap` spans and rows (`tran.Sim`), or none for a seed with
+/// no step machine (`initStatic`, `integrateFixed`).
+fn lteOf(s0: anytype) struct { []const [2]u32, []const u32 } {
+    const S = switch (@typeInfo(@TypeOf(s0))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(s0),
+    };
+    if (comptime !@hasField(S, "lte_rows")) return .{ &.{}, &.{} };
+    assert(s0.lte_rows.len == 0 or s0.n_qt > 0);
+    return .{ s0.lte_zero, s0.lte_rows };
 }

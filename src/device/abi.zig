@@ -21,7 +21,8 @@
 //! - `pub const NoiseGenKind = enum`, `pub const NoiseGen = struct`
 //! - `pub const Planes = struct`, `pub const StampMode = enum(u8)`
 //! - `pub const ScatterTapes = struct`, `pub const LocalEval = struct`, `pub const ChargeIdentity = struct`
-//! - `pub const DerivativeCounts = struct`, `pub const Batch = struct`
+//! - `pub const DerivativeCounts = struct`, `pub const CensusCounts = struct`,
+//!   `pub const Batch = struct` (`publishSim`)
 //! - `pub const StatusHit = struct`, `pub const DeviceStatus = enum(u8)`
 //! - `pub const Hooks = struct`, `pub const Proto = struct`
 //! - `pub const PatternView = struct` (`findSlot`)
@@ -72,7 +73,21 @@ pub const Systf = contract.Systf;
 pub const SystfHost = contract.SystfHost;
 
 /// `Hooks.set_bypass`'s tolerances: the Newton test's.
-pub const BypassTol = struct { reltol: f64, vntol: f64, abstol: f64 };
+pub const BypassTol = struct {
+    reltol: f64,
+    vntol: f64,
+    abstol: f64,
+    /// The C4 lever (`ESPICE_PERF=c4`, docs/perf_research/04-levers-cpu.md):
+    /// false is the shipped bypass.
+    c4: bool = false,
+    /// Measurement only (`ESPICE_PERF=c4,c4h`): with `c4`, the review
+    /// judges each window but never turns the batch off. Ignored without
+    /// `c4`.
+    hold: bool = false,
+    /// `ZP_TRAN_STATS`: each batch counts its bypass outcomes and prints
+    /// them (`bypass-stats:`) when it frees its bypass. Changes no value.
+    stats: bool = false,
+};
 
 /// One sweepable field of a device type, as `collect_params` lists it.
 pub const ParamField = struct {
@@ -267,6 +282,14 @@ pub const DerivativeCounts = struct {
     narrow_lanes: u8,
 };
 
+/// N6's census counters (`Hooks.census_counts`), since `census(true)`.
+/// charge_pairs/charge_same: instances a serial host charge pass evaluated,
+/// and those whose gathered unknowns all kept their bits since the previous
+/// charge pass. limit_pairs/limit_same: instances a serial limit pass read,
+/// and those whose `limit` inputs held their bits since the last accepted
+/// point.
+pub const CensusCounts = struct { charge_pairs: u64 = 0, charge_same: u64 = 0, limit_pairs: u64 = 0, limit_same: u64 = 0 };
+
 /// One device type's frozen batch, made by `Proto.finalize`. `eval` and
 /// `eval_newton` add the stamps of instances `[first, last)` into the given
 /// planes; `eval_newton` skips a constant Jacobian half. ParEval stamps
@@ -276,6 +299,13 @@ pub const Batch = struct {
     ctx: *anyopaque,
     eval: *const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64) void,
     eval_newton: *const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64) void,
+    /// The byte offset in `ctx` of the batch's stored analysis state, when
+    /// its `Hooks.set_sim_state` would only store the state: `publishSim`
+    /// then writes it there, with no call. `sim_none` when the hook does
+    /// more (a bypassable type reviews its hit rate at every publish), so
+    /// every publish takes the hook. An offset, not a pointer: the row stays
+    /// in its cache line.
+    sim_offset: u16 = sim_none,
     count: u32,
     n_u: u32,
     has_charge: bool,
@@ -290,6 +320,29 @@ pub const Batch = struct {
     /// (`Circuit.refuseDigital`). The frontend copies it from
     /// `Library.digital` at the freeze.
     digital: bool = false,
+
+    /// `sim_offset` of a batch whose every publish calls the hook.
+    pub const sim_none = std.math.maxInt(u16);
+
+    /// Hands the batch `sim`, the state every later device call receives:
+    /// a plain store at `sim_offset` when there is one, else
+    /// `Hooks.set_sim_state`. The store keeps the batch's `analog_initial`,
+    /// which only the batch clears (once its §5.2.1 results are held); the
+    /// hook clears it the same way, so the two leave the same state.
+    /// Cheap enough for every Newton iterate. Asserts that `sim` has
+    /// `analog_initial` set (only the batch clears it) and an `iteration`
+    /// of at least 1 (§9.15 counts from 1).
+    pub fn publishSim(self: Batch, sim: SimState) void {
+        assert(sim.analog_initial);
+        assert(sim.iteration >= 1);
+        if (self.sim_offset == sim_none) return self.hooks.set_sim_state(self.ctx, sim);
+        // SAFETY: `sim_offset` is the batch's own `@offsetOf` its `SimState`
+        // field (`DeviceBatch.binding`), inside the object `ctx` points at.
+        const cell: *SimState = @ptrCast(@alignCast(@as([*]u8, @ptrCast(self.ctx)) + self.sim_offset));
+        const analog_initial = cell.analog_initial;
+        cell.* = sim;
+        cell.analog_initial = analog_initial;
+    }
 };
 
 /// Where `Hooks.status` found a latched status: the instance index within
@@ -321,6 +374,13 @@ pub const Hooks = struct {
     /// alone. ParEval sums the positions into each plane cell in tape order,
     /// which is the order the serial `eval` adds them in.
     stage: *const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64, StampMode) void,
+    /// N3 on ParEval: `stage` of a pass taken while `track_charges` is on,
+    /// `.full` or `.newton` only. Returns true when some instance of the
+    /// range evaluated off its gathered x (a limiter, a correction) or the
+    /// range replayed a bypass record, so its charges are not `eval_q`'s;
+    /// the caller ANDs the ranges' verdicts after the pass. Every range
+    /// stores the batch's `charges_clean` as true. Null without charge.
+    stage_moved: ?*const fn (*anyopaque, *const Planes, first: u32, last: u32, []const f64, f64, StampMode) bool = null,
     /// The batch's scatter tapes: plane cell of every staged position.
     scatter_tapes: *const fn (*anyopaque) ScatterTapes,
     /// Runs the device's `limit` on every instance at x, against x_old (the
@@ -349,6 +409,24 @@ pub const Hooks = struct {
     /// values within the Newton tolerance, so it is opt-in. Null for a
     /// device it cannot serve (sources, history, mutable evaluation).
     set_bypass: ?*const fn (*anyopaque, ?BypassTol) void = null,
+    /// The N3 lever (`ESPICE_PERF=n3`, docs/perf_research/09-after-the-levers.md):
+    /// with `on`, every serial host pass also records the LTE tape and
+    /// whether a limiter or a correction moved an instance off its gathered
+    /// x, so `charges_clean` can answer. Off (the default) is the shipped
+    /// pass. Null for a batch without charge.
+    track_charges: ?*const fn (ctx: *anyopaque, on: bool) void = null,
+    /// Whether the batch's last serial host pass left in the planes and the
+    /// tape bitwise what `eval_q` writes at that pass's x, time and state.
+    /// False while `track_charges` is off. Null for a batch without charge.
+    charges_clean: ?*const fn (ctx: *anyopaque) bool = null,
+    /// N6's census, stats only: on starts it with fresh snapshots, off stops
+    /// and frees it. False when the snapshots could not be allocated.
+    census: ?*const fn (ctx: *anyopaque, on: bool) bool = null,
+    /// The census counters; zeros while it is off.
+    census_counts: ?*const fn (ctx: *anyopaque) CensusCounts = null,
+    /// N6's census: `x` is an accepted point, the reference the limit-pass
+    /// census compares against. Stats only; a no-op while the census is off.
+    census_accept: ?*const fn (ctx: *anyopaque, x: []const f64) void = null,
     /// Advances Newton-history state between evaluated iterates, given the
     /// previous x.
     advance_iteration: ?*const fn (*anyopaque, []const f64) void = null,
@@ -403,8 +481,9 @@ pub const Hooks = struct {
     set_homotopy: ?*const fn (*anyopaque, gmin: f64, source_scale: f64) void = null,
     /// Stores the analysis state (`$abstime`, timestep, `analysis()`,
     /// initial/final step, Newton iteration) that every later device call
-    /// of this batch receives. One store per batch, so it is cheap enough
-    /// to call per Newton iteration.
+    /// of this batch receives, `analog_initial` false once the batch holds
+    /// its §5.2.1 results. A host publishes through `Batch.publishSim`,
+    /// which skips the call when `Batch.sim` is set.
     set_sim_state: *const fn (*anyopaque, SimState) void,
     /// The model's smallest static delay (`D.delays`).
     min_delay: ?*const fn (*anyopaque) f64 = null,
@@ -583,9 +662,9 @@ pub const PatternBuilder = struct {
     }
 
     /// Sorts and dedups the keys into an `n`-column CSC pattern and returns
-    /// nnz. Rows come out ascending within each column. O(keys): a counting
-    /// sort by column, then each column's few rows sorted in place, two
-    /// passes over the keys where a 16-bit radix sort makes four.
+    /// nnz. Rows come out ascending within each column. O(keys + n), with no
+    /// comparison sort, so a hub column (a supply or a shared gate net: 800k
+    /// keys on 200,000 parallel inverters) costs what a short one does.
     /// Caller owns `col_ptr_out` (n + 1 entries) and `row_idx_out` (nnz) and
     /// must free them with `gpa`; `scratch` is only used during the call.
     /// On error neither output is written. Asserts that every row and column
@@ -594,34 +673,52 @@ pub const PatternBuilder = struct {
         const all = self.keys.items;
         const col_ptr = try gpa.alloc(u32, n + 1);
         errdefer gpa.free(col_ptr);
+        const row_ptr = try scratch.alloc(u32, n + 1);
+        defer scratch.free(row_ptr);
+        const by_row = try scratch.alloc(u32, all.len);
+        defer scratch.free(by_row);
         const rows = try scratch.alloc(u32, all.len);
         defer scratch.free(rows);
-        const next = try scratch.alloc(u32, n);
-        defer scratch.free(next);
-        // Counting sort by column.
+        // A counting sort by row, then a stable one by column: each
+        // column's rows arrive ascending. Each `*_ptr[i]` serves as bucket
+        // i's cursor and ends as its end, which is bucket i + 1's start.
         @memset(col_ptr, 0);
+        @memset(row_ptr, 0);
         for (all) |k| {
             assert(k >> 32 < n);
+            assert(@as(u32, @truncate(k)) < n);
             col_ptr[@intCast((k >> 32) + 1)] += 1;
+            row_ptr[@as(u32, @truncate(k)) + 1] += 1;
         }
-        for (0..n) |j| col_ptr[j + 1] += col_ptr[j];
-        @memcpy(next, col_ptr[0..n]);
-        for (all) |k| {
-            const c: usize = @intCast(k >> 32);
-            rows[next[c]] = @truncate(k);
-            next[c] += 1;
-        }
-        // Each column sorted, then compacted toward the front: a write at
-        // `m` never passes the read.
-        var m: u32 = 0;
-        var lo: u32 = 0;
         for (0..n) |j| {
-            const hi = col_ptr[j + 1];
+            col_ptr[j + 1] += col_ptr[j];
+            row_ptr[j + 1] += row_ptr[j];
+        }
+        for (all) |k| {
+            const r: u32 = @truncate(k);
+            by_row[row_ptr[r]] = @intCast(k >> 32);
+            row_ptr[r] += 1;
+        }
+        var lo: u32 = 0;
+        for (row_ptr[0..n], 0..) |hi, r| {
+            for (by_row[lo..hi]) |c| {
+                rows[col_ptr[c]] = @intCast(r);
+                col_ptr[c] += 1;
+            }
+            lo = hi;
+        }
+        assert(lo == all.len);
+        // Each column compacted toward the front: a write at `m` never
+        // passes the read.
+        var m: u32 = 0;
+        lo = 0;
+        for (0..n) |j| {
+            const hi = col_ptr[j];
             const col = rows[lo..hi];
-            std.mem.sortUnstable(u32, col, {}, std.sort.asc(u32));
             const first = m;
             for (col) |r| {
                 assert(r < n);
+                if (m != first) assert(rows[m - 1] <= r);
                 if (m != first and rows[m - 1] == r) continue;
                 rows[m] = r;
                 m += 1;
@@ -765,7 +862,17 @@ pub const GpuPayload = struct {
 //     names its frozen instance (#237).
 // 39: `GpuPayload.held_initial`/`committed_initial`, the host batch's
 //     `analog initial` latch, which resident GPU batches advance.
-pub const abi_version: u32 = 39;
+// 40: `Batch.sim_offset`, the stored `SimState` a host writes without calling
+//     `set_sim_state` (`Batch.publishSim`).
+// 41: `Hooks.track_charges` and `Hooks.charges_clean`, the N3 lever's
+//     per-batch switch and verdict; `BypassTol.c4`.
+// 42: `Hooks.census`, `Hooks.census_counts` and `CensusCounts`, N6's latency
+// census (statistics only); `Hooks.stage_moved`, N3's tracked threaded stage
+// (a verdict per range); `BypassTol.stats`.
+// 43: `Hooks.census_accept`; the limit census counts against the last
+// accepted point.
+// 44: `BypassTol.hold`, the `c4h` measurement bit.
+pub const abi_version: u32 = 44;
 
 /// A device type's construction entry points, exported by each device object
 /// and by runtime-loaded `.so` devices. Every blob pointer it takes must be
@@ -829,7 +936,7 @@ comptime {
     // plane slices may ride along on that path.
     assert(@sizeOf(Planes) == 4 * @sizeOf([]f64));
     // Every Newton iteration walks the circuit's `[]Batch` and calls `eval`
-    // through each; one cache line per batch (59 bytes of fields on a
+    // through each; one cache line per batch (61 bytes of fields on a
     // 64-bit target, 64 with padding) keeps that walk one line per type.
     assert(@sizeOf(Batch) <= 64);
     // The two `halves` bits are distinct.

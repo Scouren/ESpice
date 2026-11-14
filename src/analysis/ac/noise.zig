@@ -2,13 +2,12 @@
 //! Each frequency is one adjoint solve (a lane of `freq.Stream`); the source
 //! PSDs come from the devices' noise models. Densities are V^2/Hz internally
 //! and the published plots are V/sqrt(Hz) and V rms. The same sweep feeds
-//! `.acphasenoise` (dBc/Hz), the per-generator contribution columns
-//! (`noise_columns.zig`) and the sampler-folded `onoise_sampled` column.
-//! In: a run context and `.noise` options. Out: one of three real plots.
+//! the per-generator contribution columns (`noise_columns.zig`) and the
+//! sampler-folded `onoise_sampled` column.
+//! In: a run context and `.noise` options. Out: one of two real plots.
 //! Cites ngspice noisean.c (:376, :436-439, :487-488), ninteg.c (:24-45),
 //! noisedef.h (:105-113) and resnoise.c (:145-150); Verilog-AMS LRM §4.6.4;
-//! IEEE 1139 (L(f) = S(f)/2); #83, #84; dev/analysis/ac-small-signal-noise.md
-//! and dev/analysis/phase-noise.md.
+//! #83, #84; dev/analysis/ac-small-signal-noise.md.
 //!
 //! Contents:
 //! - `pub const Options = core.query.Noise`
@@ -87,9 +86,8 @@ pub fn plan(ctx: *const root.RunCtx, opts: Options) !freq.Plan {
 /// totals, as ngspice's `.noise ... pts` does: per generator name and per
 /// instance, `onoise_<inst>_<gen>` and `onoise_<inst>` in the spectrum,
 /// `v(onoise_total_<inst>_<gen>)`, `v(inoise_total_<inst>_<gen>)` and the
-/// instance sums in the integrated plot. `opts.phase` replaces all of it
-/// with the single-sideband phase noise in dBc/Hz, and `opts.sample` adds
-/// the folded `onoise_sampled` column to the spectrum.
+/// instance sums in the integrated plot. `opts.sample` adds the folded
+/// `onoise_sampled` column to the spectrum.
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const scratch = ctx.scratch_allocator;
     const srcs = try ctx.circuit.collectNoiseSources(ctx.x_op, scratch);
@@ -106,7 +104,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     var columns: Columns = .{};
     var per_source: ?PerSource = null;
     if (opts.contributions) {
-        columns = try Columns.build(ctx.allocator, ctx.circuit.batches, ctx.circuit.batch_types, opts.card_names, srcs.len);
+        columns = try Columns.build(ctx.allocator, ctx.circuit.batches, ctx.circuit.batch_types, opts.card_names, opts.quiet, srcs.len);
         @memset(per_buf, 0);
         per_source = .{ .dens = per_buf[0 .. srcs.len * n_points], .out = per_buf[srcs.len * n_points ..][0..srcs.len], .in = per_buf[srcs.len * (n_points + 1) ..] };
     }
@@ -114,7 +112,6 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     // ngspice's two noise plots, with ngspice's names and units: the curves
     // are amplitude spectra (V/sqrt(Hz)) and the totals are V rms. `inoise`
     // is the same noise referred to the input source's terminals.
-    if (opts.phase) return phasePlot(ctx.allocator, sp);
     if (opts.integrated) return integratedPlot(ctx, opts, columns, per_source, integrated);
     const folded = if (opts.sample) |s| try sampled(ctx.circuit, ctx.x_op, srcs, sp.freqs, s, opts, scratch) else null;
     defer if (folded) |f| scratch.free(f);
@@ -125,13 +122,12 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
 /// Returns the columns `run` publishes for `opts` over `batches`, which
 /// `session.schemaOf` reports before the query runs (#83).
 pub fn columnCount(gpa: Allocator, batches: []const abi.Batch, types: []const abi.DeviceType, opts: Options) Columns.Error!usize {
-    if (opts.phase) return 2;
     var n_cols: usize = 0;
     if (opts.contributions) {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
 
-        n_cols = (try Columns.build(arena.allocator(), batches, types, opts.card_names, noise_columns.sourceCount(batches))).labels.len;
+        n_cols = (try Columns.build(arena.allocator(), batches, types, opts.card_names, opts.quiet, noise_columns.sourceCount(batches))).labels.len;
     }
     return if (opts.integrated) 2 * n_cols + 2 else n_cols + 3 + @intFromBool(opts.sample != null);
 }
@@ -343,19 +339,6 @@ fn sampled(ckt: *root.Circuit, x_op: []const f64, srcs: []const NoiseSource, fre
 
 fn orderF64(a: f64, b: f64) std.math.Order {
     return std.math.order(a, b);
-}
-
-/// `.acphasenoise`: the output PSD is in rad^2/Hz, and phase noise is the
-/// single-sideband L(f) = S(f)/2 (IEEE 1139; the HSPICE manual gives no
-/// formula, unconfirmed).
-fn phasePlot(a: Allocator, sp: Spectra) Allocator.Error!root.Result {
-    const names = try a.dupe([]const u8, &.{ "frequency", "phnoise" });
-    const data = try a.alloc(f64, 2 * sp.freqs.len);
-    for (sp.freqs, sp.density, 0..) |f, d, i| {
-        data[2 * i] = f;
-        data[2 * i + 1] = 10 * std.math.log10(d / 2);
-    }
-    return .{ .plotname = "AC Phase Noise Analysis", .varnames = names, .is_complex = false, .npoints = sp.freqs.len, .data = data };
 }
 
 /// The integrated plot: per-contribution rms totals, then the two totals.

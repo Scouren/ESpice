@@ -5,7 +5,7 @@ A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compi
 through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
-espice deck.sp                                   # ngspice, HSPICE or Spectre deck, detected
+espice deck.sp                                   # ngspice deck; HSPICE or Spectre detected, translated by spice2rack
 espice -r out.raw deck.sp                        # also write waveforms
 espice --format=touchstone -r out.s2p deck.sp
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes
@@ -103,7 +103,7 @@ VACASK). The decks live in the
 (`git submodule update --init tests/conformance`; the flake reads the same commit as its `conformance`
 input). Add or fix a deck there, then move the submodule and `nix flake update conformance` together. Narrow a run with `-Dtest-filter=NAME` (unit tests) and
 `-- --filter op/` (decks). Benchmarks:
-`nix develop .#benchmarking -c zig build bench`. What each check proves, and which run when: [TESTING.md](TESTING.md).
+`nix develop .#benchmarking -c zig build bench`, charted per analysis by `tools/bench_plot.py` (each release attaches them; the history over releases is on the [`bench-history`](https://github.com/OpenFAT/ESPice/releases/tag/bench-history) release). What each check proves, and which run when: [TESTING.md](TESTING.md).
 
 ## Contributing
 

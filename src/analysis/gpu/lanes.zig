@@ -159,6 +159,9 @@ pub const FixedLane = struct {
     q_prev: []f64,
     i_prev: []f64,
     period: f64,
+    /// Seconds: the period's start on the sources' time axis
+    /// (`Pss.t_origin`); wave rows count time from it.
+    t_origin: f64 = 0,
     n_samples: u32,
     probes: []const u32,
     wave: []f64,
@@ -168,7 +171,8 @@ pub const FixedLane = struct {
 /// entry i of lane l at `i * N + l`. x, x_old, dx, cur, prev, rhs, q hold
 /// n + 1 rows, g, c, a nnz + 1 slots (rhs, q, g, c plus staging tails for
 /// coloured batches). The LTE tape ring holds entry j of physical slot k at
-/// `(k * n_qt + j) * N + l`, `ip_qt` entry j at `j * N + l`. Then per-lane
+/// `(k * n_qt + j) * N + l`, `ip_qt` entry j at `j * N + l`, and the
+/// coupled-inductor fix table (`lanes_lte`: `lte_dst`, `lte_src`). Then per-lane
 /// scalars and flags; the tables (tape, CSC, current rows, diagonal,
 /// probes); the device words (decide: lanes whose Newton ended this round;
 /// first: the lowest lane the dense peel took, all ones for none; over:
@@ -178,7 +182,11 @@ pub const FixedLane = struct {
 /// report, stops); a launch's ring of `max_rounds` reports and probe rows,
 /// its slot word and the dense peel's launch-wide count and lowest failing
 /// lane; the device `.meas` passes (columns, every (pass, lane) state lane
-/// major, each lane's resolving ring slot).
+/// major, each lane's resolving ring slot); then the lane-uniform hold and
+/// gmin-stamp tables (`lanes_newton.putTables`), and each lane's
+/// `[gmin, hold scale]` for the ladder's rungs (`NewtonOpts.per_lane`);
+/// then a gear-3..6 run's per-lane `LaneGear` and order-control bounds
+/// (one byte each otherwise).
 pub const Dev = enum(u8) {
     x,
     x_old,
@@ -199,6 +207,8 @@ pub const Dev = enum(u8) {
     ip,
     ring_qt,
     ip_qt,
+    lte_dst,
+    lte_src,
     sc,
     sims,
     active,
@@ -243,6 +253,11 @@ pub const Dev = enum(u8) {
     meas_cols,
     meas,
     meas_resolved,
+    force,
+    stamps,
+    homotopy,
+    gear,
+    lte_gear,
 };
 
 /// Rows of `GpuLanes.bufs`.
@@ -255,6 +270,8 @@ pub const GpuLanes = struct {
     n: u32,
     nnz: u32,
     n_hist: u32,
+    /// LTE states per lane and the tape ring's stride: the charge tape,
+    /// then a K card's inductor branch rows (`Sim.lte_rows`, `lanes_lte`).
     n_qt: u32,
     n_probes: u32,
     has_charge: bool,
@@ -281,6 +298,9 @@ pub const GpuLanes = struct {
     sims: []SimState = &.{},
     lte_in: []lk.LteIn = &.{},
     lte_out: [][2]f64 = &.{},
+    /// A gear-3..6 run's (`Ops.attempt`, `Ops.boundGear`); empty otherwise.
+    gear: []lk.LaneGear = &.{},
+    lte_gear: [][2]f64 = &.{},
     gate: []lk.Gate = &.{},
     query: []u32 = &.{},
     ops: []u8 = &.{},
@@ -339,11 +359,14 @@ pub const GpuLanes = struct {
     /// touches of coloured batches (`lane_color.zig`).
     stage_slots: u32 = 0,
     stage_rows: u32 = 0,
+    /// Entries of the coupled-inductor fix table; 0 without a K card, and
+    /// then no `lte_fix` runs.
+    n_fix: u32 = 0,
 
     const Self = @This();
 
     /// The pinned mirror fields, in their order in `pin_block`.
-    pub const pinned_mirrors = .{ "sc", "sims", "lte_in", "lte_out", "gate", "query", "ops", "accept_", "round", "perm_q", "perm_qt", "slot0", "fail", "probe_out", "words", "stop", "ring_report", "ring_rows", "meas_resolved" };
+    pub const pinned_mirrors = .{ "sc", "sims", "lte_in", "lte_out", "gear", "lte_gear", "gate", "query", "ops", "accept_", "round", "perm_q", "perm_qt", "slot0", "fail", "probe_out", "words", "stop", "ring_report", "ring_rows", "meas_resolved" };
 
     /// Most rounds one `deviceLaunch` runs; the ring holds this many.
     pub const max_rounds = 16;
@@ -417,14 +440,15 @@ comptime {
 /// `cuda`/`hip` does unless `ESPICE_LANES=0`; `auto` only on a device whose
 /// FP64 rate is at least a quarter of FP32 (datacenter parts report 2; the
 /// RTX 4060 Laptop 64, where E1 measured the GPU at 1.4-2x the 24-core CPU,
-/// so `auto` keeps the CPU there).
+/// so `auto` keeps the CPU there). The rate is the calibrated machine's
+/// (`config.machine`), so the policy never starts the driver; no machine
+/// keeps the CPU.
 pub fn policy(config: anytype) bool {
     if (config.knobs.lanes) |on| if (!on) return false;
     return switch (config.backend) {
         .cpu => false,
         .cuda, .hip => available,
-        // An unknown ratio (HIP, no driver) keeps the CPU.
-        .auto => available and (lanes_batch.fp64Ratio() orelse return false) <= 4,
+        .auto => available and (config.machine orelse return false).c.fp64_ratio <= 4,
     };
 }
 
@@ -451,8 +475,8 @@ pub fn share(cpus: usize) f64 {
 pub fn staticPolicy(config: anytype, cpus: usize) bool {
     if (@import("builtin").is_test) return test_access.static;
     if (config.backend != .auto) return true;
-    const ratio = lanes_batch.fp64Ratio() orelse return false;
-    return 13.0 * 64.0 / @as(f64, @floatFromInt(@max(ratio, 1))) > @as(f64, @floatFromInt(@max(cpus, 1)));
+    const ratio = (config.machine orelse return false).c.fp64_ratio;
+    return 13.0 * 64.0 / @max(ratio, 1) > @as(f64, @floatFromInt(@max(cpus, 1)));
 }
 
 /// Why `ckt`'s pattern cannot solve operating points or `.dc` points as

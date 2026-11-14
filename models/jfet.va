@@ -28,6 +28,7 @@ module jfet(d, g, s);
 
     // ---- DC channel ---------------------------------------------------------
     parameter real vto    = -2.0;                // V     threshold
+    aliasparam vt0 = vto;                    // ngspice jfet.c:53 IOPR spelling
     parameter real beta   = 1.0e-4 from [0:inf); // A/V^2 transconductance
     parameter real lambda = 0.0    from [0:inf); // 1/V   channel-length mod
     parameter real b      = 1.0    from [0:inf); // -     Sydney doping profile
@@ -46,7 +47,8 @@ module jfet(d, g, s);
     // ---- temperature (jfettemp.c) --------------------------------------------
     parameter real tnom    = $simparam("tnom");   // degC nominal
     // temp = -273.15 is the "not given" sentinel: any card value is an absolute
-    // override, otherwise the circuit temperature (JFETtemp = CKTtemp + dtemp).
+    // override that ignores dtemp, otherwise JFETtemp = CKTtemp + dtemp
+    // (jfettemp.c:83-88).
     parameter real temp    = -273.15;             // degC absolute override
     parameter real dtemp   = 0.0;                 // degC instance offset
     parameter real eg      = 1.11 from (0:inf);   // eV  bandgap for IS(T)
@@ -88,7 +90,7 @@ module jfet(d, g, s);
         // ---- bias-independent prep: temperature, geometry, cap constants
         // (jfettemp.c).
         tnk    = tnom + 273.15;
-        tj     = (temp > -273.0 ? temp + 273.15 : $temperature) + dtemp;
+        tj     = temp > -273.0 ? temp + 273.15 : $temperature + dtemp;
         vt     = 1.38064852e-23 / 1.6021766208e-19 * tj;
         vtnom  = 1.38064852e-23 / 1.6021766208e-19 * tnk;
         // IS(T), jfettemp.c: exp((T/tnom-1)*eg/(n*vt)), times (T/tnom)^XTI
