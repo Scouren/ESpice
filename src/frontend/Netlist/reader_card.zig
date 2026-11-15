@@ -14,6 +14,7 @@
 //! - `pub fn commit(r: *Reader, head: []const u8, letter: u8, frame: *const Frame) Error!void`
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Ast = @import("../Ast.zig");
 const card_rows = @import("card_rows.zig");
 const reader_values = @import("reader_values.zig");
@@ -22,6 +23,7 @@ const reader_frame = @import("reader_frame.zig");
 const reader_models = @import("reader_models.zig");
 const reader_nets = @import("reader_nets.zig");
 const reader_diag = @import("reader_diag.zig");
+const card_table = @import("card_table.zig");
 const Allocator = std.mem.Allocator;
 const F = Ast.Cursor;
 const Error = card_rows.Error;
@@ -159,7 +161,13 @@ pub fn splitTerminals(r: *Reader) Error!void {
     try pos.replaceRange(r.arena, 0, mi, &.{});
 }
 
+/// Commits the card scratch as card `head`'s hyperedge of kind `letter`
+/// under `frame`. `head` is the card's head word: its name is
+/// `card_table.headName`'s, and a B card's flattened name takes its
+/// first letter (a behavioural E/F/G/H keeps its own). Asserts the name
+/// is not empty.
 pub fn commit(r: *Reader, head: []const u8, letter: u8, frame: *const Frame) Error!void {
+    assert(head.len > 0);
     const arena = r.arena;
     try r.card.pins.resize(arena, r.card.nodes.items.len);
     for (r.card.nodes.items, r.card.pins.items) |n, *pin| pin.* = try reader_nets.netOf(r, frame, n);
@@ -204,7 +212,9 @@ pub fn commit(r: *Reader, head: []const u8, letter: u8, frame: *const Frame) Err
     const pv = r.card.positional.items;
     const model_at: ?usize = if (pv.len > 0 and pv[0] == .name) 0 else if (std.mem.indexOfScalar(u8, "rcl", letter) != null and pv.len > 1 and pv[0] == .num and pv[1] == .name) 1 else null;
     const model: u32 = if (model_at) |k| try reader_models.modelRow(r, letter, pv[k].name, positional.start, frame) else none;
-    const name = try reader_nets.internName(r, if (frame.path) |path| try reader_nets.joined(r, &[_][]const u8{ &.{name_letter}, ".", path, ".", head }) else head);
+    const card_name = card_table.headName(head);
+    assert(card_name.len > 0);
+    const name = try reader_nets.internName(r, if (frame.path) |path| try reader_nets.joined(r, &[_][]const u8{ &.{name_letter}, ".", path, ".", card_name }) else card_name);
     _ = r.nl.hg.addEdge(arena, .{
         .kind = letter,
         .name = name,

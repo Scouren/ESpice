@@ -96,7 +96,7 @@ pub fn behaviouralPassive(r: *Reader, card: F, letter: u8, outer: *const Frame) 
     const arena = r.arena;
     const line = card.line;
     var f = card;
-    const head = f.field().?;
+    const head = card_table.headName(f.field().?);
     const n1 = f.field().?;
     const n2 = f.field().?;
 

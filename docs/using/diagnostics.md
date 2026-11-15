@@ -23,11 +23,6 @@ Error: bad_args.sp: InvalidAnalysisArguments
 | `UnsupportedSelfHeating` | a card ngspice would self-heat on a model ESPice runs isothermal: a VDMOS with a thermal node, or with `thermal` and `rthjc`; a B3SOI-FD or -DD with `shmod=1` and a non-zero `rth0`. A diode self-heats ([diode self-heating](devices.md#diode-self-heating)) | drop the thermal node, the flag or `rth0` to run it isothermal |
 | `LibrarySectionNotFound`, `InvalidLibrarySection` | `.lib file section` names a section the file does not have | check the section names inside the library |
 | `IncludeDepthExceeded` | includes nested more than 32 deep, usually a file including itself | |
-| `SpiceRackNotFound` | a deck in another dialect than ngspice, and no `spice2rack` to translate it: not at `--spicerack`, `$ESPICE_SPICERACK` or on `PATH` | install SpiceRack, or name it with `--spicerack=PATH`; `--tokenizer=ngspice` reads the deck as written. See [Dialects](dialects.md#other-dialects-spicerack) |
-| `SpiceRackRefused` | `spice2rack` refused a construct of the deck: the line before names its file, line, column and code (`error: spicerack: deck.sp: deck:6:1: W0001 a statement kept as another dialect's text`) | rewrite what SpiceRack names, or report the construct to SpiceRack |
-| `SpiceRackFailed` | `spice2rack` failed some other way: an unreadable deck, a crash (exit 101) or a signal, a usage error, or past 64 KiB of stdout or 1 MiB of stderr; the line before has its exit | report it to SpiceRack with that line |
-| `SpiceRackNoEntry` | `spice2rack` succeeded but printed no single path of a translated deck that exists | a SpiceRack without `--to espice --kit`: update it |
-| `SpiceRackNeedsFile` | a deck in another dialect came through a pipe or FIFO (`/dev/stdin`, `<(...)`): spice2rack opens the deck by path, with no stdin, and would read nothing | save it to a file first |
 
 ```text
 error: netlist: cannot read the card: .subckt
@@ -148,6 +143,70 @@ Error: measure  t50 : out of interval
 | `VpiUnavailable` | a VPI application in a build without a VPI host (the C API, an embedding) |
 
 See [Verilog-A](devices.md#your-own-verilog-a) for the requirements.
+
+## The ESPice language { #language }
+
+A file in the [ESPice language](language.md) is checked whole before it is
+read, and every problem is one line: file, line, column, a code and what
+it is about. ESPice reports them all, not only the first. Any `E` line
+fails the deck with `ParseError`; an included file in the language that
+fails gives `InvalidLanguageInclude`. A `W` line is a warning and the run
+goes on. The first digit of a code is the stage: 1 the characters and
+numbers, 2 the grammar, 3 the statement's keys, types and units, 4 what the
+lowering to legacy cards refuses. Codes are never renumbered.
+
+What needs the whole deck (that a master, node or source exists, that a
+device declares a parameter) is checked when the circuit is built, and
+fails with the errors of the sections below.
+
+```text
+error: deck.sp:3:12: E3006: a unit that is not the slot's: 1.8V
+Error: deck.sp: ParseError
+```
+
+| Code | Means | Fix |
+|---|---|---|
+| `E1001` | a character the language does not use | Names, numbers, strings in double quotes, brackets and the operators of the Expressions section; comments are //. |
+| `E1002` | a string with no closing quote on its line | Close the string with " before the end of the line. |
+| `E1003` | a number that does not read | digits [. digits] [e [+\|-] digits] [prefix] [unit]. |
+| `E1004` | a bare M: mega needs a unit | M is mega and m milli; write 1MHz, 1MOhm or 1e6. |
+| `E1005` | a SPICE scale suffix the language does not read | meg is M with a unit (1MHz), mil is 25.4um, x is M; K U N P are written k u n p. |
+| `E1006` | an unknown unit | Units: V A s Hz Ohm S F H m C deg %. |
+| `E1007` | a legacy operator | Write ** for ^, != for <>, idiv() for \, and parentheses for '...' and {...}. |
+| `W1008` | 1F is one farad | Femto is 1f or 1fF. |
+| `E1009` | a prefix before % | A ratio is a plain number before %: 5%. |
+| `E2001` | the header is not .espice 1 | Line 1 of a file in this language is .espice 1. |
+| `E2002` | unexpected token | See the grammar in Files and statements. |
+| `E2003` | a bracket or block left open | Close every (, [ and { the file opens. |
+| `E2004` | nested deeper than the front end reads | Expressions and blocks nest at most 256 levels. |
+| `E2005` | a positional argument after a keyed one | A call takes its positional arguments first, then key=value. |
+| `E2006` | a block brace not at the end or start of its line | { closes the line that opens a block, and } stands on a line of its own. |
+| `E2007` | a } with no block open | Remove it, or open the block it closes. |
+| `E3001` | an unknown directive | The directives are the ones language.md lists. |
+| `E3002` | an unknown key | The keys of a statement are the ones its signature lists. |
+| `E3003` | a word the setting does not list | An enum takes one of its listed words. |
+| `E3004` | a required key is missing | Give every key the signature does not bracket. |
+| `E3005` | a key given twice | Give each key once; the bare principal value counts as its key. |
+| `E3006` | a unit that is not the slot's | Write the slot's unit, none, or an expression. |
+| `E3007` | a fraction in an integer slot | Write a whole number. |
+| `E3008` | a value of the wrong kind | The slot's type says what it takes (Types). |
+| `E3009` | the wrong number of arguments | See the statement's signature. |
+| `E3010` | reads the circuit outside a behavioural source | v(), i(), time, temper, hertz, ddt and the step functions belong in a bsource, or a resistor, capacitor or inductor value. |
+| `E3011` | a statement where it cannot stand | See where the statement may appear in language.md. |
+| `E3012` | a model family or polarity the table does not list | See the family table in Models. |
+| `E3013` | a quoted name with a character names may not hold | A quoted name holds no blank, (, ), comma, =, quote or brace. |
+| `E3014` | not in the language | See Not in the language for the spelling to use. |
+| `E3015` | a port list mixing positional and named ports | Write all ports by position or all as port=node. |
+| `E3016` | a Verilog-A or Verilog file read with .include | Load it with .hdl "model.va". |
+| `E3017` | an instance name used twice in one block | Names ignore case; give each instance of a block its own name. |
+| `E3018` | a .stim pwl signal whose name does not start with v or i | The name's first letter says the source it becomes: v for a voltage, i for a current. |
+| `E3201` | a measurement function the result kind does not take | thd snr sndr enob sfdr read fft; jitter tran or trannoise; em_avg tran; the margins lstb; find with neither at nor when dcmatch, lstb or op. |
+| `E3202` | a waveform where a measurement takes a value | v(), i() and time stand in a signal; a level, a key's value and a computed measurement read parameters and earlier results. |
+| `E4001` | no longer reported | Every statement lowers; the code is kept so that no code is renumbered. |
+| `E4002` | an argument the legacy card cannot leave out | Give the omitted arguments before it explicitly. |
+| `E4003` | a construct with no legacy card that means it | Write the construct in the legacy dialect, or leave it out. |
+| `E4004` | a sweep clause on a statement that takes none | Only an analysis takes sweep; vary a parameter with .step. |
+| `E4201` | a measurement inside arithmetic | Give the inner measurement its own .meas and use its name; only cross(...) - cross(...) combines two. |
 
 ## Why does my deck fail?
 

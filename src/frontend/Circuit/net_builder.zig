@@ -95,6 +95,9 @@ pub const NetBuilder = struct {
     /// as `Deck.noise_gaps`, which refuses `.noise` and nothing else.
     /// `net_devices.boundCard` appends, once per model row.
     noise_gaps: std.ArrayList(core.NoiseGap) = .empty,
+    /// What the topology check found (`net_topology`), names borrowed from
+    /// the deck and the Builder: published as `Deck.topology`.
+    topology: core.Topology = .{},
     /// One row per I card. An I source has no branch row, so a `.tf` driven
     /// from one excites the node pair.
     i: std.MultiArrayList(struct { name: []const u8, pos: u32, neg: u32 }) = .empty,
@@ -370,10 +373,10 @@ pub const NetBuilder = struct {
     /// the built-in ones, a topology check, the subcircuit tags of the BBD
     /// permutation, then the runtime-loaded (.hdl) ones. V and L go first;
     /// F/H/W/K wait until the end so the rows they name exist. Refuses a
-    /// card it cannot bind, a loop of V/L shorts whose KVL sum disagrees
-    /// (VoltageSourceLoop) and a node only current sources reach
-    /// and no `.ic` holds (CurrentSourceCutset); a capacitor-only node, or
-    /// a `.ic`-held one, sets `needs_tran_op`.
+    /// card it cannot bind, a loop of V sources alone (VoltageSourceLoop,
+    /// NonuniqueOperatingPoint) and a net no element touches
+    /// (FloatingNode); records in `topology` what only an operating point
+    /// refuses, and a node with no DC path sets `needs_tran_op`.
     pub fn build(self: *NetBuilder) !void {
         for ("vlifhwkabcdegjmnopqrstuxyz") |c| for (self.nl.bucket(c)) |e| {
             const dev = self.nl.device(e);
@@ -460,6 +463,10 @@ pub fn subject(self: *const NetBuilder, buf: []u8, dev: Device, err: anyerror) ?
         },
         error.UnsupportedDevice => if (dev.model) |m|
             w.print("model '{s}' ({s}) is not a device this card can use", .{ m.name, m.kind }) catch return null
+        else if (dev.kind == 'n')
+            // An N card, or an ESPice-language instance whose master the
+            // reader found as neither a subcircuit nor a `.model`.
+            w.print("'{s}' is no subcircuit, .model or loaded Verilog-A module", .{Value.nameAt(dev.positional, 0) orelse return null}) catch return null
         else if (std.mem.indexOfScalar(u8, "mqdjz", dev.kind) != null)
             w.writeAll("no .model this card can use: its model name is not defined, or no bin of it holds the card's L and W") catch return null
         else

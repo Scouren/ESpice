@@ -1,0 +1,9 @@
+.espice 1
+.title "Diode forward voltage from a library corner"
+// .lib "file" section reads one section; .include reads a whole file.
+.lib "models.esp.lib" slow
+.include "divider.esp.inc"
+I1 (0 a)     isource 1mA
+D1 (a 0)     dlib
+X1 (a mid 0) divider
+.op

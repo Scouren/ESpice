@@ -1,0 +1,7 @@
+.espice 1
+.title "Divider with a Verilog-A resistor"
+.hdl "vres.va"
+V1 (in 0)   vsource  1V
+R1 (in out) resistor 1k
+N1 (out 0)  vres     r=3k
+.op

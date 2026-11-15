@@ -1,0 +1,9 @@
+.espice 1
+.title "BJT bias point and output curves"
+VCC (vcc 0)   vsource  5V
+VB  (b 0)     vsource  0.7V
+Q1  (c b 0)   qnpn
+RC  (vcc c)   resistor 1k
+.model qnpn gummel_poon type=npn is=1e-15 bf=150 vaf=80
+.op
+.dc VCC=lin(0, 5V, step=0.05V) VB=lin(0.65V, 0.75V, step=0.05V)

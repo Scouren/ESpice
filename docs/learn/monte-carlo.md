@@ -7,17 +7,17 @@ to do it.
 
 ## `.mc`: vary everything
 
-`.mc N [sigma]` solves the DC operating point N times. In each trial every
+`.mc trials=N [sigma=]` solves the DC operating point N times. In each trial every
 nonzero primary value (a resistance, a source's DC value, ...) is drawn
 from a Gaussian with relative standard deviation `sigma` (5 % when left
 out).
 
-```spice
---8<-- "examples/monte_carlo.sp"
+```espice
+--8<-- "examples/monte_carlo.esp"
 ```
 
 ```sh
-espice monte_carlo.sp --rawfile mc.txt --format=print
+espice monte_carlo.esp --rawfile mc.txt --format=print
 ```
 
 ```text
@@ -31,10 +31,10 @@ Index	run	i(v1)	v(in)	v(out)
 
 One row per trial. V1 varies too: `v(in)` is not exactly 1 V.
 
-## `agauss` and `MONTE=`: vary what you choose
+## `agauss` and `sweep monte`: vary what you choose
 
 For control over which values vary, write the distribution into the deck
-and ask an analysis to run as a Monte Carlo sweep with `MONTE=n`.
+and ask an analysis to run as a Monte Carlo sweep with `sweep monte(n)`.
 
 | Function | Draws |
 |---|---|
@@ -47,16 +47,16 @@ Outside a Monte Carlo run these functions return `nom`, so the same deck
 also simulates the nominal circuit.
 
 ```text
-.dc MONTE=n                  n trials of the operating point
-.tran ... SWEEP MONTE=n      n transients (also .ac, .dc with a sweep)
+.dc sweep monte(n)           n trials of the operating point
+.tran ... sweep monte(n)     n transients (also .ac, .dc with a target)
 .option seed=N               a fixed seed: the same trials every run
 ```
 
 Here only the two resistors vary, each by 1 % (30 Ω at 3 sigma), and V1
 stays at exactly 1 V:
 
-```spice
---8<-- "examples/monte_agauss.sp"
+```espice
+--8<-- "examples/monte_agauss.esp"
 ```
 
 ```text
@@ -73,12 +73,12 @@ resistors predict 0.5 V × 0.01 / √2 = 3.5 mV.
 
 A transient run with a measurement gets statistics over the trials:
 
-```spice
---8<-- "examples/monte_tran.sp"
+```espice
+--8<-- "examples/monte_tran.esp"
 ```
 
 ```sh
-espice monte_tran.sp
+espice monte_tran.esp
 ```
 
 ESPice prints `tc` once for the nominal run and once per trial, then the
@@ -101,30 +101,32 @@ An `agauss` in a `.param` is drawn once per trial and shared by every
 element that uses the parameter, a B source's expression included; an
 `agauss` written directly on an element
 is drawn for that element alone. That is the difference between global
-(process) and local (mismatch) variation. HSPICE-style `DEV` and `LOT`
-tolerances on `.model` parameters, and the `.variation` block, work too;
-see the [language reference](../using/reference.md#statistics).
+(process) and local (mismatch) variation. `lot` and `dev` tolerances on
+`.model` parameters (`r=tol(1k, lot=gauss(5%), dev=unif(2%))`) and the
+`.variation` block work too; see the
+[language reference](../using/language.md#statistics).
 
-A distribution inside a `.model` card is drawn per trial as well, once per
+A distribution inside a `.model` is drawn per trial as well, once per
 device that uses the model. That is how a PDK states mismatch: the sky130
 `tt_mm` section sets `mc_mm_switch=1`, and its binned nfet and pfet cards
-read `MC_MM_SWITCH*AGAUSS(0,1,1)*slope/sqrt(l*w*mult)`, so `MONTE=n` on a
-sky130 deck gives n mismatch samples.
+read `MC_MM_SWITCH*AGAUSS(0,1,1)*slope/sqrt(l*w*mult)`, so
+`sweep monte(n)` on a deck that reads sky130 with `.lib` gives n mismatch
+samples.
 
 ## Rare failures: scaled sigma
 
 Counting failures needs failures to count. At 5σ one trial in 3.5 million
-fails, so plain trials cannot see it. `SIGMA_SCALE=` draws every
+fails, so plain trials cannot see it. `sigma_scale=` draws every
 distribution with its sigma 2.5, 3, ... times larger, where failures are
-common, counts them per scale against a `FAIL=` test over the `.meas`
+common, counts them per scale against a `fail=` test over the `.meas`
 results, and extrapolates the counts back to the real sigma:
 
-```spice
---8<-- "examples/monte_sss.sp"
+```espice
+--8<-- "examples/monte_sss.esp"
 ```
 
 ```sh
-espice monte_sss.sp
+espice monte_sss.esp
 ```
 
 The run ends with a table of the failures at each scale, then the
@@ -136,20 +138,20 @@ what it refuses.
 
 ## Mismatch without trials
 
-For the DC offset that mismatch causes, `.dcmatch v(out)` computes the
+For the DC offset that mismatch causes, `.dcmatch out=v(out)` computes the
 1-sigma spread directly from sensitivities, with no random trials. On a
 PDK deck without a `.variation` block it reads the same `agauss` calls a
-`MONTE=` sweep draws, so the two agree to within the linearization. The
+`sweep monte` draws, so the two agree to within the linearization. The
 [analyses reference](../using/analyses.md#dcmatch) covers it, with
 `.acmatch` and `.dcsens`.
 
 ## Exercises
 
-1. Run `monte_carlo.sp` with sigma 0.02. By how much should the spread of
+1. Run `monte_carlo.esp` with `sigma=0.02`. By how much should the spread of
    `v(out)` grow?
-2. Change `monte_tran.sp` so C varies by 10 % as well, as a separate
+2. Change `monte_tran.esp` so C varies by 10 % as well, as a separate
    parameter. What sigma do you expect for `tc`?
-3. Remove `.option seed=3` and run `monte_tran.sp` twice. Are the
+3. Remove `.option seed=3` and run `monte_tran.esp` twice. Are the
    statistics the same?
 
 ??? tip "Answers"

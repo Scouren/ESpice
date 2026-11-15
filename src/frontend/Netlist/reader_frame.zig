@@ -34,7 +34,11 @@ const Value = card_rows.Value;
 const Analysis = card_rows.Analysis;
 const isGroundName = netlist_view.isGroundName;
 
-pub const Entry = union(enum) { num: f64, text: []const u8 };
+/// A scope's value of a name: a number, a definition's text read in the
+/// scope that holds it, or an X card's actual that did not fold at the
+/// card (a Monte Carlo draw), read in the scopes outside its instance's,
+/// the caller's, as ngspice reads an actual.
+pub const Entry = union(enum) { num: f64, text: []const u8, actual: []const u8 };
 
 // Insertion-ordered, so a walk over the globals is deck order (#64).
 pub const Scope = std.StringArrayHashMapUnmanaged(Entry);

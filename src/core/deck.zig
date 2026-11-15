@@ -13,6 +13,7 @@
 //! - `pub const Stim = struct`
 //! - `pub const AcOverride = struct`
 //! - `pub const NoiseGap = struct { card: []const u8, key: []const u8 }`
+//! - `pub const Topology = struct { dc_loop, cutset, no_dc_path }`
 //! - `pub const Temper = struct`, `Temper.count(self: Temper) u32`
 //! - `pub const Variants = struct`, `Variants.Kind = enum { step, data, monte, alter }`,
 //!   `Variants.count(self: Variants) u32`,
@@ -97,6 +98,27 @@ pub const AcOverride = struct {
 /// on a deck that has one; every other analysis runs, since the key moves
 /// none of their numbers.
 pub const NoiseGap = struct { card: []const u8, key: []const u8 };
+
+/// What the frontend's DC topology check found, each the first card or
+/// node that shows it; null where there is none. Facts, not refusals: the
+/// check runs before any analysis is known, so `validate.validateDeck`
+/// refuses each query whose solve cannot meet one, at admission.
+pub const Topology = struct {
+    /// An inductor that closes a loop of V sources and inductors whose KVL
+    /// sum disagrees at DC, where an inductor is a short. Refuses every
+    /// operating point; a `uic` transient holds the inductor's current as
+    /// its state and runs.
+    dc_loop: ?[]const u8 = null,
+    /// A node only current sources reach that do not balance, and that no
+    /// `.ic` holds: static KCL has no solution. Refuses every operating
+    /// point; a `uic` transient charges the node's capacitors.
+    cutset: ?[]const u8 = null,
+    /// A node with no DC path to ground (a capacitor-only island, or one
+    /// whose current sources balance): its static operating point is not
+    /// unique. Refuses a static operating point; a transient's (OPtran)
+    /// and a `uic` start hold the node's charge.
+    no_dc_path: ?[]const u8 = null,
+};
 
 /// Device parameters whose card value reads `temper`, the circuit
 /// temperature in °C. ngspice re-evaluates them (inp_evaluate_temper) before
@@ -374,6 +396,8 @@ pub const Deck = struct {
     /// Noise-only keys the cards set and ESPice does not model, in card
     /// order. Only a `.noise` query reads it.
     noise_gaps: []const NoiseGap = &.{},
+    /// The topology check's facts; `validate.validateDeck` reads them.
+    topology: Topology = .{},
     /// The parameters that follow the circuit temperature; null when no
     /// card value reads `temper`.
     temper: ?Temper = null,

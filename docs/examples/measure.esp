@@ -1,0 +1,17 @@
+.espice 1
+.title "Measurements on an RC step response"
+// RC = 1 us. The input steps 0 -> 1 V at 1 us and back at 6 us.
+V1 (in 0)   vsource   pulse(0, 1V, td=1us, tr=1ns, tf=1ns, pw=5us, per=20us)
+R1 (in out) resistor  1k
+C1 (out 0)  capacitor 1nF
+.tran stop=10us step=10ns
+.meas tran trise  = cross(v(out), 0.9V, rise=1) - cross(v(out), 0.1V, rise=1)
+.meas tran tdelay = cross(v(out), 0.5V, rise=1) - cross(v(in), 0.5V, rise=1)
+.meas tran vat3u  = find(v(out), at=3us)
+.meas tran tcross = cross(v(out), 0.5V, fall=1)
+.meas tran vmax   = max(v(out))
+.meas tran vavg   = avg(v(out), from=0, to=10us)
+.meas tran vrms   = rms(v(out), from=0, to=10us)
+.meas tran slope  = deriv(v(out), at=2us)
+.meas tran charge = integ(i(V1), from=1us, to=6us)
+.meas tran ratio  = trise/tdelay

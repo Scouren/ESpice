@@ -19,6 +19,7 @@ const reader_values = @import("reader_values.zig");
 const reader_diag = @import("reader_diag.zig");
 const reader_card = @import("reader_card.zig");
 const reader_expand = @import("reader_expand.zig");
+const reader_instance = @import("reader_instance.zig");
 const F = Ast.Cursor;
 const Reader = reader.Reader;
 const Error = card_rows.Error;
@@ -27,19 +28,25 @@ const behavioural = card_table.behavioural;
 const Frame = reader_frame.Frame;
 
 /// Reads device card `card`, a cursor at its start, under `outer` into one
-/// hyperedge, or expands it when it is an X card.
+/// hyperedge, or expands it when it is an X card. A `?@` card is read as
+/// the legacy card its master makes (`reader_instance.legacyCard`).
 pub fn readDevice(r: *Reader, card: F, outer: *const Frame) Error!void {
     const line = card.line;
     r.diag.card = line;
     const arena = r.arena;
     var f = card;
+    // `head` is the card's first word, `name` its instance name: they
+    // differ on the lowering's `<letter>@<name>` heads, whose letter is
+    // the kind whatever the name (card_table.headName).
     const head = f.field() orelse return error.ParseError;
+    if (std.mem.startsWith(u8, head, "?@")) return readDevice(r, try reader_instance.legacyCard(r, card, outer), outer);
+    const name = card_table.headName(head);
     var own = outer.*;
     own.keep_live = true;
     const frame = &own;
-    if (r.live.monte) r.eval.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
+    if (r.live.monte) r.eval.site_owner = nameKey(nameKey(0, frame.path orelse ""), name);
     r.eval.site_ordinal = 0;
-    if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return error.ParseError;
+    if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0]) or name.len == 0) return error.ParseError;
     const letter = std.ascii.toLower(head[0]);
     if (card_table.isDataElement(letter, line)) return readDataElement(r, head, letter, &f, frame);
     if (std.mem.indexOfScalar(u8, "efgh", letter) != null) {
@@ -119,7 +126,7 @@ pub fn readDevice(r: *Reader, card: F, outer: *const Frame) Error!void {
 
     var kv_text: std.ArrayList([]const u8) = .empty;
     try reader_card.readFields(r, line, letter, &f, frame, &kv_text);
-    if (letter == 'x') return reader_expand.expand(r, head, frame, kv_text.items);
+    if (letter == 'x') return reader_expand.expand(r, name, frame, kv_text.items);
     // A D card's third node is its thermal node `tj` when a model
     // name follows it (ngspice-syntax.md §3.2, #121).
     if (letter == 'q' or letter == 'm' or letter == 'd') try reader_card.splitTerminals(r);

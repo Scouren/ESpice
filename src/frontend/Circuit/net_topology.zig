@@ -1,6 +1,9 @@
 //! The DC topology check. In: each card's pins and kind as it is added.
-//! Out: refusals for a node with no DC path to ground, an inconsistent
-//! loop of voltage sources or inductors, and a cut set of current sources.
+//! Out: refusals for what no analysis can solve (a loop of V sources alone,
+//! a net no element touches), and as `NetBuilder.topology` the facts only
+//! an operating point cannot meet (an inconsistent V/L loop, a cut set of
+//! current sources, a node with no DC path), which `core.validate`
+//! refuses per query once the analyses are known.
 //! Cites: ngspice CKTsetup-class checks; #70, #90.
 //!
 //! Contents:
@@ -84,10 +87,12 @@ pub fn compRoot(self: *NetBuilder, id0: u32) u32 {
 /// Classifies one card's nodes. `.dc` and `.short` join the pins into one
 /// DC-path component, `.cap` and `.cur` mark presence only; `.short` also
 /// joins the first two nodes as a DC short with v(node0) - v(node1) =
-/// `vshort` and rejects a loop whose KVL sum disagrees, or which V
-/// sources alone close: V cards are marked before any L, so a V that
-/// finds its pins already shorted closes a loop of V sources, whose
-/// current no equation fixes (ngspice: singular matrix).
+/// `vshort`. V cards are marked before any L, so a V that finds its pins
+/// already shorted closes a loop of V sources alone, refused for every
+/// analysis: no current satisfies its KVL when the sum disagrees, and none
+/// is fixed when it agrees (ngspice: singular matrix). An L that closes a
+/// loop whose sum disagrees is a short only at DC: it is recorded as
+/// `topology.dc_loop`, the first such card.
 pub fn topoMark(self: *NetBuilder, dev: Device, kind: enum { dc, cap, cur, short }, vshort: f64) !void {
     var first_two: [2]u32 = .{ GROUND, GROUND };
     for (dev.pins, 0..) |pin, i| {
@@ -103,21 +108,24 @@ pub fn topoMark(self: *NetBuilder, dev: Device, kind: enum { dc, cap, cur, short
         const b_ = topoRoot(self, first_two[1]);
         if (a.root == b_.root) {
             const gap = (a.pot - b_.pot) - vshort;
+            const disagrees = @abs(gap) > 1e-9 * @max(1.0, @abs(vshort));
+            if (dev.kind != 'v') {
+                if (disagrees and self.topology.dc_loop == null) self.topology.dc_loop = dev.name;
+                return;
+            }
             // The test runner fails any test that logs an error.
-            if (@abs(gap) > 1e-9 * @max(1.0, @abs(vshort))) {
+            if (disagrees) {
                 if (!@import("builtin").is_test) std.log.err(
-                    "topology: '{s}' closes an inconsistent voltage-source/inductor loop ({d} V of KVL violation)",
+                    "topology: '{s}' closes an inconsistent loop of voltage sources ({d} V of KVL violation)",
                     .{ dev.name, gap },
                 );
                 return error.VoltageSourceLoop;
             }
-            if (dev.kind == 'v') {
-                if (!@import("builtin").is_test) std.log.err(
-                    "topology: '{s}' closes a loop of voltage sources — the loop current is not unique",
-                    .{dev.name},
-                );
-                return error.NonuniqueOperatingPoint;
-            }
+            if (!@import("builtin").is_test) std.log.err(
+                "topology: '{s}' closes a loop of voltage sources — the loop current is not unique",
+                .{dev.name},
+            );
+            return error.NonuniqueOperatingPoint;
         } else {
             // Attach so every member's potential stays consistent:
             // v(b) = pot_b + pot[rb] must equal v(a) - vshort.
@@ -127,15 +135,14 @@ pub fn topoMark(self: *NetBuilder, dev: Device, kind: enum { dc, cap, cur, short
     }
 }
 
-/// Rejects a net no element touches (one only an expression reads, #92)
-/// and a component without a DC path to ground whose current sources do
-/// not balance, which static KCL cannot satisfy, unless a `.ic` card holds
-/// one of its nodes: a transient's operating point holds that node with
-/// a 1e10 S conductance (ngspice cktload.c under MODETRANOP), a DC path
-/// for that solve alone. A component that balances (capacitors only, or
-/// equal sources in and out, #70) or is so held sets `needs_tran_op`,
-/// ngspice's OPtran fallback, under which an operating point without the
-/// holds is refused (`op_ladder.solve`, error.FloatingNode).
+/// Rejects a net no element touches (one only an expression reads, #92):
+/// its row has no entry in any analysis. Records, as `topology`, the first
+/// node of a component without a DC path to ground (`no_dc_path`), and of
+/// one whose current sources do not balance (`cutset`), which static KCL
+/// cannot satisfy, unless a `.ic` card holds one of its nodes: a
+/// transient's operating point holds that node with a 1e10 S conductance
+/// (ngspice cktload.c under MODETRANOP), a DC path for that solve alone.
+/// Any such component sets `needs_tran_op`, ngspice's OPtran fallback.
 pub fn topoCheck(self: *NetBuilder) !void {
     const quiet = @import("builtin").is_test; // the test runner fails any test that logs an error
     for (self.rows) |row| {
@@ -171,10 +178,9 @@ pub fn topoCheck(self: *NetBuilder) !void {
         if (!self.topo.items(.seen)[id]) continue;
         const r = compRoot(self, @intCast(id));
         if (r == ground) continue;
-        if (!(@abs(net[r]) <= 1e-9 * mag[r]) and !held[r]) {
-            if (!quiet) std.log.err("topology: node '{s}' is a current-source cutset — its current sources do not balance and KCL has no DC path to satisfy it", .{self.b.node_labels.items[id]});
-            return error.CurrentSourceCutset;
-        }
+        const label = self.b.node_labels.items[id];
+        if (!(@abs(net[r]) <= 1e-9 * mag[r]) and !held[r] and self.topology.cutset == null) self.topology.cutset = label;
+        if (self.topology.no_dc_path == null) self.topology.no_dc_path = label;
         self.b.needs_tran_op = true;
     }
 }

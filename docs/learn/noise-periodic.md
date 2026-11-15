@@ -11,18 +11,18 @@ every noisy device (resistor thermal noise, junction shot noise, flicker
 noise):
 
 ```text
-.noise v(out[,ref]) Vinput dec|oct|lin N fstart fstop
+.noise out=v(out[,ref]) src=Vinput freq=dec(fstart, fstop, n=N)
 ```
 
-`Vinput` is the source the noise is referred back to: the input-referred
+`src` is the source the noise is referred back to: the input-referred
 noise is the output noise divided by the gain from that source.
 
-```spice
---8<-- "examples/noise.sp"
+```espice
+--8<-- "examples/noise.esp"
 ```
 
 ```sh
-espice noise.sp --rawfile noise.txt --format=print
+espice noise.esp --rawfile noise.txt --format=print
 ```
 
 ```text
@@ -39,9 +39,9 @@ The two 10k resistors look like 5k from the output, and √(4kT × 5k) at
 noise is twice that. A second plot, `Integrated Noise`, holds the total
 noise over the sweep in V rms.
 
-Add a nonzero points-per-summary number at the end of the card
-(`.noise v(out) V1 dec 1 1k 100k 1`) to also get each device's
-contribution as its own column.
+Add the flag `contributions`
+(`.noise out=v(out) src=V1 freq=dec(1kHz, 100kHz, n=1) contributions`) to
+also get each device's contribution as its own column.
 
 ## Periodic steady state
 
@@ -49,19 +49,19 @@ A circuit driven by a periodic source eventually repeats itself. A long
 `.tran` gets there by brute force; the periodic analyses solve for the
 repeating waveform directly.
 
-`.pss f0 [points]` finds the periodic steady state at fundamental `f0` by
-shooting: it searches for the start state that comes back to itself after
-one period. `.hb f0 [harmonics]` solves the same problem in the frequency
-domain with harmonic balance. `.pac` is the small-signal AC analysis around
+`.pss f0= [points=]` finds the periodic steady state at fundamental `f0`
+by shooting: it searches for the start state that comes back to itself
+after one period. `.hb f0= [harmonics=]` solves the same problem in the
+frequency domain with harmonic balance. `.pac` is the small-signal AC analysis around
 the periodic solution: a small input at frequency f shows up at the output
 at f and at every f + k·f0 sideband.
 
-```spice
---8<-- "examples/periodic.sp"
+```espice
+--8<-- "examples/periodic.esp"
 ```
 
 ```sh
-espice periodic.sp --rawfile periodic.txt --format=print
+espice periodic.esp --rawfile periodic.txt --format=print
 ```
 
 ```text
@@ -92,19 +92,19 @@ The PAC plot has one complex column per sideband, `tf_h-3` to `tf_h3`:
 the transfer from the AC source to the output at f + k·f0. `.pac` takes no
 output node: it reports the last node the deck names, `out` here.
 
-Related cards: `.pnoise` (noise around the periodic solution), `.pxf`
+Related analyses: `.pnoise` (noise around the periodic solution), `.pxf`
 (transfer from every source), `.hbac`, `.hbnoise` and `.hbxf` (the same on
 the harmonic-balance solution), `.qpss` (two incommensurate tones) and
-`.hb v(node) f` / `.pss v(node) f` for oscillators. The
+`.hb osc=v(node)` / `.pss osc=v(node)` for oscillators. The
 [analyses reference](../using/analyses.md) has them all.
 
 ## Exercises
 
-1. In `noise.sp`, make R2 1k. Does the output noise go up or down? What
+1. In `noise.esp`, make R2 1k. Does the output noise go up or down? What
    about the input-referred noise?
-2. Raise the sine in `periodic.sp` to 3 V. What happens to the second
+2. Raise the sine in `periodic.esp` to 3 V. What happens to the second
    harmonic?
-3. Change `.hb 1k 8` to `.hb 1k 2`. Which numbers change, and why is the
+3. Change `harmonics=8` to `harmonics=2` on the `.hb`. Which numbers change, and why is the
    answer less trustworthy?
 
 ??? tip "Answers"

@@ -3,9 +3,8 @@
 //! the developer knobs, and the point options and query list of the deck's
 //! own analyses. Nothing below the facade reads the environment; this file
 //! reads all of it, once per Problem or calibration run, so a C API or Zig
-//! API caller gets what the CLI gets. Two reads live elsewhere:
-//! `ESPICE_SPICERACK`, the default of the CLI's `--spicerack` (main.zig),
-//! since only the CLI runs spice2rack, and Gompute's `GOMPUTE_FAKE_DEVICES`.
+//! API caller gets what the CLI gets. One read lives elsewhere: Gompute's
+//! `GOMPUTE_FAKE_DEVICES`.
 //! Cites: none.
 //!
 //! Contents:
@@ -278,7 +277,7 @@ pub fn toolchainFromEnv(arena: Allocator, given: HdlToolchain) Allocator.Error!H
 }
 
 /// `$TMPDIR`, else `/tmp` when it is unset or empty: the `.hdl` cache's last
-/// root (`toolchainFromEnv`) and where the CLI's SpiceRack kit goes.
+/// root (`toolchainFromEnv`).
 pub fn tmpDir() []const u8 {
     return nonEmptyEnv("TMPDIR") orelse "/tmp";
 }

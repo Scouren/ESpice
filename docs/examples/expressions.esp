@@ -1,0 +1,9 @@
+.espice 1
+.title "Parameters and expressions"
+.param f0 = 1kHz  c = 10nF
+.param r = 1/(2*3.14159265*f0*c)
+V1 (in 0)   vsource   dc=0 ac=1
+R1 (in out) resistor  r
+C1 (out 0)  capacitor c
+.ac freq=dec(100Hz, 10kHz, n=20)
+.meas ac f3db = cross(vdb(out), -3)

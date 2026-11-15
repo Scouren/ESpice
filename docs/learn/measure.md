@@ -1,24 +1,24 @@
 # 7. Measurements
 
-A waveform answers questions only after you read numbers off it. `.measure`
-(or `.meas`) reads them for you after the run and prints the results on
-stdout, so a deck can report its own rise time, delay or peak.
+A waveform answers questions only after you read numbers off it. `.meas`
+reads them for you after the run and prints the results on stdout, so a
+deck can report its own rise time, delay or peak.
 
 ```text
-.meas <analysis> <name> <function> ...
+.meas <analysis> <name> = <function>(...)
 ```
 
 `<analysis>` is `tran`, `ac` or `dc`: which result to measure. `<name>`
-labels the printed line and can be used by later `.meas` cards.
+labels the printed line and can be used by later measurements.
 
 ## A worked example
 
-```spice
---8<-- "examples/measure.sp"
+```espice
+--8<-- "examples/measure.esp"
 ```
 
 ```sh
-espice measure.sp
+espice measure.esp
 ```
 
 ```text
@@ -48,25 +48,24 @@ its positive terminal).
 
 | Form | Measures |
 |---|---|
-| `TRIG sig VAL=v RISE=n TARG sig VAL=v RISE=n` | time from the trigger event to the target event |
-| `FIND sig AT=x` | the value of `sig` at `x` |
-| `FIND sig WHEN sig2=v` | the value of `sig` when `sig2` crosses `v` |
-| `WHEN sig=v [RISE=n \| FALL=n \| CROSS=n]` | when `sig` crosses `v` |
-| `MAX`, `MIN`, `PP` `sig [FROM= TO=]` | peak, valley, peak-to-peak; `MAX_AT`, `MIN_AT` give where |
-| `AVG`, `RMS`, `INTEG` `sig [FROM= TO=]` | average, RMS and integral over the window |
-| `DERIV sig AT=x` | slope at `x` |
-| `PARAM='expression'` | arithmetic over earlier results and parameters |
+| `cross(sig2, v2, rise=n) - cross(sig1, v1, rise=n)` | time from the first event to the second |
+| `find(sig, at=x)` | the value of `sig` at `x` |
+| `find(sig, when=cross(sig2, v))` | the value of `sig` when `sig2` crosses `v` |
+| `cross(sig, v, rise=n \| fall=n \| cross=n)` | when `sig` crosses `v` |
+| `max`, `min`, `pp` `(sig, from=, to=)` | peak, valley, peak-to-peak; `max_at`, `min_at` give where |
+| `avg`, `rms`, `integ` `(sig, from=, to=)` | average, RMS and integral over the window |
+| `deriv(sig, at=x)` | slope at `x` |
+| an expression | arithmetic over earlier results and parameters: `trise/tdelay` |
 
-`RISE=n`, `FALL=n` and `CROSS=n` pick the nth rising, falling or any
-crossing; `LAST` picks the last one. `TD=t` ignores events before `t`.
-`FROM` and `TO` bound the window, and a signal can be `v(node)`,
-`v(a,b)`, `i(Vsource)`, or in AC `vdb(node)`, `vm`, `vp`, `vr` and `vi`.
+`rise=n`, `fall=n` and `cross=n` pick the nth rising, falling or any
+crossing; `last` picks the last one. `td=t` ignores events before `t`.
+`from` and `to` bound the window, and a signal can be `v(node)`,
+`v(a,b)`, `i(source)`, or in AC `vdb(node)`, `vm`, `vp`, `vr` and `vi`.
 
 ESPice evaluates `.meas` like ngspice's `meas` command, with the same
-interpolation and print format, and also reads HSPICE's extra forms
-(`INTEGRAL`, `DERIVATIVE`, `ERR1` to `ERR3`, continuous `TRAN_CONT`
-measures and more). The [language reference](../using/reference.md#meas)
-lists them all.
+interpolation and print format, and has more functions (`err1` to
+`err3`, `thd`, `jitter`, continuous `tran_cont` measures and more). The
+[language reference](../using/language.md#meas) lists them all.
 
 A measurement that cannot be taken, because its event never happens in
 the run, prints an error and the run carries on:
@@ -81,15 +80,16 @@ Error: measure  t50 : out of interval
    input steps back to 0 at 6 µs.
 2. Measure the average of `v(out)` over the last full period only: is it
    still about 0.5 V?
-3. In `cmos_inverter.sp` (chapter 4), add `tplh` for the rising output
-   edge and a `PARAM` measurement of the mean delay.
+3. In `cmos_inverter.esp` (chapter 4), add `tplh` for the rising output
+   edge and a measurement of the mean delay.
 
 ??? tip "Answers"
 
-    1. `.meas tran tfall TRIG v(out) VAL=0.9 FALL=1 TARG v(out) VAL=0.1 FALL=1`,
+    1. `.meas tran tfall = cross(v(out), 0.1V, fall=1) - cross(v(out), 0.9V, fall=1)`,
        2.197 µs again: the circuit is linear.
     2. The run is only 10 µs and the period 20 µs, so there is no full
-       period. Lengthen `.tran` to 40u and average `FROM=20u TO=40u`.
-    3. `.meas tran tplh TRIG v(in) VAL=0.9 FALL=1 TARG v(out) VAL=0.9 RISE=1`
-       and `.meas tran tpd PARAM='(tphl+tplh)/2'`. `tplh` is 32 ps (the
+       period. Lengthen the `.tran` to `stop=40us` and average with
+       `from=20us, to=40us`.
+    3. `.meas tran tplh = cross(v(out), 0.9V, rise=1) - cross(v(in), 0.9V, fall=1)`
+       and `.meas tran tpd = (tphl + tplh)/2`. `tplh` is 32 ps (the
        PMOS is weaker) and `tpd` 30 ps.

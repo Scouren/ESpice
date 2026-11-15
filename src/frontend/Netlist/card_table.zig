@@ -14,16 +14,21 @@
 //! - `pub fn seedOption(line: []const u8) bool`
 //! - `pub fn setsKey(line: []const u8, key: []const u8) bool`
 //! - `pub fn isDataElement(letter: u8, line: []const u8) bool`
+//! - `pub const headName`
 //! - `pub fn bTransformationWanted(p: []const u8) bool`
 //! - `pub fn kvIndex(kvs: []const Kv, key: []const u8) ?usize`
 //! - `pub fn isBinOf(model: []const u8, base: []const u8) bool`
 //! - `pub fn binBounds(kv: []const Kv) ?[4]f64`
 //! - `pub fn readsLive(ops: []const expr.Op) bool`
+//! - `pub fn canonical(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8`
 
 const std = @import("std");
 const expr = @import("../Parse/expr.zig");
 const card_rows = @import("card_rows.zig");
 const netlist_view = @import("netlist_view.zig");
+
+/// `tokenizer.headName`, a leaf `source/` reads too.
+pub const headName = @import("../tokenizer.zig").headName;
 const Kv = card_rows.Kv;
 const kvNumber = netlist_view.kvNumber;
 
@@ -138,4 +143,77 @@ pub fn readsLive(ops: []const expr.Op) bool {
     return false;
 }
 
+/// `text`, an expression echoed back to the user (a `FAIL=` test), in one
+/// spelling whatever its blanks: one blank around a binary operator and
+/// after a comma, none inside parentheses or after a unary sign. `m>5` and
+/// `m > 5` both read `m > 5`; a number keeps its exponent (`1e-5`).
+pub fn canonical(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    // After nothing, an operator, `(` or `,`, a sign is unary.
+    var operand = false;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == ' ' or c == '\t') {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        if (std.ascii.isDigit(c) or (c == '.' and i + 1 < text.len and std.ascii.isDigit(text[i + 1]))) {
+            while (i < text.len and (std.ascii.isDigit(text[i]) or text[i] == '.')) i += 1;
+            if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
+                const sign = i + 1 < text.len and (text[i + 1] == '+' or text[i + 1] == '-');
+                const digits = i + 1 + @intFromBool(sign);
+                if (digits < text.len and std.ascii.isDigit(text[digits])) i = digits;
+            }
+            while (i < text.len and std.ascii.isAlphanumeric(text[i])) i += 1;
+        } else if (std.ascii.isAlphabetic(c) or c == '_') {
+            while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or std.mem.indexOfScalar(u8, "_.$#", text[i]) != null)) i += 1;
+        } else {
+            i += 1;
+            const pairs = [_][]const u8{ ">=", "<=", "==", "!=", "&&", "||", "**" };
+            for (pairs) |p| if (std.mem.startsWith(u8, text[start..], p)) {
+                i = start + 2;
+            };
+        }
+        const tok = text[start..i];
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
+            try out.appendSlice(arena, tok);
+            operand = true;
+        } else if (c == '(') {
+            try out.append(arena, c);
+            operand = false;
+        } else if (c == ')') {
+            try out.append(arena, c);
+            operand = true;
+        } else if (c == ',') {
+            try out.appendSlice(arena, ", ");
+            operand = false;
+        } else if (!operand and tok.len == 1 and std.mem.indexOfScalar(u8, "+-!", c) != null) {
+            try out.append(arena, c);
+        } else {
+            try out.print(arena, " {s} ", .{tok});
+            operand = false;
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 // ---- private ----
+
+test canonical {
+    // Oracle: the spellings the reader takes for one test, written by hand.
+    const a = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "m>5", "m > 5" },
+        .{ "m > 5", "m > 5" },
+        .{ "  m  >=  -1e-5 ", "m >= -1e-5" },
+        .{ "max(a,b)*2<=3k&&!c", "max(a, b) * 2 <= 3k && !c" },
+        .{ "-x**2", "-x ** 2" },
+        .{ "a?b:c", "a ? b : c" },
+    }) |c| {
+        const got = try canonical(a, c[0]);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}

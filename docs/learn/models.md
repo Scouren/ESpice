@@ -5,34 +5,35 @@ a named set of parameters declared once with `.model` and shared by every
 device that names it.
 
 ```text
-.model name type(param=value param=value ...)
+.model name family [type=polarity] param=value param=value ...
 ```
 
-The parentheses are optional. The type says what kind of device the model
-is for:
+The family says which device equations the model uses, and so what kind
+of device it is for. A device names the model as its master, and its
+ports follow the kind:
 
-| Type | Device | Element letter |
+| Family | Device | Ports |
 |---|---|---|
-| `D` | diode | `D` |
-| `NPN`, `PNP` | bipolar transistor | `Q` |
-| `NMOS`, `PMOS` | MOSFET | `M` |
-| `NJF`, `PJF` | JFET | `J` |
-| `NMF`, `PMF` | MESFET | `Z` |
-| `SW`, `CSW` | voltage- and current-controlled switch | `S`, `W` |
+| `diode` | diode | `a k` |
+| `gummel_poon`, `type=npn` or `pnp` | bipolar transistor | `c b e` |
+| `mos1`, `bsim4`, ..., `type=n` or `p` | MOSFET | `d g s b` |
+| `jfet`, `type=n` or `p` | JFET | `d g s` |
+| `mesfet`, `type=n` or `p` | MESFET | `d g s` |
+| `vswitch`, `cswitch` | voltage- and current-controlled switch | `p n cp cn`; `p n` |
 
 Parameters you leave out take the model's defaults.
 
 ## Diodes
 
-`D1 anode cathode model`. This half-wave rectifier charges a 100 µF
+`D1 (anode cathode) model`. This half-wave rectifier charges a 100 µF
 reservoir through a diode:
 
-```spice
---8<-- "examples/diode_rectifier.sp"
+```espice
+--8<-- "examples/diode_rectifier.esp"
 ```
 
 ```sh
-espice diode_rectifier.sp
+espice diode_rectifier.esp
 ```
 
 ```text
@@ -47,22 +48,22 @@ Half-wave rectifier: 4 devices
 The output peaks one diode drop below the 10 V input, then sags between
 peaks as the load drains the capacitor: about 1.5 V of ripple.
 
-`IS` (saturation current), `N` (emission coefficient), `RS` (series
-resistance) and `CJO` (zero-bias junction capacitance) are the parameters
+`is` (saturation current), `n` (emission coefficient), `rs` (series
+resistance) and `cjo` (zero-bias junction capacitance) are the parameters
 you will set most often.
 
 ## Bipolar transistors
 
-`Q1 collector base emitter [substrate] model`. Nested `.dc` sweeps give the
-classic output curves: the first source sweeps fastest, once per value of
-the second.
+`Q1 (collector base emitter [substrate]) model`. Nested `.dc` sweeps give
+the classic output curves: the first target sweeps fastest, once per value
+of the second.
 
-```spice
---8<-- "examples/bjt_bias.sp"
+```espice
+--8<-- "examples/bjt_bias.esp"
 ```
 
 ```sh
-espice bjt_bias.sp --rawfile bjt.txt --format=print
+espice bjt_bias.esp --rawfile bjt.txt --format=print
 ```
 
 ```text
@@ -73,23 +74,22 @@ Index	i(vcc)	i(vb)	v(vcc)	v(b)	v(c)
 ```
 
 At 0.7 V of base drive the collector draws 0.59 mA and the base 3.8 µA,
-a current gain of about 157 (BF = 150, raised a little by the Early
-effect, VAF = 80 V). The DC sweep has 101 × 3 = 303 points.
+a current gain of about 157 (`bf` = 150, raised a little by the Early
+effect, `vaf` = 80 V). The DC sweep has 101 × 3 = 303 points.
 
 ## MOSFETs
 
-`M1 drain gate source bulk model W=... L=...`. A MOSFET model's `LEVEL`
-picks the equations: `LEVEL=1` is the simple square-law Shichman-Hodges
-model, good for learning and hand checks; real processes use BSIM4
-(`LEVEL=14` or `54`) or another compact model. Here is a CMOS inverter in
-level 1:
+`M1 (drain gate source bulk) model w=... l=...`. A MOSFET model's family
+picks the equations: `mos1` is the simple square-law Shichman-Hodges
+model, good for learning and hand checks; real processes use `bsim4` or
+another compact model. Here is a CMOS inverter in `mos1`:
 
-```spice
---8<-- "examples/cmos_inverter.sp"
+```espice
+--8<-- "examples/cmos_inverter.esp"
 ```
 
 ```sh
-espice cmos_inverter.sp --rawfile inv.raw
+espice cmos_inverter.esp --rawfile inv.raw
 ```
 
 ```text
@@ -101,42 +101,38 @@ CMOS inverter: 5 devices
   Transient Analysis: 2032 points, 6 variables
 ```
 
-The `.dc` card gives the voltage transfer curve; `tphl`, the
+The `.dc` gives the voltage transfer curve; `tphl`, the
 high-to-low propagation delay into 10 fF, is 28 ps.
 
-## LEVEL
+## Model families
 
-For one element letter, `LEVEL` on the `.model` card picks among the
-built-in models. With no `LEVEL`, it is 1.
+The family names the equations, so one device kind has several. The
+common ones:
 
-| Letter | LEVEL | Model |
-|---|---|---|
-| `M` | 1, 2, 3, 6, 9 | MOS level 1, 2, 3, 6, 9 |
-| `M` | 4, 5, 8 / 49 | BSIM1, BSIM2, BSIM3 |
-| `M` | 14 / 54 | BSIM4 |
-| `M` | 10 / 58, 55, 56 | BSIM-SOI, B3SOI-FD, B3SOI-DD |
-| `M` | 68, 73 | HiSIM2, HiSIM-HV |
-| `M` | 1040 | PSP 103 |
-| `Q` | 1 / 2, 4 / 9, 8 | Gummel-Poon, VBIC 1.3, HICUM/L2 |
-| `J` | 1, 2 | JFET, JFET2 |
-| `Z` | 1, 2-4, 5, 6 | MESFET, MESA, HFET1, HFET2 |
+| Device | Families |
+|---|---|
+| MOSFET | `mos1` `mos2` `mos3` `mos6` `mos9`, `bsim1` ... `bsim4`, `bsimsoi`, `hisim2`, `bsimcmg`, `psp103`, `psp104` |
+| BJT | `gummel_poon`, `vbic`, `hicuml2`, `mextram` |
+| JFET, MESFET, HFET | `jfet` `jfet2`, `mesfet` `mesa` `hfet1` `hfet2` |
 
-The [devices page](../using/devices.md) has the full table and what each
-model is.
+A deck in the ngspice dialect writes the same choice as a type and a
+`LEVEL` (`NMOS LEVEL=14` is `bsim4 type=n`). The
+[language reference](../using/language.md#models) has the full table, and
+the [devices page](../using/devices.md) what each model is.
 
 ## Exercises
 
-1. In `diode_rectifier.sp`, double C1. What happens to the ripple?
-2. Add `.temp 100` to `diode_iv.sp` (chapter 3). Does the diode turn on
+1. In `diode_rectifier.esp`, double C1. What happens to the ripple?
+2. Add `.option temp=100C` to `diode_iv.esp` (chapter 3). Does the diode turn on
    at a lower or higher voltage?
-3. In `cmos_inverter.sp`, make the PMOS as wide as the NMOS (`wp={wn}`).
+3. In `cmos_inverter.esp`, make the PMOS as wide as the NMOS (`wp = wn`).
    Where does the switching threshold of the DC curve move?
 
 ??? tip "Answers"
 
     1. The capacitor discharges half as fast, so the ripple roughly halves
        and `vmin` rises.
-    2. Lower: IS grows quickly with temperature, so the same current needs
+    2. Lower: `is` grows quickly with temperature, so the same current needs
        less forward voltage (about −2 mV per °C).
-    3. Down, toward 0 V: the NMOS is now stronger than the PMOS (KP 200µ
+    3. Down, toward 0 V: the NMOS is now stronger than the PMOS (`kp` 200µ
        against 80µ), so it pulls the output low at a lower input voltage.

@@ -847,6 +847,11 @@ test "CPL and RLGC matrices read their packed triangles" {
 /// Builds `source` (title line first) and returns `needs_tran_op`. The
 /// Builder is never compiled.
 fn buildDeck(source: []const u8) !bool {
+    return buildFacts(source, null);
+}
+
+/// `buildDeck`, also expecting the topology facts `want` when it is given.
+fn buildFacts(source: []const u8, want: ?[3]?[]const u8) !bool {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -856,10 +861,13 @@ fn buildDeck(source: []const u8) !bool {
     defer b.deinit();
     var nb = try builder.NetBuilder.init(a, &b, nl);
     try nb.build();
+    if (want) |w| for (w, [3]?[]const u8{ nb.topology.dc_loop, nb.topology.cutset, nb.topology.no_dc_path }) |expected, got| {
+        if (expected) |e| try std.testing.expectEqualStrings(e, got orelse return error.TestExpectedFact) else try std.testing.expectEqual(null, got);
+    };
     return b.needs_tran_op;
 }
 
-test "topology: V/L shorts must agree on KVL, current sources need a DC path" {
+test "topology: V shorts must agree on KVL; a V/L loop, a cutset and a floating node are facts" {
     try std.testing.expectError(error.VoltageSourceLoop, buildDeck("* loop\nV1 a 0 5\nV2 a 0 3\n.end\n"));
     // Agreeing sources in a loop leave its current free (#70).
     try std.testing.expectError(error.NonuniqueOperatingPoint, buildDeck("* parallel\nV1 a 0 5\nV2 a 0 5\nR1 a 0 1k\n.end\n"));
@@ -867,23 +875,25 @@ test "topology: V/L shorts must agree on KVL, current sources need a DC path" {
     // v(c) = 3 agrees with it, 2 does not.
     try std.testing.expectError(error.NonuniqueOperatingPoint, buildDeck("* chain\nV3 c b 1\nV2 b a 1\nV1 a 0 1\nV4 c 0 3\n.end\n"));
     try std.testing.expectError(error.VoltageSourceLoop, buildDeck("* chain\nV3 c b 1\nV2 b a 1\nV1 a 0 1\nV4 c 0 2\n.end\n"));
-    // An inductor is a 0 V short.
-    try std.testing.expectError(error.VoltageSourceLoop, buildDeck("* l loop\nV1 a 0 1\nL1 a 0 1u\n.end\n"));
-    try std.testing.expectError(error.CurrentSourceCutset, buildDeck("* cutset\nI1 0 out 1m\nC1 out 0 1u\n.end\n"));
+    // An inductor is a 0 V short at DC only: the loop is a fact the
+    // analyses decide on (`core.validate`), as is a cutset.
+    try std.testing.expect(!try buildFacts("* l loop\nV1 a 0 1\nL1 a 0 1u\n.end\n", .{ "l1", null, null }));
+    try std.testing.expect(!try buildFacts("* l agrees\nV1 a 0 0\nL1 a 0 1u\n.end\n", .{ null, null, null }));
+    try std.testing.expect(try buildFacts("* cutset\nI1 0 out 1m\nC1 out 0 1u\n.end\n", .{ null, "out", "out" }));
     // Current sources that balance on a capacitor node are an island (#70);
     // unequal ones are a cutset.
     try std.testing.expect(try buildDeck("* balanced\nI1 0 a 1m\nI2 a b 1m\nR1 b 0 1k\nC1 a 0 1p\n.end\n"));
-    try std.testing.expectError(error.CurrentSourceCutset, buildDeck("* unbalanced\nI1 0 a 1m\nI2 a b 2m\nR1 b 0 1k\nC1 a 0 1p\n.end\n"));
+    try std.testing.expect(try buildFacts("* unbalanced\nI1 0 a 1m\nI2 a b 2m\nR1 b 0 1k\nC1 a 0 1p\n.end\n", .{ null, "a", "a" }));
     // A `.ic` node is held through a transient's operating point (ngspice
     // cktload.c, MODETRANOP), a DC path for that solve: ngspice 44.2 runs
     // the cutset deck with it, v(out) 0 at t = 0 and the exact 1 V/ms ramp,
     // with no warning. A `.ic` on another node holds nothing here (ngspice:
     // singular matrix at out).
-    try std.testing.expect(try buildDeck("* held\nI1 0 out 1m\nC1 out 0 1u\n.ic v(out)=0\n.tran 1u 1m\n.end\n"));
-    try std.testing.expectError(error.CurrentSourceCutset, buildDeck("* held elsewhere\nI1 0 out 1m\nC1 out 0 1u\nV1 a 0 1\nR1 a 0 1k\n.ic v(a)=1\n.tran 1u 1m\n.end\n"));
+    try std.testing.expect(try buildFacts("* held\nI1 0 out 1m\nC1 out 0 1u\n.ic v(out)=0\n.tran 1u 1m\n.end\n", .{ null, null, "out" }));
+    try std.testing.expect(try buildFacts("* held elsewhere\nI1 0 out 1m\nC1 out 0 1u\nV1 a 0 1\nR1 a 0 1k\n.ic v(a)=1\n.tran 1u 1m\n.end\n", .{ null, "out", "out" }));
     // A node only capacitors reach needs the transient operating point,
     // also behind a series short that touches no ground (#90).
-    try std.testing.expect(try buildDeck("* cap node\nV1 a 0 1\nC1 a b 1p\nC2 b 0 1p\n.end\n"));
+    try std.testing.expect(try buildFacts("* cap node\nV1 a 0 1\nC1 a b 1p\nC2 b 0 1p\n.end\n", .{ null, null, "b" }));
     try std.testing.expect(try buildDeck("* ammeter\nV1 a 0 1\nC1 a m 1p\nVam m b 0\nC2 b 0 1p\n.end\n"));
     try std.testing.expect(try buildDeck("* series r\nV1 a 0 1\nC1 a m 1p\nR1 m b 1m\nC2 b 0 1p\n.end\n"));
     try std.testing.expect(!try buildDeck("* divider\nV1 a 0 1\nR1 a b 1k\nR2 b 0 1k\n.end\n"));
@@ -1167,6 +1177,9 @@ test "an UnsupportedDevice names why: the model the card cannot use, the model i
     try std.testing.expectEqualStrings("no .model this card can use: its model name is not defined, or no bin of it holds the card's L and W", ta.subject(&nb, &buf, m, error.UnsupportedDevice) orelse "");
     const u = cardWith("a1", 'a', &.{}, &.{});
     try std.testing.expectEqualStrings("no device has the card letter 'a'", ta.subject(&nb, &buf, u, error.UnsupportedDevice) orelse "");
+    // An N card, or a language instance (`?@`) whose master is nothing.
+    const n = cardWith("x1", 'n', &.{.{ .name = "nosuch" }}, &.{});
+    try std.testing.expectEqualStrings("'nosuch' is no subcircuit, .model or loaded Verilog-A module", ta.subject(&nb, &buf, n, error.UnsupportedDevice) orelse "");
 }
 
 test "the branch-name index answers as the first-match scans did, duplicates included" {

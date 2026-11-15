@@ -1,0 +1,7 @@
+.espice 1
+.title "Resistor divider noise"
+// Two 10k resistors: the output noise is that of 5k, about 9.1 nV/sqrt(Hz).
+V1 (in 0)   vsource  dc=0 ac=1
+R1 (in out) resistor 10k
+R2 (out 0)  resistor 10k
+.noise out=v(out) src=V1 freq=dec(1kHz, 100kHz, n=1)

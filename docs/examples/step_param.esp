@@ -1,0 +1,9 @@
+.espice 1
+.title "RC corner against R, with .step"
+.param rval = 1k
+V1 (in 0)   vsource   dc=0 ac=1
+R1 (in out) resistor  rval
+C1 (out 0)  capacitor 100nF
+.ac freq=dec(10Hz, 100kHz, n=5)
+.step rval=[1k, 2k, 4k]
+.meas ac f3db = cross(vdb(out), -3)

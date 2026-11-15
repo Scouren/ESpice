@@ -1,10 +1,9 @@
 //! The `espice` command line: argv in, one `Problem` per netlist file run
 //! in order, its `.meas` text on stdout (or its JSON, `--measures=-`), the
 //! `--measures` and `--emir` JSON files, and a one-line summary per result
-//! on stderr. A deck in another dialect than ngspice runs as SpiceRack's
-//! translation of it (spicerack.zig), with SpiceRack's time on stderr apart
-//! from ESPice's own. Exit 0, 1 if any file failed to read, translate,
-//! prepare or run, 2 on a usage error. The flags, the exit codes and every
+//! on stderr. A deck is read as ngspice; another dialect is translated
+//! before espice sees it (SpiceRack's `sprack translate`, run by the caller).
+//! Exit 0, 1 if any file failed to read, prepare or run, 2 on a usage error. The flags, the exit codes and every
 //! printed line are the CLI's contract.
 //! Cites: none.
 //!
@@ -16,7 +15,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const problem = @import("espice");
-const spicerack = @import("spicerack.zig");
 const vpi_host = @import("vpi_host.zig");
 
 /// std reserves a 256 KB alternate signal stack per thread for stack-overflow
@@ -70,9 +68,6 @@ const help =
     \\      --tangents=P,...        Print d(.meas)/d(P) of the first .tran's cards for these .params
     \\      --tangent-step=S        Relative step of --tangents (default 1e-6)
     \\      --lanes                 Solve sweep points' OPs and .dc sweeps as SIMD lanes (CPU)
-    \\      --tokenizer=FMT         ngspice|hspice|spectre|ltspice|xyce|vacask (default: detected from the deck,
-    \\                              else ngspice); any but ngspice is translated by SpiceRack's spice2rack first
-    \\      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else the one beside espice, else spice2rack on PATH)
     \\      --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
     \\  -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
     \\                              directory; repeatable, in order
@@ -93,9 +88,6 @@ const Cli = struct {
     vpi_apps: std.ArrayList([]const u8) = .empty,
     include_dirs: std.ArrayList([]const u8) = .empty,
     tangents: std.ArrayList([]const u8) = .empty,
-    dialect: ?spicerack.Dialect = null,
-    /// `--spicerack=PATH`; null falls back to `ESPICE_SPICERACK`, then PATH.
-    spicerack_exe: ?[]const u8 = null,
     selection: problem.Selection = .{},
     /// Null when no `--backend` or `--gpu` was given.
     backend: ?problem.Request = null,
@@ -267,10 +259,6 @@ fn parse(gpa: std.mem.Allocator, args: anytype, cli: *Cli) std.mem.Allocator.Err
             try cli.vpi_apps.append(gpa, value orelse return .usage);
         } else if (optionValue(arg, "-I", "--include", args)) |value| {
             try cli.include_dirs.append(gpa, value orelse return .usage);
-        } else if (optionValue(arg, "-tokenizer", "--tokenizer", args)) |value| {
-            cli.dialect = spicerack.parseDialect(value orelse return .usage) orelse return .usage;
-        } else if (optionValue(arg, "", "--spicerack", args)) |value| {
-            cli.spicerack_exe = value orelse return .usage;
         } else if (arg.len > 0 and arg[0] == '-') {
             std.debug.print("Error: unsupported option '{s}'\n", .{arg});
             return .usage;
@@ -281,87 +269,24 @@ fn parse(gpa: std.mem.Allocator, args: anytype, cli: *Cli) std.mem.Allocator.Err
 
 /// Reads, prepares and runs the deck at `path`, printing its `.meas` text
 /// and summary lines; false when it failed, after printing why on stderr.
-/// A deck in another dialect runs as SpiceRack's translation of it, never
-/// read natively; its two timing lines go to stderr (spicerack.zig). The
-/// deck is read once: a pipe or FIFO (`/dev/stdin`, `<(...)`) drains on
-/// the first read (#234), and spice2rack reads none, so one in another
-/// dialect is refused (`SpiceRackNeedsFile`). Fails only when stdout or
-/// stderr cannot be written.
+/// The deck is read once: a pipe or FIFO (`/dev/stdin`, `<(...)`) drains on
+/// the first read (#234). Fails only when stdout or stderr cannot be written.
 fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vpi: *const problem.Vpi, path: []const u8) !bool {
     std.debug.assert(cli.max_parallel != 0);
-    const start = std.Io.Timestamp.now(init.io, .awake);
     if (cli.timing_in_depth) std.debug.print("timing: {s}\n", .{path});
     // Each `.meas` block prints as its point ends (`Options.measures`).
     var out_buf: [4096]u8 = undefined;
     var err_buf: [1024]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &out_buf);
     var stderr: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
-    // The user's deck, read only to detect its dialect or to run it: a
-    // named other dialect leaves it to spice2rack, which reads it itself.
-    const named = cli.dialect orelse .ngspice;
-    const original: ?[]u8 = if (cli.dialect != null and named != .ngspice) null else readDeck(init, path, path) orelse return false;
-    defer if (original) |t| init.gpa.free(t);
-    const dialect = cli.dialect orelse detected: {
-        const d = spicerack.detect(original.?);
-        if (d.dialect != .ngspice) std.debug.print("{s}:{d}: `{s}` is {t}: reading the deck through SpiceRack (--tokenizer to override)\n", .{ path, d.line, d.marker, d.dialect });
-        break :detected d.dialect;
-    };
-    // spice2rack opens the deck by path with no stdin, so a pipe or FIFO
-    // reaches it empty, drained here to detect its dialect (#234) or not:
-    // refuse it rather than translate nothing. A regular file goes by its
-    // real path, so `/dev/stdin` redirected from a file names that file.
-    // ponytail: refused, not copied, since a copy's relative includes would
-    // resolve against the copy; write it into the kit when a pipe needs it.
-    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const real: []const u8 = if (dialect == .ngspice) path else real: {
-        const st = std.Io.Dir.cwd().statFile(init.io, path, .{}) catch |err| {
-            std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        if (st.kind != .file) {
-            std.debug.print("Error: {s}: SpiceRackNeedsFile\n", .{path});
-            return false;
-        }
-        const n = std.Io.Dir.cwd().realPathFile(init.io, path, &real_buf) catch |err| {
-            std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
-            return false;
-        };
-        break :real real_buf[0..n];
-    };
-    var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    var kit: ?spicerack.Kit = if (dialect == .ngspice) null else spicerack.translate(init.gpa, init.io, .{
-        // `--spicerack`'s default, read here and nowhere else: only the CLI
-        // runs spice2rack (the library reads ngspice alone, c_api.zig).
-        .exe = spicerackExe(cli.spicerack_exe, init.io, &exe_buf),
-        .dialect = dialect,
-        .deck = path,
-        .path = real,
-        .tmp_dir = problem.tmpDir(),
-    }, &stderr.interface) catch |err| {
-        try stderr.interface.flush();
-        std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
-        return false;
-    };
-    try stderr.interface.flush();
-    defer if (kit) |*k| k.deinit(init.gpa, init.io);
-    // The second timing line, however the run ends: ESPice's own time apart
-    // from SpiceRack's.
-    defer if (kit) |k| {
-        const total = spicerack.seconds(start.durationTo(std.Io.Timestamp.now(init.io, .awake)));
-        const translating = spicerack.seconds(k.elapsed);
-        std.debug.print("espice: finished {s} in {d:.2} s, plus {d:.2} s in spicerack\n", .{ path, total - translating, translating });
-    };
-    // Includes in the translation resolve against its entry, so they find
-    // the translated copies; output paths stay relative to the cwd.
-    const origin = if (kit) |k| k.entry else path;
-    const text = if (kit != null) readDeck(init, origin, path) orelse return false else original.?;
-    defer if (kit != null) init.gpa.free(text);
+    const text = readDeck(init, path) orelse return false;
+    defer init.gpa.free(text);
     // `--measures=-`: the JSON takes the text blocks' place on stdout.
     var discard_buf: [256]u8 = undefined;
     var discard: std.Io.Writer.Discarding = .init(&discard_buf);
     const meas_out = if (jsonStdout(cli)) &discard.writer else &stdout.interface;
     const p = problem.Problem.init(init.gpa, init.io, .{
-        .source = .{ .bytes = .{ .data = text, .origin = origin } },
+        .source = .{ .bytes = .{ .data = text, .origin = path } },
         .output = cli.selection,
         .backend = .{
             .backend = backend,
@@ -425,11 +350,10 @@ fn runDeck(init: std.process.Init, cli: *const Cli, backend: problem.Request, vp
     return ok;
 }
 
-/// The bytes of `file`, in `init.gpa`; null after printing why it failed,
-/// under the user's `deck`.
-fn readDeck(init: std.process.Init, file: []const u8, deck: []const u8) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(init.io, file, init.gpa, .unlimited) catch |err| {
-        std.debug.print("Error: {s}: {s}\n", .{ deck, @errorName(err) });
+/// The bytes of `path`, in `init.gpa`; null after printing why it failed.
+fn readDeck(init: std.process.Init, path: []const u8) ?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .unlimited) catch |err| {
+        std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
         return null;
     };
 }
@@ -531,19 +455,6 @@ fn autoJobs() u16 {
 /// value is taken from `args`.
 // `args` is anytype: argv's iterator and the tests' split iterator both
 // have `next() ?[]const u8`.
-/// The spice2rack the CLI runs: `--spicerack`, else `ESPICE_SPICERACK`,
-/// else the one a release archive ships beside this executable, else the
-/// first on PATH. `buf` holds the sibling's path.
-fn spicerackExe(flag: ?[]const u8, io: std.Io, buf: []u8) []const u8 {
-    if (flag) |exe| return exe;
-    if (std.c.getenv("ESPICE_SPICERACK")) |v| return std.mem.span(v);
-    const dir = std.process.executableDirPath(io, buf) catch return "spice2rack";
-    const sibling = std.fmt.bufPrint(buf[dir..], "{c}spice2rack", .{std.fs.path.sep}) catch return "spice2rack";
-    const path = buf[0 .. dir + sibling.len];
-    std.Io.Dir.cwd().access(io, path, .{}) catch return "spice2rack";
-    return path;
-}
-
 fn optionValue(arg: []const u8, short: []const u8, long: []const u8, args: anytype) ??[]const u8 {
     std.debug.assert(long.len > 2);
     if ((short.len != 0 and std.mem.eql(u8, arg, short)) or std.mem.eql(u8, arg, long)) {
@@ -594,7 +505,6 @@ fn usageFail() u8 {
 test {
     // Analyzed only from `main` otherwise, which no test build reaches.
     std.testing.refAllDecls(vpi_host);
-    _ = spicerack;
 }
 
 test "--version matches build.zig.zon" {
@@ -615,7 +525,7 @@ test "optionValue: separate, joined, missing and empty values" {
     try t.expectEqualStrings("a=b", optionValue("--rawfile=a=b", "-r", "--rawfile", &args).?.?);
     try t.expect(optionValue("--rawfile=", "-r", "--rawfile", &args).? == null);
     // The single-dash name takes the joined form too (#88).
-    try t.expectEqualStrings("hspice", optionValue("-tokenizer=hspice", "-tokenizer", "--tokenizer", &args).?.?);
+    try t.expectEqualStrings("x.raw", optionValue("-r=x.raw", "-r", "--rawfile", &args).?.?);
     // Not this flag: a longer flag sharing the prefix, a bare value, and an
     // empty short name that must not match an empty argument.
     try t.expect(optionValue("--rawfilex", "-r", "--rawfile", &args) == null);

@@ -1,0 +1,14 @@
+.espice 1
+.title "Independent source waveforms"
+// Each source drives its own 1k load, so every node shows its waveform.
+VP (p 0) vsource pulse(0, 1V, td=1ms, tr=0.1ms, tf=0.1ms, pw=2ms, per=5ms)
+VS (s 0) vsource sin(0.5V, 0.5V, freq=1kHz)
+VW (w 0) vsource pwl((0, 0), (1ms, 1V), (3ms, 1V), (4ms, 0))
+VE (e 0) vsource exp(0, 1V, td1=1ms, tau1=0.5ms, td2=3ms, tau2=0.5ms)
+IC (0 c) isource 1mA
+RP (p 0) resistor 1k
+RS (s 0) resistor 1k
+RW (w 0) resistor 1k
+RE (e 0) resistor 1k
+RC (c 0) resistor 1k
+.tran stop=5ms step=10us

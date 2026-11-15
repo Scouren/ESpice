@@ -187,7 +187,8 @@ tphl                =  2.818778e-11 targ=  1.078188e-09 trig=  1.050000e-09
 They are printed whether or not `--rawfile` is given. Over Monte Carlo
 trials ESPice also prints the mean, sigma, min and max of each
 measurement. [Chapter 7](../learn/measure.md) and the
-[reference](reference.md#meas) cover the syntax.
+[language reference](language.md#meas) cover the syntax ([legacy
+cards](reference.md#meas)).
 
 ### Measurements as JSON
 

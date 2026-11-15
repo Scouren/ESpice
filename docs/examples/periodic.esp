@@ -1,0 +1,12 @@
+.espice 1
+.title "Diode clipper in periodic steady state"
+// A 1 kHz, 1 V sine drives a diode clipper. ac=1 is the small signal
+// that .pac moves through the periodically switching circuit.
+V1 (in 0)   vsource   dc=0 ac=1 sin(0, 1V, freq=1kHz)
+R1 (in out) resistor  1k
+D1 (out 0)  dmod
+C1 (out 0)  capacitor 10nF
+.model dmod diode is=1e-14
+.pss f0=1kHz points=256
+.pac f0=1kHz freq=dec(10Hz, 10kHz, n=4)
+.hb f0=1kHz harmonics=8

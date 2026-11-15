@@ -19,14 +19,16 @@
     # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
     # a git flake leaves submodules out of its source.
     # git+https, not github: GitHub's tarball of one commit gave two NAR hashes.
-    conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=dev/perf-oracles&rev=c0348882ff257bef9ff85a35a398559a7271073d";
+    conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=main&rev=ca18ac9d1e44132f7b25a911ba0947356a3d74a6";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
-    # SpiceRack's source, for spice2rack (`--to espice --kit`): the CLI runs it
-    # on every non-ngspice deck. Its own flake pulls two ESPice revs, so this
-    # takes the source alone and builds the one binary below.
-    spicerack.url = "git+https://github.com/Scouren/SpiceRack?ref=espice-kit&rev=231d9c9c34ac142c55d06a9a985739afb160b1ab";
-    spicerack.flake = false;
+    # SpiceRack, the translator from other dialects (`sprack translate`):
+    # its main branch, locked in flake.lock; sprack-update.yml moves the
+    # lock to the newest commit in a gated pull request.
+    sprack = {
+      url = "github:Scouren/SPRack";
+      flake = false;
+    };
   };
 
   outputs =
@@ -37,7 +39,7 @@
       zig-overlay,
       nix-bundle,
       conformance,
-      spicerack,
+      sprack,
       ...
     }:
     {
@@ -143,26 +145,35 @@
         # The reference simulators come from the conformance suite's flake.
         refPkgs = conformance.packages.${system};
 
-        # SpiceRack's translator, which the CLI finds on PATH or by ESPICE_SPICERACK.
-        spice2rack = pkgs.rustPlatform.buildRustPackage {
-          pname = "spice2rack";
-          version = (lib.importTOML "${spicerack}/Cargo.toml").package.version;
-          src = spicerack;
-          cargoLock.lockFile = "${spicerack}/Cargo.lock";
-          buildNoDefaultFeatures = true;
-          cargoBuildFlags = [ "--bin" "spice2rack" ];
-          # Its suites need the reference simulators; SpiceRack's CI runs them.
-          doCheck = false;
-          meta.mainProgram = "spice2rack";
-        };
         version = builtins.head (builtins.match ''.*\.version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon));
+
+        # SpiceRack's CLI, built from the locked source with this Zig (it
+        # has no dependencies): the corpus runner and the docs gate run
+        # `sprack translate` on the decks in other dialects.
+        sprackPkg = pkgs.stdenvNoCC.mkDerivation {
+          pname = "sprack";
+          version = sprack.shortRev or "dirty";
+          src = sprack;
+          nativeBuildInputs = [ zig ];
+          dontConfigure = true;
+          dontInstall = true;
+          buildPhase = ''
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            zig build install -Doptimize=ReleaseSafe -j$NIX_BUILD_CORES --prefix "$out"
+            rm -rf "$out/python" "$out/lib"
+          '';
+          meta = {
+            description = "SpiceRack: SPICE dialect translator";
+            mainProgram = "sprack";
+          };
+        };
 
         devShells = rec {
           ci = pkgs.mkShell {
             packages = [
               zig
               pkgs.python3
-              spice2rack
+              sprackPkg
             ];
             # One global cache per Zig store path: two builds of the same Zig version
             # sharing ~/.cache/zig evict each other's build runner on every `zig build`.
@@ -238,7 +249,6 @@
                 -Dhip-arch=${hip} -Dcuda-arch=${cuda} \
                 -j$NIX_BUILD_CORES --prefix "$out"
               wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig \
-                --set-default ESPICE_SPICERACK ${lib.getExe spice2rack} \
                 --run ${lib.escapeShellArg callerDir} \
                 ${lib.optionalString (hip != "none")
                   "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.rocmPackages.clr ]}"
@@ -280,7 +290,8 @@
 
         packages = {
           default = espice;
-          inherit espice spice2rack;
+          inherit espice;
+          sprack = sprackPkg;
         }
         // releases
         // lib.optionalAttrs (latest != null) { inherit latest; }

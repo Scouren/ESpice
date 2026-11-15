@@ -1,0 +1,7 @@
+.espice 1
+.title "Divider spread with Monte Carlo"
+// .mc: trials, each nonzero primary value drawn with relative sigma.
+V1 (in 0)   vsource  1V
+R1 (in out) resistor 1k
+R2 (out 0)  resistor 1k
+.mc trials=200 sigma=0.01

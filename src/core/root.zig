@@ -9,7 +9,7 @@
 //! Contents:
 //! - `pub const gpa: std.mem.Allocator`
 //! - namespaces: `numerics`, `query`, `validate`, `lm`, `bisect`, `eigen`, `sss`, `form`, `testing`, `perf`
-//! - deck (`deck.zig`): `Deck`, `Ic`, `AcOverride`, `NoiseGap`, `Temper`, `Variants`, `QueryBindings`,
+//! - deck (`deck.zig`): `Deck`, `Ic`, `AcOverride`, `NoiseGap`, `Topology`, `Temper`, `Variants`, `QueryBindings`,
 //!   `SaveOp`, `Mosra`, `MosraModel`, `Stim`, `Soa`, `SoaLimit`, `OpVar`
 //! - measures (`measure_card.zig`): `Measure`, `MeasureClause`, `GoalBound`,
 //!   `MeasureFunc`, `Check`, `MeasureOp`, `MeasureRef`, `measure_unset`,
@@ -58,6 +58,7 @@ pub const Deck = deck.Deck;
 pub const Ic = deck.Ic;
 pub const AcOverride = deck.AcOverride;
 pub const NoiseGap = deck.NoiseGap;
+pub const Topology = deck.Topology;
 pub const Temper = deck.Temper;
 pub const Variants = deck.Variants;
 pub const QueryBindings = deck.QueryBindings;

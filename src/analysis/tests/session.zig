@@ -95,6 +95,7 @@ test "validate: refuses what the frontend refuses" {
 
 test "a dc sweep target resolves against the prepared card table, type included" {
     var deck: Deck = undefined;
+    deck.topology = .{};
     deck.cards = &.{
         .{ .type = builtin("vsource"), .index = 0, .name = "v1" },
         .{ .type = builtin("isource"), .index = 0, .name = "i1" },

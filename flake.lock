@@ -10,17 +10,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1794592363,
-        "narHash": "sha256-Tz+hf0/z47PqEqUL8T/1YjmrGfEGqdz4dcjHR6v+eaA=",
-        "ref": "dev/perf-oracles",
-        "rev": "c0348882ff257bef9ff85a35a398559a7271073d",
-        "revCount": 128,
+        "lastModified": 1794773234,
+        "narHash": "sha256-ub22pQOqDQyp4c4cqYSWNIVaDNdY2S7t5YrxwJOlPPY=",
+        "ref": "main",
+        "rev": "ca18ac9d1e44132f7b25a911ba0947356a3d74a6",
+        "revCount": 222,
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
       },
       "original": {
-        "ref": "dev/perf-oracles",
-        "rev": "c0348882ff257bef9ff85a35a398559a7271073d",
+        "ref": "main",
+        "rev": "ca18ac9d1e44132f7b25a911ba0947356a3d74a6",
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
       }
@@ -105,26 +105,24 @@
         "flake-utils": "flake-utils",
         "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",
-        "spicerack": "spicerack",
+        "sprack": "sprack",
         "zig-overlay": "zig-overlay"
       }
     },
-    "spicerack": {
+    "sprack": {
       "flake": false,
       "locked": {
-        "lastModified": 1794590138,
-        "narHash": "sha256-IsC4NMZ+n2mr5b9RqVqcO1f2HvuxTooIBLKIFOP8BrU=",
-        "ref": "espice-kit",
-        "rev": "231d9c9c34ac142c55d06a9a985739afb160b1ab",
-        "revCount": 2177,
-        "type": "git",
-        "url": "https://github.com/Scouren/SpiceRack"
+        "lastModified": 1794731616,
+        "narHash": "sha256-AxQeEbGHsUy4+US+XVufUKmRDFoP1SpKUtkqBXKTf4c=",
+        "owner": "Scouren",
+        "repo": "SPRack",
+        "rev": "b53d6fffc2ef1004964de9e87e0d6d107c677934",
+        "type": "github"
       },
       "original": {
-        "ref": "espice-kit",
-        "rev": "231d9c9c34ac142c55d06a9a985739afb160b1ab",
-        "type": "git",
-        "url": "https://github.com/Scouren/SpiceRack"
+        "owner": "Scouren",
+        "repo": "SPRack",
+        "type": "github"
       }
     },
     "systems": {

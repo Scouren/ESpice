@@ -152,7 +152,9 @@ pub fn prepare(io: std.Io, session: Allocator, input: Source, live: []const []co
         .file => |path| try std.Io.Dir.cwd().readFileAlloc(io, path, session, .unlimited),
         .bytes => |bytes| try session.dupe(u8, bytes.data),
     };
-    const runs = try netlist.source.splitAlters(session, raw);
+    // A deck in the ESPice language is read as its legacy cards (lang.zig).
+    const deck = try netlist.lang.lower(session, session, raw, origin, .top);
+    const runs = try netlist.source.splitAlters(session, deck);
     const ast = try netlist.Ast.parse(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), .deck);
     var nl = try netlist.elaborate(session, &ast, live);
     const alters = try session.alloc([]const u8, runs.len - 1);
@@ -400,6 +402,7 @@ fn plan(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator
         .card_names = card_names,
         .ac_overrides = try prepared_deck.acOverrides(sim_arena, cards, nb.ac_res.items(.name), nb.ac_res.items(.value)),
         .noise_gaps = try prepared_deck.noiseGaps(sim_arena, nb.noise_gaps.items),
+        .topology = try prepared_deck.topology(sim_arena, nb.topology),
         .temper = temper,
         .measures = try prepared_deck.measures(sim_arena, nl.deck.measures),
         .save_op = if (nl.deck.save_op) |s| blk: {

@@ -22,6 +22,7 @@ const netlist_view = @import("netlist_view.zig");
 const reader_frame = @import("reader_frame.zig");
 const reader_nets = @import("reader_nets.zig");
 const reader_diag = @import("reader_diag.zig");
+const reader_instance = @import("reader_instance.zig");
 const Reader = reader.Reader;
 const none = card_rows.none;
 const Error = card_rows.Error;
@@ -87,7 +88,7 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
                 };
                 switch (hit.entry) {
                     .num => |n| try emitNum(r, n),
-                    .text => |text| {
+                    .text, .actual => |text| {
                         // Instance scopes are fixed once built; the
                         // globals are not (a later `.param` redefines).
                         const key: reader.ParamKey = .{ .scope = @intFromPtr(scopes[hit.level]), .row = scopes[hit.level].getIndex(name).? };
@@ -117,7 +118,10 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
                         defer r.eval.bindings = saved;
                         var numparam = frame.*;
                         numparam.bsource = false;
-                        try subst(r, code, 0, code.ops.items.len, &numparam, scopes[0 .. hit.level + 1], depth + 1);
+                        // An actual reads the caller's scopes: never its own
+                        // instance's, where its formal would find itself.
+                        const outer = hit.level + @intFromBool(hit.entry == .text);
+                        try subst(r, code, 0, code.ops.items.len, &numparam, scopes[0..outer], depth + 1);
                         // A constant (no swept name, no Monte Carlo
                         // draw) folds once: later reads splice the number.
                         const ops = r.nl.ops.items[ops_mark..];
@@ -136,7 +140,7 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
             .iprobe => {
                 const a = if (op.a == none) none else a: {
                     const dev = src.names.items[op.a];
-                    const flat = if (frame.path) |path| try reader_nets.joined(r, &.{ dev[0..1], ".", path, ".", dev }) else dev;
+                    const flat = if (frame.path) |path| try reader_nets.joined(r, &.{ &.{reader_instance.probeLetter(r, frame, dev)}, ".", path, ".", dev }) else dev;
                     break :a (try reader_nets.internName(r, flat)).index();
                 };
                 try r.nl.ops.append(r.arena, .{ .code = .iprobe, .a = a, .b = none });
