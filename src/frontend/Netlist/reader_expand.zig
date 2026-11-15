@@ -57,8 +57,8 @@ pub fn expand(r: *Reader, head: []const u8, frame: *const Frame, kv_text: []cons
     for (sub.defaults) |d| try scope.put(arena, d.key, .{ .text = d.text });
     for (r.card.kv.items, kv_text) |kv, text| try scope.put(arena, kv.key, switch (kv.value) {
         .num => |n| .{ .num = n },
-        .name => |n| .{ .text = n },
-        else => .{ .text = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text },
+        .name => |n| .{ .actual = n },
+        else => .{ .actual = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text },
     });
     // `m=` on an X card whose subcircuit declares no `m` makes m
     // parallel copies of it (ngspice inpcom.c:4334-4344, HSPICE's

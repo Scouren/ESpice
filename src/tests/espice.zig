@@ -555,6 +555,7 @@ test {
     _ = @import("sp_balanced.zig");
     _ = @import("dc_segments.zig");
     _ = @import("hdl_include.zig");
+    _ = @import("x_actuals.zig");
 }
 
 test "Problem: .lin format=touchstone writes <deck>.s2p beside the output file, not the deck, with the noise block" {

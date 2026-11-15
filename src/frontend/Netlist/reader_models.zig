@@ -291,8 +291,8 @@ pub fn localKey(r: *Reader, lm: usize, frame: *const Frame) Error!?[]const u8 {
                     try key.append(r.arena, 1);
                     try key.appendSlice(r.arena, std.mem.asBytes(&v));
                 },
-                .text => |t| {
-                    try key.append(r.arena, 2);
+                .text, .actual => |t| {
+                    try key.append(r.arena, if (e == .text) 2 else 3);
                     try key.appendSlice(r.arena, std.mem.asBytes(&@as(u64, t.len)));
                     try key.appendSlice(r.arena, t);
                     switch (try localReads(r, t)) {

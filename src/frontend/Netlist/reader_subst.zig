@@ -87,7 +87,7 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
                 };
                 switch (hit.entry) {
                     .num => |n| try emitNum(r, n),
-                    .text => |text| {
+                    .text, .actual => |text| {
                         // Instance scopes are fixed once built; the
                         // globals are not (a later `.param` redefines).
                         const key: reader.ParamKey = .{ .scope = @intFromPtr(scopes[hit.level]), .row = scopes[hit.level].getIndex(name).? };
@@ -117,7 +117,10 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
                         defer r.eval.bindings = saved;
                         var numparam = frame.*;
                         numparam.bsource = false;
-                        try subst(r, code, 0, code.ops.items.len, &numparam, scopes[0 .. hit.level + 1], depth + 1);
+                        // An actual reads the caller's scopes: never its own
+                        // instance's, where its formal would find itself.
+                        const outer = hit.level + @intFromBool(hit.entry == .text);
+                        try subst(r, code, 0, code.ops.items.len, &numparam, scopes[0..outer], depth + 1);
                         // A constant (no swept name, no Monte Carlo
                         // draw) folds once: later reads splice the number.
                         const ops = r.nl.ops.items[ops_mark..];

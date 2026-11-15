@@ -34,6 +34,7 @@ pub fn liveParam(r: *Reader, name: []const u8) Error!?u32 {
             .num => |n| n,
             else => return error.ParseError,
         },
+        .actual => unreachable, // only an instance scope holds an actual
     };
     try r.live.names.put(r.arena, name, {});
     try r.live.nominal.append(r.arena, v);
