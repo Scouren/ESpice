@@ -1,8 +1,9 @@
 //! HSPICE `.fft` [CR .FFT; SA Ch.15]: the deck's transient, resampled onto
 //! NP uniform points over [START, STOP), windowed and transformed. The plot
 //! is the `.ft#` data: every bin from DC to NP/2, as one complex column
-//! whose magnitude is the component's amplitude and whose angle is its sine
-//! phase.
+//! whose magnitude is the component's amplitude and whose angle is its
+//! cosine phase (Star-Hspice 1998.2 ch. 25 Example 1: a whole-cycle sine
+//! reads -90 deg).
 //! In: a run context and the `.fft` options. Out: NP/2 + 1 complex rows.
 //! Cites HSPICE [CR .FFT; SA Ch.15 Table 56]; Harris 1978 (Kaiser window
 //! side lobes, #82).
@@ -26,8 +27,8 @@ const besselI0_terms_max = 1000;
 
 /// Contract entry: the transient (or the rows `ctx.source` holds of it),
 /// then the spectrum. Complex, NP/2 + 1 rows
-/// (frequency, output). Bin k >= 1 holds 2·X[k]/Σw rotated to a sine
-/// reference, so a bin-centred A·sin(2πft + φ) reads A∠φ under any window;
+/// (frequency, output). Bin k >= 1 holds 2·X[k]/Σw, cosine-referenced as
+/// HSPICE's is, so a bin-centred A·cos(2πft + φ) reads A∠φ under any window;
 /// DC and Nyquist hold X[k]/Σw. FORMAT=NORM divides every bin by the
 /// largest non-DC magnitude. `error.TransientFailed` when the run stops
 /// early.
@@ -80,10 +81,9 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         const row = data[k * 4 ..][0..4];
         row[0] = @as(f64, @floatFromInt(k)) / (opts.stop - opts.start);
         row[1] = 0;
-        // X[k] = (N·A/2)·e^{jφc} for A·cos(ωt + φc); A·sin(ωt + φ) has
-        // φc = φ − 90°, so j·X[k] carries the sine phase φ.
-        row[2] = if (k == 0) re[0] * scale else -im[k] * scale;
-        row[3] = if (k == 0) 0 else re[k] * scale;
+        // X[k] = (N·A/2)·e^{jφ} for A·cos(ωt + φ): the cosine phase.
+        row[2] = re[k] * scale;
+        row[3] = if (k == 0) 0 else im[k] * scale;
         if (k != 0) peak = @max(peak, std.math.hypot(row[2], row[3]));
     }
     if (opts.normalized and peak > 0) for (0..rows) |k| {

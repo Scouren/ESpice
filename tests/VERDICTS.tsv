@@ -668,6 +668,7 @@ PASS	conformance/tests/netlist/op/resistor_model_geometry.sp
 PASS	conformance/tests/netlist/op/resistor_negative_ngspice.sp
 PASS	conformance/tests/netlist/op/save_forms.sp
 PASS	conformance/tests/netlist/op/series_sources.sp
+PASS	conformance/tests/netlist/op/sky130_opvars.sp
 PASS	conformance/tests/netlist/op/source_portnum_z0.sp
 PASS	conformance/tests/netlist/op/switch_s_none.sp
 PASS	conformance/tests/netlist/op/switch_s_off.sp
@@ -683,6 +684,7 @@ PASS	conformance/tests/netlist/op/vccs_sign.sp
 PASS	conformance/tests/netlist/op/vcvs_negative_gain.sp
 PASS	conformance/tests/netlist/op/vdmos_breakdown_m.sp
 PASS	conformance/tests/netlist/op/vdmos_model_m.sp
+PASS	conformance/tests/netlist/op/vdmos_pchan_saturation.sp
 PASS	conformance/tests/netlist/op/zero_supply.sp
 PASS	conformance/tests/netlist/optimize/bisection_divider.sp
 PASS	conformance/tests/netlist/optimize/bisection_divider_ngspice.sp
