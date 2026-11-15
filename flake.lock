@@ -112,11 +112,11 @@
     "sprack": {
       "flake": false,
       "locked": {
-        "lastModified": 1794721984,
-        "narHash": "sha256-iXtfKNKqgqKD8b38RmCIi97zKwGTb9BaNbuMz+Q5J/k=",
+        "lastModified": 1794731616,
+        "narHash": "sha256-AxQeEbGHsUy4+US+XVufUKmRDFoP1SpKUtkqBXKTf4c=",
         "owner": "Scouren",
         "repo": "SPRack",
-        "rev": "db87b8b1c386de3a7ca6a64c2d0372d8c9484adc",
+        "rev": "b53d6fffc2ef1004964de9e87e0d6d107c677934",
         "type": "github"
       },
       "original": {
