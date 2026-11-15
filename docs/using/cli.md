@@ -290,7 +290,7 @@ espice amp.sp -r amp.txt --format=print
 
 # An HSPICE deck, S-parameters to Touchstone: SpiceRack translates it
 # first (see Dialects)
-spx translate --from hspice --to ngspice filter.sp > filter.ngspice.sp
+sprack translate --from hspice --to ngspice filter.sp > filter.ngspice.sp
 espice filter.ngspice.sp --format=touchstone -r filter.s2p
 
 # Four analyses at once, eight device threads

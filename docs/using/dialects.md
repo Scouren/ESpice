@@ -10,17 +10,19 @@ change, and a file in either format may `.include` or `.lib` one in the
 other. [Moving a deck to the language](language.md#moving) lists the
 spellings that change. A deck in any other dialect (HSPICE, Spectre,
 LTspice, Xyce or VACASK) is translated to ngspice first by
-[SpiceRack](https://github.com/Scouren/SpiceRack)'s `spx`, installed
-separately; ESPice neither ships nor runs it.
+[SpiceRack](https://github.com/Scouren/SPRack)'s `sprack`. ESPice never
+runs it itself; the flake builds it from SpiceRack's newest `main` (`nix
+build github:OpenFAT/ESPice#sprack`, and `nix develop .#ci` puts it on
+`PATH`).
 
 ## Other dialects: SpiceRack
 
 ```sh
-spx translate --from hspice --to ngspice deck.sp > deck.ngspice.sp
+sprack translate --from hspice --to ngspice deck.sp > deck.ngspice.sp
 espice deck.ngspice.sp
 ```
 
-`spx translate` writes the netlist to stdout and its report to stderr, and
+`sprack translate` writes the netlist to stdout and its report to stderr, and
 exits 1 when part of the deck has no ngspice form. Every difference
 between ngspice and another dialect is SpiceRack's to translate: HSPICE's
 TNOM of 25 °C, `.temp` lists, multi-segment `.tran`, untyped `.measure`
@@ -49,7 +51,7 @@ parentheses, an untyped `.measure` and an `.alter` run:
 ```
 
 ```sh
-spx translate --from hspice --to ngspice hspice_alter.sp > alter.sp
+sprack translate --from hspice --to ngspice hspice_alter.sp > alter.sp
 espice alter.sp
 ```
 
@@ -74,7 +76,7 @@ The `.alter` run doubles R, and the 50 % crossing moves from RC ln 2 =
 ```
 
 ```sh
-spx translate --from spectre --to ngspice spectre_rc.scs > rc.sp
+sprack translate --from spectre --to ngspice spectre_rc.scs > rc.sp
 espice rc.sp
 ```
 

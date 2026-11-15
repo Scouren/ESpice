@@ -42,7 +42,7 @@ enum { ESPICE_FILE = 0, ESPICE_BYTES = 1 };
 /* espice_create_options.dialect: ngspice is the only one read. Any other
  * value is INVALID_ARGUMENT ("UnsupportedDialect"): translate an HSPICE,
  * Spectre, LTspice, Xyce or VACASK deck with SpiceRack first
- * (`spx translate --from <d> --to ngspice DECK`). */
+ * (`sprack translate --from <d> --to ngspice DECK`). */
 enum { ESPICE_NGSPICE = 0 };
 /* espice_create_options.backend */
 enum { ESPICE_CPU = 0, ESPICE_AUTO = 1, ESPICE_CUDA = 2, ESPICE_HIP = 3 };

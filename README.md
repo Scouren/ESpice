@@ -15,7 +15,7 @@ espice --plan deck.sp                            # print the analysis DAG withou
 A new deck is written in ESPice's netlist language: a file whose first line is `.espice 1`, with
 typed, named arguments and units. It keeps SPICE's directives and lowers to the ngspice dialect, so
 the two mix freely through `.include` and `.lib`, and a PDK needs no change. HSPICE, Spectre and
-other dialects are translated to ngspice first with SpiceRack's `spx translate`.
+other dialects are translated to ngspice first with SpiceRack's `sprack translate`.
 
 ```espice
 .espice 1

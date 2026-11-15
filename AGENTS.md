@@ -31,7 +31,7 @@ Project-specific:
 | Skill | Use it for here |
 |---|---|
 | `spice-engine` | MNA stamps, sparse LU replay, Newton with limiting, timestep control, device derivatives, ngspice/Xyce oracles |
-| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: SpiceRack's `spx`, external), expressions, coded diagnostics |
+| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: SpiceRack's `sprack`, external), expressions, coded diagnostics |
 | `gpu-kernel-optimization` | `--backend cuda` and HIP: device evaluation and solves on the GPU, where the data lives |
 | `branchless` | Data-dependent branches in device evaluation (region selects, limiting), before `simd-loops` |
 
@@ -164,7 +164,7 @@ Project-specific:
 | Skill | Use it for here |
 |---|---|
 | `spice-engine` | MNA stamps, sparse LU replay, Newton with limiting, timestep control, device derivatives, ngspice/Xyce oracles |
-| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: SpiceRack's `spx`, external), expressions, coded diagnostics |
+| `compiler-construction` | `src/frontend`: the ngspice netlist reader (other dialects: SpiceRack's `sprack`, external), expressions, coded diagnostics |
 | `gpu-kernel-optimization` | `--backend cuda` and HIP: device evaluation and solves on the GPU, where the data lives |
 | `branchless` | Data-dependent branches in device evaluation (region selects, limiting), before `simd-loops` |
 

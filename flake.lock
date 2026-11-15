@@ -105,7 +105,24 @@
         "flake-utils": "flake-utils",
         "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",
+        "sprack": "sprack",
         "zig-overlay": "zig-overlay"
+      }
+    },
+    "sprack": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794707739,
+        "narHash": "sha256-bdM24SIdze7/MY4DwQL/EBOIT6NuV4eyjhgGYMnuqBY=",
+        "owner": "Scouren",
+        "repo": "SPRack",
+        "rev": "3e39def846ed1c9d1160ac6ac0bd577bd73700a1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Scouren",
+        "repo": "SPRack",
+        "type": "github"
       }
     },
     "systems": {

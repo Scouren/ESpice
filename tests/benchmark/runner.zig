@@ -17,7 +17,7 @@
 //!   bash tests/conformance/external/spice-bench/fetch.sh zig-out/suites cmcqa
 //!   zig build bench -- --fixtures zig-out/suites/cmcqa --out zig-out/suites-results.md
 //! A deck whose oracle names another dialect is translated once by
-//! SpiceRack's `spx translate` (`--spx BIN`, else `spx` on PATH),
+//! SpiceRack's `sprack translate` (`--sprack BIN`, else `sprack` on PATH),
 //! outside timing; the espice columns time the translated ngspice deck.
 const std = @import("std");
 const Io = std.Io;
@@ -43,8 +43,8 @@ const Config = struct {
     /// Extra command-line words for HSPICE and Spectre (threads, APS).
     hspice_args: []const []const u8 = &.{},
     spectre_args: []const []const u8 = &.{},
-    /// The `spx` that translates a deck in another dialect.
-    spx: []const u8 = "spx",
+    /// The `sprack` that translates a deck in another dialect.
+    sprack: []const u8 = "sprack",
     /// Give HSPICE and Spectre ESPice's tolerances where the deck sets none.
     match_tol: bool = true,
     fixtures: []const u8,
@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
         // Another dialect: SpiceRack translates the deck once, here, outside
         // timing, and every espice column runs the translation as ngspice.
         const translation: ?spicerack.Translation = if (dialect) |d|
-            if (std.mem.eql(u8, d, "ngspice")) null else try spicerack.translate(fa, io, cfg.spx, d, source, absolute)
+            if (std.mem.eql(u8, d, "ngspice")) null else try spicerack.translate(fa, io, cfg.sprack, d, source, absolute)
         else
             null;
         // Sampled before the deck's runs, so they do not count themselves.
@@ -422,7 +422,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
     const engine = args.next() orelse return error.MissingEngine;
     var cfg: Config = .{ .espice = try Io.Dir.cwd().realPathFileAlloc(io, engine, a), .fixtures = args.next() orelse return error.MissingFixtures };
     var variants: std.ArrayList(Variant) = .empty;
-    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step, fixtures, spx };
+    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step, fixtures, sprack };
     const flags = std.StaticStringMap(Flag).initComptime(.{
         .{ "--list", .list },                    .{ "--ngspice-klu", .klu },               .{ "--filter", .filter },
         .{ "--iters", .iters },                  .{ "--timeout", .timeout },               .{ "--rtol", .rtol },
@@ -430,7 +430,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
         .{ "--xyce", .xyce },                    .{ "--espice", .espice },                 .{ "--hspice", .hspice },
         .{ "--spectre", .spectre },              .{ "--hspice-args", .hspice_args },       .{ "--spectre-args", .spectre_args },
         .{ "--vendor-tolerances", .native_tol }, .{ "--vacask-tran-fs", .vacask_tran_fs }, .{ "--vacask-tran-step", .vacask_tran_step },
-        .{ "--fixtures", .fixtures },            .{ "--spx", .spx },
+        .{ "--fixtures", .fixtures },            .{ "--sprack", .sprack },
     });
     while (args.next()) |arg| {
         const flag = flags.get(arg) orelse return error.UnknownArgument;
@@ -449,7 +449,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
             .rtol => cfg.rtol = try std.fmt.parseFloat(f64, value),
             .out => cfg.report = value,
             .fixtures => cfg.fixtures = value,
-            .spx => cfg.spx = value,
+            .sprack => cfg.sprack = value,
             .ngspice => cfg.refs.set(.ngspice, value),
             .vacask => cfg.refs.set(.vacask, value),
             .vacask_tran_fs => cfg.vacask_tran_fs = try std.fmt.parseFloat(f64, value),

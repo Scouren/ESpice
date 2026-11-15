@@ -55,13 +55,13 @@ twin() { # twin STEM: docs/examples/STEM.esp prints and writes what STEM.sp does
   fi
 }
 
-# A deck in another dialect runs as `spx translate`'s ngspice of it, as
-# dialects.md says to run it; no spx on PATH fails it, never skips it.
+# A deck in another dialect runs as `sprack translate`'s ngspice of it, as
+# dialects.md says to run it; no sprack on PATH fails it, never skips it.
 translated() { # translated FROM DECK
   total=$((total + 1))
-  if ! (cd docs/examples && spx translate --from "$1" --to ngspice "$2" >"$work/translated.sp" 2>"$work/log"); then
+  if ! (cd docs/examples && sprack translate --from "$1" --to ngspice "$2" >"$work/translated.sp" 2>"$work/log"); then
     fail=$((fail + 1))
-    echo "FAIL $2: spx translate --from $1"
+    echo "FAIL $2: sprack translate --from $1"
     tail -5 "$work/log"
     return
   fi

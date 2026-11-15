@@ -22,6 +22,13 @@
     conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=dev/perf-oracles&rev=c0348882ff257bef9ff85a35a398559a7271073d";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
+    # SpiceRack, the translator from other dialects (`sprack translate`):
+    # its main branch, locked in flake.lock; sprack-update.yml moves the
+    # lock to the newest commit in a gated pull request.
+    sprack = {
+      url = "github:Scouren/SPRack";
+      flake = false;
+    };
   };
 
   outputs =
@@ -32,6 +39,7 @@
       zig-overlay,
       nix-bundle,
       conformance,
+      sprack,
       ...
     }:
     {
@@ -139,11 +147,33 @@
 
         version = builtins.head (builtins.match ''.*\.version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon));
 
+        # SpiceRack's CLI, built from the locked source with this Zig (it
+        # has no dependencies): the corpus runner and the docs gate run
+        # `sprack translate` on the decks in other dialects.
+        sprackPkg = pkgs.stdenvNoCC.mkDerivation {
+          pname = "sprack";
+          version = sprack.shortRev or "dirty";
+          src = sprack;
+          nativeBuildInputs = [ zig ];
+          dontConfigure = true;
+          dontInstall = true;
+          buildPhase = ''
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            zig build install -Doptimize=ReleaseSafe -j$NIX_BUILD_CORES --prefix "$out"
+            rm -rf "$out/python" "$out/lib"
+          '';
+          meta = {
+            description = "SpiceRack: SPICE dialect translator";
+            mainProgram = "sprack";
+          };
+        };
+
         devShells = rec {
           ci = pkgs.mkShell {
             packages = [
               zig
               pkgs.python3
+              sprackPkg
             ];
             # One global cache per Zig store path: two builds of the same Zig version
             # sharing ~/.cache/zig evict each other's build runner on every `zig build`.
@@ -261,6 +291,7 @@
         packages = {
           default = espice;
           inherit espice;
+          sprack = sprackPkg;
         }
         // releases
         // lib.optionalAttrs (latest != null) { inherit latest; }

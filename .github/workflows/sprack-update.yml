@@ -1,0 +1,69 @@
+name: sprack-update
+
+# Keeps the SpiceRack translator at the newest commit of Scouren/SPRack's
+# main: moves the `sprack` input in flake.lock and opens (or updates) a pull
+# request, so the bump lands only through the required checks. A bot never
+# pushes to main.
+#
+# A pull request opened with the default GITHUB_TOKEN starts no workflows,
+# so its checks would never run: set the repository secret
+# SPRACK_UPDATE_TOKEN (a fine-grained token with contents and
+# pull-requests write) and the checks run on the bump like any PR.
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sprack-update
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SPRACK_UPDATE_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          token: ${{ secrets.SPRACK_UPDATE_TOKEN || github.token }}
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Move the sprack lock to SPRack's newest main
+        id: bump
+        run: |
+          before=$(jq -r .nodes.sprack.locked.rev flake.lock)
+          nix flake update sprack
+          after=$(jq -r .nodes.sprack.locked.rev flake.lock)
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+
+      # The bump must at least build before it is proposed.
+      - if: steps.bump.outputs.before != steps.bump.outputs.after
+        run: nix build .#sprack --print-build-logs
+
+      - if: steps.bump.outputs.before != steps.bump.outputs.after
+        name: Open or update the pull request
+        run: |
+          before=${{ steps.bump.outputs.before }}
+          after=${{ steps.bump.outputs.after }}
+          branch=bot/sprack-update
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git commit -am "flake: sprack ${before:0:8} -> ${after:0:8}"
+          git push --force origin "$branch"
+          body="Moves the \`sprack\` input to Scouren/SPRack@${after}: https://github.com/Scouren/SPRack/compare/${before}...${after}"
+          if gh pr view "$branch" --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "$branch" --title "flake: sprack ${before:0:8} -> ${after:0:8}" --body "$body"
+          else
+            gh pr create --base main --head "$branch" --title "flake: sprack ${before:0:8} -> ${after:0:8}" --body "$body"
+          fi

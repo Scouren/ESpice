@@ -2,7 +2,7 @@
 //! in order, its `.meas` text on stdout (or its JSON, `--measures=-`), the
 //! `--measures` and `--emir` JSON files, and a one-line summary per result
 //! on stderr. A deck is read as ngspice; another dialect is translated
-//! before espice sees it (SpiceRack's `spx translate`, run by the caller).
+//! before espice sees it (SpiceRack's `sprack translate`, run by the caller).
 //! Exit 0, 1 if any file failed to read, prepare or run, 2 on a usage error. The flags, the exit codes and every
 //! printed line are the CLI's contract.
 //! Cites: none.

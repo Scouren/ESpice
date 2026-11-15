@@ -335,7 +335,7 @@ fn create(gpa: std.mem.Allocator, options: *const CreateOptions) !*Token {
     const live_params = try strings(gpa, live_bytes);
     defer gpa.free(live_params);
     if (source.len == 0 or options.explicit_gpu > 1) return error.InvalidArgument;
-    // The library reads ngspice only; `spx translate` converts the rest first.
+    // The library reads ngspice only; `sprack translate` converts the rest first.
     if (options.dialect != header.ESPICE_NGSPICE) return error.UnsupportedDialect;
     const config: api.Options = .{
         .source = switch (options.source_kind) {

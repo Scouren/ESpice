@@ -222,7 +222,7 @@ test "C entry points reject NULL handles and malformed options" {
         var bad = good;
         switch (case) {
             0 => bad.source_kind = 2,
-            1 => bad.dialect = 1, // HSPICE's old tag: `spx translate` converts it
+            1 => bad.dialect = 1, // HSPICE's old tag: `sprack translate` converts it
             2 => bad.output_format = 9,
             3 => bad.explicit_gpu = 2,
             4 => bad.max_parallel = 0,

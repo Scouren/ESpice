@@ -24,8 +24,8 @@
 //! After the decks, `vpi/bare_name` checks the CLI's `--vpi` file name, and
 //! `netlist/behavioural_dropped` its warning for a dropped field (`cli_checks`).
 //! A deck in another dialect (`tokenizer` hspice or spectre) runs as
-//! SpiceRack's `spx translate --from <tokenizer> --to ngspice` of it, with
-//! `spx` on PATH: a missing one fails the deck, never skips it. One whose run
+//! SpiceRack's `sprack translate --from <tokenizer> --to ngspice` of it, with
+//! `sprack` on PATH: a missing one fails the deck, never skips it. One whose run
 //! warns that ESPice dropped input fails as `DroppedInput` unless its oracle
 //! lists the warning as a `stderr_line` check (`droppedInput`).
 //! `--zig PATH` and `--perf LEVERS` set `ZIG` and `ESPICE_PERF` in every
@@ -65,7 +65,7 @@ const Expectation = struct {
     category: ?[]const u8 = null,
 };
 /// `tokenizer`: the dialect the deck is written in; null keeps
-/// espice's dialect (ngspice). Any other is translated by `spx` first
+/// espice's dialect (ngspice). Any other is translated by `sprack` first
 /// (`translate`); espice reads ngspice alone.
 const Oracle = struct { schema_version: u8, netlist_sha256: []const u8, expect: Expectation, tokenizer: ?[]const u8 = null };
 /// espice's `--measures` JSON (src/espice/report.zig) as `measure` reads
@@ -554,7 +554,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
     // the GPU path it asked for. Under `auto` too: a failed kernel build is a bug either way.
     if (!equal(backend_name, "cpu") and std.mem.indexOf(u8, result.stderr, "hdl: no device kernels for ") != null) return error.DeviceKernelsFailed;
     try requireSuccess(result);
-    // A routed deck ran spx's translation: a warning that ESPice
+    // A routed deck ran sprack's translation: a warning that ESPice
     // dropped part of it is input the translation lost, whatever the numbers.
     const routed = if (oracle.tokenizer) |t| !equal(t, "ngspice") else false;
     if (routed) if (try droppedInput(result.stderr, oracle.expect.checks)) |l| {
@@ -692,32 +692,32 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
     return runEspice(a, io, argv, std.fs.path.dirname(netlist).?, timeout_seconds);
 }
 
-/// `netlist` in `dialect` as `spx translate --from DIALECT --to ngspice`
+/// `netlist` in `dialect` as `sprack translate --from DIALECT --to ngspice`
 /// writes it (stdout), at `<output>.sp`, an absolute path. espice still runs
 /// from the deck's directory, which ngspice's include order searches first,
 /// so a relative `.include` finds the original file, untranslated.
-/// spx's exit 1 (something could not be expressed) is the deck's refusal:
-/// a run exiting 1 with `Error: <deck>: SpxRefused` after spx's report,
-/// which `checkRejection` reads as unsupported_input. `error.SpxNotFound`
-/// when no spx is on PATH; any other exit is `error.SpxFailed`.
+/// sprack's exit 1 (something could not be expressed) is the deck's refusal:
+/// a run exiting 1 with `Error: <deck>: SprackRefused` after sprack's report,
+/// which `checkRejection` reads as unsupported_input. `error.SprackNotFound`
+/// when no sprack is on PATH; any other exit is `error.SprackFailed`.
 // ponytail: includes are not translated; a routed deck that includes
-// another-dialect file needs spx to inline it or a kit mode.
+// another-dialect file needs sprack to inline it or a kit mode.
 fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, output: []const u8, timeout_seconds: u32) !union(enum) { deck: []const u8, refused: std.process.RunResult } {
     std.debug.assert(dialect.len != 0 and output.len != 0);
     const deck = try std.fmt.allocPrint(a, "{s}.sp", .{output});
-    const argv = [_][]const u8{ "spx", "translate", "--from", dialect, "--to", "ngspice", std.fs.path.basename(netlist) };
+    const argv = [_][]const u8{ "sprack", "translate", "--from", dialect, "--to", "ngspice", std.fs.path.basename(netlist) };
     const result = runEspice(a, io, &argv, std.fs.path.dirname(netlist).?, timeout_seconds) catch |err| switch (err) {
-        error.FileNotFound => return error.SpxNotFound,
+        error.FileNotFound => return error.SprackNotFound,
         else => return err,
     };
     if (result.term == .exited and result.term.exited == 1) {
         var refused = result;
-        refused.stderr = try std.fmt.allocPrint(a, "{s}\nError: {s}: SpxRefused\n", .{ result.stderr, netlist });
+        refused.stderr = try std.fmt.allocPrint(a, "{s}\nError: {s}: SprackRefused\n", .{ result.stderr, netlist });
         return .{ .refused = refused };
     }
     if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0) {
-        diagnostic("  spx {any}\n{s}\n", .{ result.term, result.stderr });
-        return error.SpxFailed;
+        diagnostic("  sprack {any}\n{s}\n", .{ result.term, result.stderr });
+        return error.SprackFailed;
     }
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = deck, .data = result.stdout });
     return .{ .deck = deck };
@@ -790,9 +790,9 @@ fn checkRejection(category: []const u8, result: std.process.RunResult) !void {
         .{ "UnregisteredSystf", "unsupported_input" },
         .{ "VpiSecondSystfModule", "unsupported_input" },
         .{ "UnpairedPoleRoot", "unsupported_input" },
-        // spx's exit 1, a construct it could not express, never its
+        // sprack's exit 1, a construct it could not express, never its
         // absence or crash (`translate`).
-        .{ "SpxRefused", "unsupported_input" },
+        .{ "SprackRefused", "unsupported_input" },
         .{ "unsupported_input", "unsupported_input" },
     });
     var lines = std.mem.splitScalar(u8, result.stderr, '\n');
