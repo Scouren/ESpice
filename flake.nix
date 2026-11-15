@@ -19,7 +19,7 @@
     # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
     # a git flake leaves submodules out of its source.
     # git+https, not github: GitHub's tarball of one commit gave two NAR hashes.
-    conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=main&rev=035edd3c40bf22c7088a98791566863c8cabe79e";
+    conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=main&rev=1ebd3cfcec1820e7f1e2888c141a2656452fa7f5";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
     # SpiceRack, the translator from other dialects (`sprack translate`):
