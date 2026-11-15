@@ -540,6 +540,7 @@ test {
     _ = @import("mfactor.zig");
     _ = @import("tempco.zig");
     _ = @import("noise_gap.zig");
+    _ = @import("topology.zig");
     _ = @import("noise_quiet.zig");
     _ = @import("expressions.zig");
     _ = @import("temper.zig");

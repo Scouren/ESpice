@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 const requests = @import("query.zig");
 const Tolerances = @import("numerics.zig").Tolerances;
 const Deck = @import("deck.zig").Deck;
+const Topology = @import("deck.zig").Topology;
 
 /// The most tones a multi-tone HB spectrum takes (analysis/pss/mhb.zig).
 pub const mhb_max_tones = 8;
@@ -48,6 +49,12 @@ pub const DeckError = Error || error{
     /// <time>`) or the deck runs no `.tran` its names were resolved for;
     /// the log names the first such variable.
     UnreplayedOpVar,
+    /// An operating point on a deck with `Topology.dc_loop`.
+    VoltageSourceLoop,
+    /// An operating point on a deck with `Topology.cutset`.
+    CurrentSourceCutset,
+    /// A static operating point on a deck with `Topology.no_dc_path`.
+    FloatingNode,
 };
 
 /// Row fields, by name, that every query kind having one must keep below n.
@@ -79,11 +86,14 @@ pub fn validate(query: requests.Query, n: u32) Error!void {
 /// row or a `.tran` one lies past `deck.variants` or among its dropped rows,
 /// `error.DcSweepSourceNotFound` when a `.dc` sweep names a card the deck
 /// does not have, `error.UnmodelledNoise` for a `.noise` on a deck with
-/// `noise_gaps`, and `error.UnreplayedOpVar` for a `.tran` whose rows no
-/// replay serves a saved operating-point variable over. Asserts that a
+/// `noise_gaps`, `error.UnreplayedOpVar` for a `.tran` whose rows no
+/// replay serves a saved operating-point variable over, and a topology
+/// error for a query whose operating point `deck.topology` rules out
+/// (`admitTopology`). Asserts that a
 /// non-empty `deck.variants` has one `starts` entry more than rows.
 pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void {
     try validate(query, n);
+    try admitTopology(query, deck.topology);
     // `count` asserts the table's shape, so it runs only for a query that
     // reads the table: a deck with no variant query may carry any table.
     const rows = deck.variants;
@@ -110,6 +120,37 @@ pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!
         },
         .ac, .dcmatch, .disto, .envelope, .four, .hb, .matex, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => {},
     }
+}
+
+/// Refuses `query` when its operating point cannot exist on a deck with
+/// `topo`, naming the card or node in the log. Every query but a `uic` one
+/// solves an operating point first (`Query.uic`; analysis
+/// session_jobs.zig `prerequisite`): a V/L loop that disagrees at DC or a
+/// cutset refuses it. A node with no DC path refuses only a static one: a
+/// transient's (an `.op` with `tran_op`, or a transient kind; analysis
+/// dispatch.zig, `transient`) settles it by OPtran (op_ladder.zig
+/// `transientOp`). Under `uic` nothing is solved at DC: the start is one
+/// step over a vanishing dt (tran/sim_init.zig `uicStart`), where an
+/// inductor's flux and a capacitor's charge hold their initial values, so
+/// the V/L loop, the cutset and the capacitor-only node all have a unique
+/// solution. A node that neither a DC path nor a capacitor reaches stays
+/// singular there too, and the transient fails on it as a solve.
+fn admitTopology(query: requests.Query, topo: Topology) DeckError!void {
+    if (query.uic()) return;
+    const quiet = @import("builtin").is_test; // the test runner fails any test that logs an error
+    if (topo.dc_loop) |name| {
+        if (!quiet) std.log.err("topology: '{s}' closes a loop of voltage sources and inductors whose KVL disagrees at DC; only a `.tran ... uic` runs it", .{name});
+        return error.VoltageSourceLoop;
+    }
+    if (topo.cutset) |node| {
+        if (!quiet) std.log.err("topology: node '{s}' is a current-source cutset: its current sources do not balance and KCL has no DC path to satisfy it", .{node});
+        return error.CurrentSourceCutset;
+    }
+    const static = if (query == .op) !query.op.tran_op else !@as(requests.Kind, query).transient();
+    if (static) if (topo.no_dc_path) |node| {
+        if (!quiet) std.log.err("topology: node '{s}' has no DC path to ground, so the operating point is not unique", .{node});
+        return error.FloatingNode;
+    };
 }
 
 // What the drivers allocate, not their caps: a cap times n can pass the
@@ -527,26 +568,29 @@ test "envelopeMaxPoints and matexEstPoints bound their tables" {
     try std.testing.expectEqual(@as(u32, 300), matexEstPoints(.{ .t_stop = 1, .max_points = 300, .h_output_cap = 1e-6 }));
 }
 
+/// A deck with no cards, variants or facts, for the `validateDeck` tests.
+const bare_deck: Deck = .{
+    .probes = &.{},
+    .probe_labels = &.{},
+    .source_node = 0,
+    .source_branch = 0,
+    .output_node = 0,
+    .ac_drive = &.{},
+    .title = "",
+    .n_devices = 0,
+    .ic = &.{},
+    .deck_tol = .{},
+    .deck_temp = null,
+    .deck_method = null,
+    .queries = &.{},
+    .bindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} },
+    .cards = &.{},
+    .ac_overrides = &.{},
+};
+
 test "validateDeck refuses a variant past the deck's table" {
-    const deck: Deck = .{
-        .probes = &.{},
-        .probe_labels = &.{},
-        .source_node = 0,
-        .source_branch = 0,
-        .output_node = 0,
-        .ac_drive = &.{},
-        .title = "",
-        .n_devices = 0,
-        .ic = &.{},
-        .deck_tol = .{},
-        .deck_temp = null,
-        .deck_method = null,
-        .queries = &.{},
-        .bindings = .{ .v_names = &.{}, .i_names = &.{}, .v_branches = &.{}, .v_pos = &.{}, .v_neg = &.{}, .i_pos = &.{}, .i_neg = &.{}, .v_distof1 = &.{}, .ports = &.{} },
-        .cards = &.{},
-        .ac_overrides = &.{},
-        .variants = .{ .labels = &.{ "a", "b" }, .temp_c = &.{ null, null }, .axis = &.{ 0, 1 }, .starts = &.{ 0, 0, 0 } },
-    };
+    var deck = bare_deck;
+    deck.variants = .{ .labels = &.{ "a", "b" }, .temp_c = &.{ null, null }, .axis = &.{ 0, 1 }, .starts = &.{ 0, 0, 0 } };
     try validateDeck(.{ .op = .{ .tol = .{ .variant = 1 } } }, 2, &deck);
     try std.testing.expectError(error.InvalidQueryOptions, validateDeck(.{ .op = .{ .tol = .{ .variant = 2 } } }, 2, &deck));
     try validateDeck(.{ .mc = .{ .variants = .{ .first = 1, .count = 1 } } }, 2, &deck);
@@ -559,6 +603,29 @@ test "validateDeck refuses a variant past the deck's table" {
     try std.testing.expectError(error.InvalidQueryOptions, validateDeck(.{ .tran = .{ .t_stop = 1e-9, .method = .gear_3, .tangents = &.{1} } }, 2, &deck));
     try validateDeck(.{ .tran = .{ .t_stop = 1e-9, .method = .gear_6 } }, 2, &deck);
     try std.testing.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = @fromBackingInt(0) } } } }, 2, &deck));
+}
+
+test "validateDeck refuses a topology fact only for the queries whose operating point it rules out" {
+    // Oracle: the list by hand, from what each analysis solves first. A uic
+    // transient (and a .four over one) solves none; a transient (also .pss,
+    // an .op that starts one) solves OPtran's; .op, .dc, .pz and .mc a
+    // static one.
+    var deck = bare_deck;
+    const uic_tran: requests.Query = .{ .tran = .{ .t_stop = 1e-9, .uic = true } };
+    const tran: requests.Query = .{ .tran = .{ .t_stop = 1e-9 } };
+    const static = [_]requests.Query{ .{ .op = .{} }, .{ .dc = .{ .target = .temp } }, .{ .pz = .{} }, .{ .mc = .{} } };
+    const transient = [_]requests.Query{ tran, .{ .op = .{ .tran_op = true } }, .{ .pss = .{ .period = 1e-9 } } };
+    deck.topology = .{ .dc_loop = "l1" };
+    try validateDeck(uic_tran, 2, &deck);
+    try validateDeck(.{ .four = .{ .f_fundamental = 1e9, .tran_opts = .{ .t_stop = 1e-9, .uic = true } } }, 2, &deck);
+    for (static ++ transient) |q| try std.testing.expectError(error.VoltageSourceLoop, validateDeck(q, 2, &deck));
+    deck.topology = .{ .cutset = "out", .no_dc_path = "out" };
+    try validateDeck(uic_tran, 2, &deck);
+    for (static ++ transient) |q| try std.testing.expectError(error.CurrentSourceCutset, validateDeck(q, 2, &deck));
+    deck.topology = .{ .no_dc_path = "x" };
+    try validateDeck(uic_tran, 2, &deck);
+    for (transient) |q| try validateDeck(q, 2, &deck);
+    for (static) |q| try std.testing.expectError(error.FloatingNode, validateDeck(q, 2, &deck));
 }
 
 test "a non-finite float anywhere in a query refuses it, inside slices and optionals too" {

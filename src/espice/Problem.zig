@@ -377,7 +377,7 @@ pub fn init(gpa: Allocator, io: std.Io, given: Options) !*Problem {
     const workers = self.query_memory.allocator();
     self.threads = .init(workers, io);
     // Spawns lazily: the warm operating point (`points.solveWarmOp`) can
-    // start threads and then fail the init (error.FloatingNode).
+    // start threads and then fail the init.
     errdefer self.threads.deinit();
     self.ws_pool = try .init(workers, io, options.max_parallel);
     errdefer self.ws_pool.deinit();

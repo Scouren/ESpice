@@ -402,6 +402,7 @@ fn plan(lib: *const device.Library, sim_arena: Allocator, parse_arena: Allocator
         .card_names = card_names,
         .ac_overrides = try prepared_deck.acOverrides(sim_arena, cards, nb.ac_res.items(.name), nb.ac_res.items(.value)),
         .noise_gaps = try prepared_deck.noiseGaps(sim_arena, nb.noise_gaps.items),
+        .topology = try prepared_deck.topology(sim_arena, nb.topology),
         .temper = temper,
         .measures = try prepared_deck.measures(sim_arena, nl.deck.measures),
         .save_op = if (nl.deck.save_op) |s| blk: {

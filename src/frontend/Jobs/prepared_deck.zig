@@ -11,6 +11,7 @@
 //! - `pub fn measures(arena: Allocator, cards: []const core.Measure) Allocator.Error![]const core.Measure`
 //! - `pub fn acOverrides(arena: Allocator, cards: []const requests.CardRef, names: []const []const u8, values: []const f64) error{ OutOfMemory, InvalidAcOverride }![]const core.AcOverride`
 //! - `pub fn noiseGaps(arena: Allocator, gaps: []const core.NoiseGap) Allocator.Error![]const core.NoiseGap`
+//! - `pub fn topology(arena: Allocator, facts: core.Topology) Allocator.Error!core.Topology`
 //! - `pub fn frozenIndices(scratch: Allocator, cards: []requests.CardRef, circuit: *const device.Circuit) !void`
 //! - `pub fn cardModels(sim_arena: Allocator, scratch: Allocator, nl: *const netlist.Netlist, cards: []const requests.CardRef) !requests.CardNames`
 //! - `pub fn portCounts(arena: Allocator, lib: *const device.Library, circuit: *const device.Circuit) ![]const u32`
@@ -121,6 +122,15 @@ pub fn noiseGaps(arena: Allocator, gaps: []const core.NoiseGap) Allocator.Error!
     const out = try arena.alloc(core.NoiseGap, gaps.len);
     for (gaps, out) |gap, *o| o.* = .{ .card = try arena.dupe(u8, gap.card), .key = try arena.dupe(u8, gap.key) };
     return out;
+}
+
+/// `facts` with every name copied into `arena`.
+pub fn topology(arena: Allocator, facts: core.Topology) Allocator.Error!core.Topology {
+    return .{
+        .dc_loop = if (facts.dc_loop) |name| try arena.dupe(u8, name) else null,
+        .cutset = if (facts.cutset) |node| try arena.dupe(u8, node) else null,
+        .no_dc_path = if (facts.no_dc_path) |node| try arena.dupe(u8, node) else null,
+    };
 }
 
 /// Renumbers each card's `index` from its add ordinal to its instance's

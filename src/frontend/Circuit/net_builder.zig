@@ -95,6 +95,9 @@ pub const NetBuilder = struct {
     /// as `Deck.noise_gaps`, which refuses `.noise` and nothing else.
     /// `net_devices.boundCard` appends, once per model row.
     noise_gaps: std.ArrayList(core.NoiseGap) = .empty,
+    /// What the topology check found (`net_topology`), names borrowed from
+    /// the deck and the Builder: published as `Deck.topology`.
+    topology: core.Topology = .{},
     /// One row per I card. An I source has no branch row, so a `.tf` driven
     /// from one excites the node pair.
     i: std.MultiArrayList(struct { name: []const u8, pos: u32, neg: u32 }) = .empty,
@@ -370,10 +373,10 @@ pub const NetBuilder = struct {
     /// the built-in ones, a topology check, the subcircuit tags of the BBD
     /// permutation, then the runtime-loaded (.hdl) ones. V and L go first;
     /// F/H/W/K wait until the end so the rows they name exist. Refuses a
-    /// card it cannot bind, a loop of V/L shorts whose KVL sum disagrees
-    /// (VoltageSourceLoop) and a node only current sources reach
-    /// and no `.ic` holds (CurrentSourceCutset); a capacitor-only node, or
-    /// a `.ic`-held one, sets `needs_tran_op`.
+    /// card it cannot bind, a loop of V sources alone (VoltageSourceLoop,
+    /// NonuniqueOperatingPoint) and a net no element touches
+    /// (FloatingNode); records in `topology` what only an operating point
+    /// refuses, and a node with no DC path sets `needs_tran_op`.
     pub fn build(self: *NetBuilder) !void {
         for ("vlifhwkabcdegjmnopqrstuxyz") |c| for (self.nl.bucket(c)) |e| {
             const dev = self.nl.device(e);
