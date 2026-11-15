@@ -24,7 +24,8 @@
 //! After the decks, `vpi/bare_name` checks the CLI's `--vpi` file name, and
 //! `netlist/behavioural_dropped` its warning for a dropped field (`cli_checks`).
 //! A deck in another dialect (`tokenizer` hspice or spectre) runs as
-//! SpiceRack's `sprack translate --from <tokenizer> --to espice` of it, with
+//! SpiceRack's `sprack project --from <tokenizer> --to espice` of it (the deck and every
+//! file it includes, translated), with
 //! `sprack` on PATH: a missing one fails the deck, never skips it. One whose run
 //! warns that ESPice dropped input fails as `DroppedInput` unless its oracle
 //! lists the warning as a `stderr_line` check (`droppedInput`).
@@ -676,8 +677,15 @@ fn sameResults(a: Allocator, base: []const Plot, got: []const Plot, v: metamorph
 /// start code leaves the exit code alone on one, so only stderr shows it.
 fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: []const u8, timeout_seconds: u32, tokenizer: ?[]const u8) !std.process.RunResult {
     const measures = try std.fmt.allocPrint(a, "--measures={s}.json", .{output});
+    // A routed deck runs from its translated tree, so a relative include
+    // finds the translated copy, never the original (ngspice's include
+    // order searches the working directory first).
+    var dir = std.fs.path.dirname(netlist).?;
     const deck = if (tokenizer) |dialect| switch (try translate(a, io, netlist, dialect, output, timeout_seconds)) {
-        .deck => |d| d,
+        .kit => |k| d: {
+            dir = k;
+            break :d std.fs.path.basename(netlist);
+        },
         .refused => |result| return result,
     } else std.fs.path.basename(netlist);
     const base = [_][]const u8{ app, "--backend", backend_name, "--format=binary", "-b", "-r", output, measures, deck };
@@ -689,23 +697,25 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
         with_vpi[base.len + 1] = try Io.Dir.cwd().realPathFileAlloc(io, vpi_fixture orelse return error.MissingVpiFixture, a);
         break :blk &with_vpi;
     } else &base;
-    return runEspice(a, io, argv, std.fs.path.dirname(netlist).?, timeout_seconds);
+    return runEspice(a, io, argv, dir, timeout_seconds);
 }
 
-/// `netlist` in `dialect` as `sprack translate --from DIALECT --to espice`
-/// writes it (stdout), at `<output>.sp`, an absolute path. espice still runs
-/// from the deck's directory, which ngspice's include order searches first,
-/// so a relative `.include` finds the original file, untranslated.
-/// sprack's exit 1 (something could not be expressed) is the deck's refusal:
-/// a run exiting 1 with `Error: <deck>: SprackRefused` after sprack's report,
-/// which `checkRejection` reads as unsupported_input. `error.SprackNotFound`
+/// `netlist` in `dialect` as `sprack project --from DIALECT --to espice`
+/// writes it and every file it reaches, into the directory `<output>.kit`
+/// (absolute), the deck at `<output>.kit/<basename>`: returns that
+/// directory. An include is translated and rewritten to its copy, and
+/// HSPICE's `.option search` resolved. sprack's exit 1 (something could
+/// not be expressed) is the deck's refusal: a run exiting 1 with
+/// `Error: <deck>: SprackRefused` after sprack's report, which
+/// `checkRejection` reads as unsupported_input. `error.SprackNotFound`
 /// when no sprack is on PATH; any other exit is `error.SprackFailed`.
-// ponytail: includes are not translated; a routed deck that includes
-// another-dialect file needs sprack to inline it or a kit mode.
-fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, output: []const u8, timeout_seconds: u32) !union(enum) { deck: []const u8, refused: std.process.RunResult } {
+// ponytail: the kit holds netlists only; a routed deck reading a data or
+// HDL file beside it (none in the corpus) would need it copied in.
+fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, output: []const u8, timeout_seconds: u32) !union(enum) { kit: []const u8, refused: std.process.RunResult } {
     std.debug.assert(dialect.len != 0 and output.len != 0);
-    const deck = try std.fmt.allocPrint(a, "{s}.sp", .{output});
-    const argv = [_][]const u8{ "sprack", "translate", "--from", dialect, "--to", "espice", std.fs.path.basename(netlist) };
+    const kit = try std.fmt.allocPrint(a, "{s}.kit", .{output});
+    std.debug.assert(std.fs.path.isAbsolute(kit));
+    const argv = [_][]const u8{ "sprack", "project", "--from", dialect, "--to", "espice", "--out", kit, std.fs.path.basename(netlist) };
     const result = runEspice(a, io, &argv, std.fs.path.dirname(netlist).?, timeout_seconds) catch |err| switch (err) {
         error.FileNotFound => return error.SprackNotFound,
         else => return err,
@@ -715,12 +725,11 @@ fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, out
         refused.stderr = try std.fmt.allocPrint(a, "{s}\nError: {s}: SprackRefused\n", .{ result.stderr, netlist });
         return .{ .refused = refused };
     }
-    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         diagnostic("  sprack {any}\n{s}\n", .{ result.term, result.stderr });
         return error.SprackFailed;
     }
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = deck, .data = result.stdout });
-    return .{ .deck = deck };
+    return .{ .kit = kit };
 }
 
 /// Runs the espice command `argv` in `cwd`. `error.Timeout` after

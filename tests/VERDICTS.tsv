@@ -401,7 +401,7 @@ PASS	conformance/tests/netlist/hspice/match_diode_is.sp
 PASS	conformance/tests/netlist/hspice/match_diode_is_ngspice.sp
 PASS	conformance/tests/netlist/hspice/match_diode_ngspice.sp
 XFAIL	conformance/tests/netlist/hspice/meas_events.sp
-XFAIL	conformance/tests/netlist/hspice/meas_forms.sp
+PASS	conformance/tests/netlist/hspice/meas_forms.sp
 PASS	conformance/tests/netlist/hspice/meas_lstb.sp
 PASS	conformance/tests/netlist/hspice/meas_lstb_ngspice.sp
 PASS	conformance/tests/netlist/hspice/meas_match.sp
@@ -446,7 +446,7 @@ XFAIL	conformance/tests/netlist/hspice/sn_rc.sp
 XFAIL	conformance/tests/netlist/hspice/snac_rc.sp
 XFAIL	conformance/tests/netlist/hspice/snnoise_rc.sp
 XFAIL	conformance/tests/netlist/hspice/snxf_rc.sp
-XFAIL	conformance/tests/netlist/hspice/temp_list.sp
+PASS	conformance/tests/netlist/hspice/temp_list.sp
 PASS	conformance/tests/netlist/hspice/tnom_default.sp
 PASS	conformance/tests/netlist/hspice/tran_segments.sp
 PASS	conformance/tests/netlist/hspice/unknown_card.sp
@@ -1093,9 +1093,9 @@ PASS	conformance/tests/netlist/tran/zero_abstol_vntol.sp
 PASS	conformance/tests/netlist/tran/zero_vntol_chgtol.sp
 PASS	conformance/tests/netlist/tran_noise/hspice_samples.sp
 PASS	conformance/tests/netlist/tran_noise/hspice_samples_ngspice.sp
-XFAIL	conformance/tests/netlist/tran_noise/hspice_sde_flicker.sp
+PASS	conformance/tests/netlist/tran_noise/hspice_sde_flicker.sp
 PASS	conformance/tests/netlist/tran_noise/hspice_sde_flicker_ngspice.sp
-XFAIL	conformance/tests/netlist/tran_noise/hspice_sde_rc.sp
+PASS	conformance/tests/netlist/tran_noise/hspice_sde_rc.sp
 PASS	conformance/tests/netlist/tran_noise/hspice_sde_rc_ngspice.sp
 PASS	conformance/tests/netlist/tran_noise/ideal_clamp_-2.sp
 PASS	conformance/tests/netlist/tran_noise/ideal_clamp_0.sp
