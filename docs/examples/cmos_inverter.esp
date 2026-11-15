@@ -1,0 +1,13 @@
+.espice 1
+.title "CMOS inverter"
+.param vdd = 1.8V  wn = 1u  wp = 2*wn
+VDD (vdd 0)         vsource   vdd
+VIN (in 0)          vsource   dc=0 pulse(0, vdd, td=1ns, tr=100ps, tf=100ps, pw=5ns, per=10ns)
+M1  (out in 0 0)    nch       w=wn l=180n
+M2  (out in vdd vdd) pch      w=wp l=180n
+CL  (out 0)         capacitor 10fF
+.model nch mos1 type=n vto=0.45 kp=200u lambda=0.05 gamma=0.4 phi=0.8
+.model pch mos1 type=p vto=-0.45 kp=80u lambda=0.05 gamma=0.4 phi=0.8
+.dc VIN=lin(0, 1.8V, step=0.01V)
+.tran stop=20ns step=10ps
+.meas tran tphl = cross(v(out), 0.9V, fall=1) - cross(v(in), 0.9V, rise=1)

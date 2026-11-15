@@ -18,6 +18,10 @@
   .esp-pg__top { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* A deck in ESPice's language has no schematic: the source takes the row. */
+.esp-pg__top--nosch { grid-template-columns: minmax(0, 1fr); }
+.esp-pg__top--nosch .esp-pg__sch { display: none; }
+
 .esp-pg__src {
   width: 100%;
   box-sizing: border-box;

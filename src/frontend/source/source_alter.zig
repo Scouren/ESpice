@@ -13,6 +13,7 @@ const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const source_search = @import("source_search.zig");
 const Fields = source_search.Fields;
+const headName = @import("../tokenizer.zig").headName;
 
 /// Every way `splitAlters` fails; partial runs stay in the arena.
 pub const Error = error{
@@ -105,8 +106,12 @@ fn keyOf(arena: Allocator, t: []const u8) Error![]const u8 {
     if (t.len == 0 or t[0] == '*') return "";
     var fields = Fields.init(t);
     const head = fields.field() orelse return "";
-    const kind: []const u8 = if (std.ascii.isAlphabetic(head[0])) "e" else if (std.ascii.eqlIgnoreCase(head, ".model")) "model" else if (std.ascii.eqlIgnoreCase(head, ".subckt")) "subckt" else if (std.ascii.eqlIgnoreCase(head, ".lib")) "lib" else if (std.ascii.eqlIgnoreCase(head, ".del")) "del" else if (std.ascii.eqlIgnoreCase(head, ".ends")) "ends" else return "";
-    if (mem.eql(u8, kind, "e") or mem.eql(u8, kind, "ends")) return std.ascii.allocLowerString(arena, try arena.print("{s}:{s}", .{ kind, head }));
+    // A device keys on its instance name, so the lowering's `?@<name>`
+    // and `<letter>@<name>` heads and a legacy `<name>` replace each other.
+    const device = std.ascii.isAlphabetic(head[0]) or (head.len > 2 and head[1] == '@');
+    if (device) return std.ascii.allocLowerString(arena, try arena.print("e:{s}", .{headName(head)}));
+    const kind: []const u8 = if (std.ascii.eqlIgnoreCase(head, ".model")) "model" else if (std.ascii.eqlIgnoreCase(head, ".model")) "model" else if (std.ascii.eqlIgnoreCase(head, ".subckt")) "subckt" else if (std.ascii.eqlIgnoreCase(head, ".lib")) "lib" else if (std.ascii.eqlIgnoreCase(head, ".del")) "del" else if (std.ascii.eqlIgnoreCase(head, ".ends")) "ends" else return "";
+    if (mem.eql(u8, kind, "ends")) return std.ascii.allocLowerString(arena, try arena.print("{s}:{s}", .{ kind, head }));
     if (mem.eql(u8, kind, "del")) {
         const what = fields.field() orelse return error.InvalidAlter;
         if (!std.ascii.eqlIgnoreCase(what, "lib")) return error.InvalidAlter;

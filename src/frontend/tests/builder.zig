@@ -1167,6 +1167,9 @@ test "an UnsupportedDevice names why: the model the card cannot use, the model i
     try std.testing.expectEqualStrings("no .model this card can use: its model name is not defined, or no bin of it holds the card's L and W", ta.subject(&nb, &buf, m, error.UnsupportedDevice) orelse "");
     const u = cardWith("a1", 'a', &.{}, &.{});
     try std.testing.expectEqualStrings("no device has the card letter 'a'", ta.subject(&nb, &buf, u, error.UnsupportedDevice) orelse "");
+    // An N card, or a language instance (`?@`) whose master is nothing.
+    const n = cardWith("x1", 'n', &.{.{ .name = "nosuch" }}, &.{});
+    try std.testing.expectEqualStrings("'nosuch' is no subcircuit, .model or loaded Verilog-A module", ta.subject(&nb, &buf, n, error.UnsupportedDevice) orelse "");
 }
 
 test "the branch-name index answers as the first-match scans did, duplicates included" {

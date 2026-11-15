@@ -1,0 +1,7 @@
+.espice 1
+.title "Voltage divider"
+// A 10 V source across 1k over 3k.
+V1 (in 0)  vsource  10V
+R1 (in out) resistor 1k
+R2 (out 0)  resistor 3k
+.op

@@ -1,0 +1,11 @@
+.espice 1
+.title "Half-wave rectifier"
+// A 50 Hz, 10 V peak sine through a diode into an RC load.
+V1 (in 0)   vsource   sin(0, 10V, freq=50Hz)
+D1 (in out) dmod
+R1 (out 0)  resistor  1k
+C1 (out 0)  capacitor 100uF
+.model dmod diode is=1e-14 n=1.05 rs=0.5 cjo=10p
+.tran stop=60ms step=0.1ms
+.meas tran vpeak = max(v(out))
+.meas tran vmin  = min(v(out), from=40ms, to=60ms)

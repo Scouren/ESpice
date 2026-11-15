@@ -166,7 +166,8 @@ pub fn readDirective(r: *Reader, card_in: F) Error!void {
                 if (kind != .tran and kind != .ac and kind != .dc) return reader_diag.unsupported(r, line, "SIGMA_SCALE on a card other than .tran, .ac or .dc");
                 // The lane ensemble (`.dc MONTE=n`) measures no trial.
                 if (kind == .dc and swept.args.len == 0) return reader_diag.unsupported(r, line, "SIGMA_SCALE on a .dc with no sweep of its own");
-                swept.sweep.monte.fail.text = fail;
+                // The echo (listing.zig) prints it: one spelling for any blanks.
+                swept.sweep.monte.fail.text = try card_table.canonical(r.arena, fail);
             }
             try appendAnalysis(r.arena, &r.deck.analyses, .{ .kind = kind, .args = swept.args, .sweep = swept.sweep, .line = r.ast.written(line) });
         },

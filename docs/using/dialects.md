@@ -1,9 +1,16 @@
 # Dialects
 
-ESPice reads one netlist dialect, ngspice's, with the HSPICE cards listed
-below that no ngspice spelling collides with. A deck in any other dialect
-(HSPICE, Spectre, LTspice, Xyce or VACASK) is translated to ngspice first
-by [SpiceRack](https://github.com/Scouren/SpiceRack)'s `spx`, installed
+ESPice reads two netlist formats, chosen per file by its first line alone.
+A file whose first line is `.espice 1` is in
+[ESPice's own netlist language](language.md): typed, keyed, and the
+format new decks should use. Every other file is read as the legacy
+dialect, ngspice's, with the HSPICE cards listed below that no ngspice
+spelling collides with; a PDK library or an existing deck needs no
+change, and a file in either format may `.include` or `.lib` one in the
+other. [Moving a deck to the language](language.md#moving) lists the
+spellings that change. A deck in any other dialect (HSPICE, Spectre,
+LTspice, Xyce or VACASK) is translated to ngspice first by
+[SpiceRack](https://github.com/Scouren/SpiceRack)'s `spx`, installed
 separately; ESPice neither ships nor runs it.
 
 ## Other dialects: SpiceRack

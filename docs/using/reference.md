@@ -1,7 +1,10 @@
-# Language reference
+# Legacy dialect reference
 
-Every element letter and every dot card ESPice reads, in its one dialect:
-ngspice's, with the HSPICE cards no ngspice spelling collides with. A deck
+Every element letter and every dot card of ESPice's legacy dialect:
+ngspice's, with the HSPICE cards no ngspice spelling collides with. A file
+whose first line is `.espice 1` is in ESPice's own language instead, which
+[The ESPice netlist language](language.md) defines; every other file is
+read as this page says, and the two mix through `.include` and `.lib`. A deck
 in another dialect arrives as SpiceRack's ngspice translation of it (see
 [Dialects](dialects.md)). The lists come from the parser's
 tables: the card keyword map and the element letter map. A card not listed
@@ -103,12 +106,12 @@ Waveforms for `V` and `I` cards, in `.tran` (and as the drive in `.pss`,
 
 | Waveform | Arguments |
 |---|---|
-| `PULSE(v1 v2 [td tr tf pw per [np]])` | `tr`, `tf` default to the `.tran` step and `pw`, `per` to its stop time, also when given as 0; `np` pulses, then `v1` |
+| `PULSE(v1 v2 [td tr tf pw per [phase]])` | `tr`, `tf` default to the `.tran` step and `pw`, `per` to its stop time, also when given as 0; `phase` in degrees starts the train that far into its period |
 | `SIN(vo va [freq td theta phase])` | `theta` is the damping factor in 1/s; phase in degrees; `freq` omitted or 0 is 1/stop time |
 | `EXP(v1 v2 [td1 tau1 td2 tau2])` | omitted or 0: `td1`, `tau1`, `tau2` are the `.tran` step, `td2` is `td1` plus the step |
 | `PWL(t1 v1 t2 v2 ...) [r=t] [td=t]` | any number of points; `r=` repeats from time `t` (64 points at most with `r=`) |
 | `SFFM(vo va [fm mdi fc td phasem phasec])` | ngspice order |
-| `AM(vo vmo [vma fm fc td phasem phasec])` | ngspice order; 0 up to and at `td`, `vo` included |
+| `AM(va vo [mf fc td phasec phases off])` | `off + va·(vo + sin(2π·mf·t + phases))·sin(2π·fc·t + phasec)`, phases in degrees; 0 up to and at `td`, `off` included |
 | `PAT(vhi vlo td tr tf tsample data)` | HSPICE bit patterns (`b0101`, `[...]` groups, `R=`/`RB=` repeats), rewritten to PWL |
 
 `DISTOF1 mag [phase]` and `DISTOF2 mag [phase]` on a V card mark the

@@ -1,0 +1,8 @@
+.espice 1
+.title "Capacitor discharge from an initial condition"
+// uic skips the operating point and starts from the .ic values.
+R1 (top 0) resistor  1k
+C1 (top 0) capacitor 1uF
+.ic v(top)=5V
+.tran stop=5ms step=10us uic
+.meas tran vtau = find(v(top), at=1ms)

@@ -268,6 +268,15 @@ pub fn build(b: *Build) void {
     const run_exe_tests = t.run(exe.root_module, &.{tests_espice}, false);
     run_exe_tests.addFileInput(b.path("build.zig.zon"));
 
+    // The ESPice language front end (src/frontend/lang.zig), its own root
+    // so `check-frontend-lang` type-checks it alone; its spec-page and
+    // catalogue tests read those pages at run time.
+    const run_lang_tests = t.run(M.make(b.path("src/frontend/lang.zig"), &.{.{ .name = "core", .module = g.core }}), &.{}, false);
+    run_lang_tests.addFileInput(b.path("docs/using/language.md"));
+    run_lang_tests.addFileInput(b.path("docs/using/diagnostics.md"));
+    run_lang_tests.addFileInput(b.path("docs/using/reference.md"));
+    run_lang_tests.addFileInput(b.path("src/frontend/Circuit/spice.zig"));
+
     for ([_]*Build.Step.Run{
         run_espice_tests,
         run_c_api_tests,
@@ -275,6 +284,7 @@ pub fn build(b: *Build) void {
         run_exe_tests,
         t.run(g.netlist, &.{}, false),
         t.run(g.wfit, &.{}, false),
+        run_lang_tests,
         t.run(g.tests.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
         // spice.zig and Circuit.zig's own tests live only in the builder module.
         t.run(g.tests.builder, &.{}, true),

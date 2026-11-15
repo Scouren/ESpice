@@ -555,6 +555,8 @@ test {
     _ = @import("sp_balanced.zig");
     _ = @import("dc_segments.zig");
     _ = @import("hdl_include.zig");
+    _ = @import("free_names.zig");
+    _ = @import("lang_deck.zig");
     _ = @import("x_actuals.zig");
 }
 

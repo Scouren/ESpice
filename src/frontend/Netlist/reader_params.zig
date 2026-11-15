@@ -14,6 +14,7 @@ const reader = @import("reader.zig");
 const card_rows = @import("card_rows.zig");
 const reader_frame = @import("reader_frame.zig");
 const reader_diag = @import("reader_diag.zig");
+const card_table = @import("card_table.zig");
 const Reader = reader.Reader;
 const Error = card_rows.Error;
 const Frame = reader_frame.Frame;
@@ -103,7 +104,7 @@ pub fn stepTarget(r: *Reader, name: []const u8) Error!StepTarget {
     for (r.decl.top_devices) |i| {
         var f = r.ast.cursor(i);
         const head = f.field() orelse continue;
-        if (std.ascii.eqlIgnoreCase(head, name)) return .{ .card = name };
+        if (std.ascii.eqlIgnoreCase(card_table.headName(head), name)) return .{ .card = name };
     }
     if (try liveParam(r, name)) |k| return .{ .param = k };
     return .{ .card = name };

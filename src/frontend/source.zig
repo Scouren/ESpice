@@ -23,6 +23,7 @@ const vec = @import("source/vec.zig");
 const source_search = @import("source/source_search.zig");
 const source_alter = @import("source/source_alter.zig");
 const source_data = @import("source/source_data.zig");
+const lang = @import("lang.zig");
 const Fields = source_search.Fields;
 const Search = source_search.Search;
 const Files = source_search.Files;
@@ -43,6 +44,9 @@ pub const Error = Io.Dir.ReadFileAllocError || error{
     InvalidVector,
     /// Includes nested past `include_depth_max` levels.
     IncludeDepthExceeded,
+    /// An included file in the ESPice language that does not lower
+    /// (lang.zig rendered its coded rows).
+    InvalidLanguageInclude,
 };
 
 /// What a non-netlist file a deck names holds: a compiled OSDI model
@@ -168,7 +172,14 @@ fn appendVec(io: Io, gpa: Allocator, path: []const u8, out: *std.ArrayList(u8)) 
     try out.appendSlice(gpa, text);
 }
 
-fn appendContents(io: Io, gpa: Allocator, search: Search, path: []const u8, src: []const u8, section: ?[]const u8, depth: u8, out: *std.ArrayList(u8)) Error!void {
+fn appendContents(io: Io, gpa: Allocator, search: Search, path: []const u8, raw: []const u8, section: ?[]const u8, depth: u8, out: *std.ArrayList(u8)) Error!void {
+    // A file in the ESPice language is read as its legacy cards (lang.zig).
+    var lowered: std.heap.ArenaAllocator = .init(gpa);
+    defer lowered.deinit();
+    const src = lang.lower(gpa, lowered.allocator(), raw, path, if (depth == 0) .top else .include) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseError => return error.InvalidLanguageInclude,
+    };
     var lines = std.mem.splitScalar(u8, src, '\n');
     var selected = section == null;
     var found = selected;

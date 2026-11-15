@@ -86,7 +86,9 @@ pub const ngspice = struct {
             while (true) {
                 const raw = nextPhysicalLine(&self.rest) orelse return null;
                 t = std.mem.trim(u8, raw, " \t");
-                if (t.len == 0 or isCommentLead(t[0])) continue;
+                // Since the ESPice language: a `?@` line is its lowering's
+                // instance card, no comment.
+                if (t.len == 0 or (isCommentLead(t[0]) and !std.mem.startsWith(u8, t, "?@"))) continue;
                 // §1.3: a line starting with `@` ends the file.
                 if (t[0] == '@') {
                     self.rest = "";

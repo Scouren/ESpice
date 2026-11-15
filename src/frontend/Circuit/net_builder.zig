@@ -460,6 +460,10 @@ pub fn subject(self: *const NetBuilder, buf: []u8, dev: Device, err: anyerror) ?
         },
         error.UnsupportedDevice => if (dev.model) |m|
             w.print("model '{s}' ({s}) is not a device this card can use", .{ m.name, m.kind }) catch return null
+        else if (dev.kind == 'n')
+            // An N card, or an ESPice-language instance whose master the
+            // reader found as neither a subcircuit nor a `.model`.
+            w.print("'{s}' is no subcircuit, .model or loaded Verilog-A module", .{Value.nameAt(dev.positional, 0) orelse return null}) catch return null
         else if (std.mem.indexOfScalar(u8, "mqdjz", dev.kind) != null)
             w.writeAll("no .model this card can use: its model name is not defined, or no bin of it holds the card's L and W") catch return null
         else

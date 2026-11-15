@@ -1,0 +1,21 @@
+.espice 1
+.title "The four controlled sources and a B source"
+V1 (in 0) vsource  2V
+R1 (in 0) resistor 1k
+// vcvs: v(e) = 3 * v(in)
+E1 (e 0 in 0) vcvs 3
+RE (e 0)      resistor 1k
+// vccs: 1 mA/V from in, pushed into node g
+G1 (0 g in 0) vccs 1mS
+RG (g 0)      resistor 1k
+// The current through Vsense sets F1 (cccs) and H1 (ccvs)
+Vsense (in sense) vsource 0
+RS (sense 0) resistor 2k
+F1 (0 f)     cccs 2 probe=Vsense
+RF (f 0)     resistor 1k
+H1 (h 0)     ccvs 500Ohm probe=Vsense
+RH (h 0)     resistor 1k
+// Behavioural source: any expression of node voltages
+B1 (b 0) bsource v=v(in)*v(in)/4
+RB (b 0) resistor 1k
+.op

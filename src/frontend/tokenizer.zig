@@ -34,6 +34,7 @@
 //! - `pub fn isWord(f: []const u8) bool`
 //! - `pub fn isQuote(c: u8) bool`
 //! - `pub fn body(f: []const u8) []const u8`
+//! - `pub fn headName(head: []const u8) []const u8`
 //! - `pub fn normalize(dst: []u8, src: []const u8) usize`
 
 const std = @import("std");
@@ -144,7 +145,10 @@ pub const Lines = struct {
         while (true) {
             const raw = nextPhysicalLine(&self.rest) orelse return null;
             const t = std.mem.trim(u8, raw, " \t");
-            if (t.len == 0 or isCommentLead(t[0]) or isLoneControl(t)) continue;
+            // The lowering's `?@<name>` instance card (docs/using/language.md)
+            // is a card, where ngspice reads a `?` line as a comment.
+            const internal = std.mem.startsWith(u8, t, "?@");
+            if (t.len == 0 or (isCommentLead(t[0]) and !internal) or isLoneControl(t)) continue;
             // §1.3: a line starting with `@` ends the file.
             if (t[0] == '@') {
                 self.rest = "";
@@ -408,6 +412,14 @@ pub fn Tokenizer(comptime quotes: []const u8, comptime braces: bool) type {
             break :blk t;
         };
     };
+}
+
+/// The instance name of device card head `head`: `<name>` of the ESPice
+/// language lowering's `<letter>@<name>` and `?@<name>` heads
+/// (docs/using/language.md, whose names are free), else the head itself,
+/// ngspice's name. Empty for a bare `<letter>@`.
+pub fn headName(head: []const u8) []const u8 {
+    return if (head.len >= 2 and head[1] == '@') head[2..] else head;
 }
 
 /// Copies `src` lowercased into `dst` (at least as long) and returns its

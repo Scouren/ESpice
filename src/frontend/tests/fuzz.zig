@@ -5,7 +5,8 @@
 //! no leak, no error outside the set; the same digest on a second parse
 //! (determinism); the same digest after a transform the grammar says
 //! changes nothing (a comment line inserted, the deck uppercased, a card
-//! split onto a `+` continuation); and an
+//! split onto a `+` continuation, every device head written as the ESPice
+//! language's lowering writes it, `<letter>@<name>`); and an
 //! injected allocation failure that surfaces as `OutOfMemory`, never as a
 //! panic or another error.
 //! `fuzz_corpus/` holds the seed decks and every input a fuzz run found;
@@ -188,6 +189,8 @@ fn check(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8) !void {
     try expectSame("the deck uppercased", base, outcome(gpa, upper), deck_text, upper);
     if (withContinuation(src, deck_text, &buf)) |t|
         try expectSame("a card split onto a `+` line", base, outcome(gpa, t), deck_text, t);
+    if (withAtHeads(deck_text, &buf)) |t|
+        try expectSame("every device head written <letter>@<name>", base, outcome(gpa, t), deck_text, t);
     try failOnce(gpa, src, deck_text, base);
 }
 
@@ -300,6 +303,40 @@ fn withContinuation(src: anytype, text: []const u8, buf: []u8) ?[]const u8 {
     return w.buffered();
 }
 
+/// `text` with every device card's head `H...` written `H@H...`, the
+/// lowering's head of the same name (docs/using/language.md): the reader
+/// takes the letter from before the `@` and the name from after it. The
+/// lines of `.control`, `.data` and `.variation` blocks are no device
+/// cards and stay. Null when the result does not fit `buf`.
+fn withAtHeads(text: []const u8, buf: []u8) ?[]const u8 {
+    const blocks = [_][2][]const u8{ .{ ".control", ".endc" }, .{ ".data", ".enddata" }, .{ ".variation", ".end_variation" } };
+    var w: std.Io.Writer = .fixed(buf);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    const title = it.first();
+    w.writeAll(title) catch return null;
+    var close: ?[]const u8 = null;
+    // A line after one ending in `\\` continues that card (tokenizer.zig).
+    var glued = std.mem.endsWith(u8, std.mem.trimEnd(u8, title, " \t\r"), "\\\\");
+    while (it.next()) |line| {
+        defer glued = std.mem.endsWith(u8, std.mem.trimEnd(u8, line, " \t\r"), "\\\\");
+        w.writeByte('\n') catch return null;
+        const t = std.mem.trimStart(u8, line, " \t");
+        const word = t[0 .. std.mem.indexOfAny(u8, t, " \t\r") orelse t.len];
+        if (close) |c| {
+            if (std.ascii.eqlIgnoreCase(word, c)) close = null;
+        } else for (blocks) |b| {
+            if (std.ascii.eqlIgnoreCase(word, b[0])) close = b[1];
+        }
+        const device = close == null and !glued and t.len > 0 and std.ascii.isAlphabetic(t[0]) and !(t.len > 1 and t[1] == '@');
+        if (device) {
+            w.writeAll(line[0 .. line.len - t.len]) catch return null;
+            w.writeAll(&.{ t[0], '@' }) catch return null;
+            w.writeAll(t) catch return null;
+        } else w.writeAll(line) catch return null;
+    }
+    return w.buffered();
+}
+
 fn rawBytes(_: void, s: *Smith) anyerror!void {
     var buf: [deck_max]u8 = undefined;
     const text = buf[0..s.slice(&buf)];
@@ -383,6 +420,198 @@ test "the seed decks hold every oracle" {
     var prng: std.Random.DefaultPrng = .init(0xc0de);
     var src: Seeded = .{ .r = prng.random() };
     for (seeds) |text| try check(std.testing.allocator, &src, text);
+}
+
+test "every element letter, at top level and in a subcircuit, digests the same under <letter>@<name> heads" {
+    // Oracle: the legacy reader as the reference implementation; the
+    // `<letter>@<name>` deck must elaborate to the legacy deck's netlist
+    // (names, kinds, flattened names, F/H/W/K references, values).
+    // Red before readDevice split the head: the names kept `r@`.
+    const body =
+        \\r1 a b 1k
+        \\rb a b {v(a)*2}
+        \\c1 a 0 1p
+        \\l1 a b 1n
+        \\l2 b 0 2n
+        \\k1 l1 l2 0.9
+        \\v1 a 0 dc 1 ac 1
+        \\vs b c 0
+        \\i1 c 0 1m
+        \\e1 c 0 a 0 2
+        \\e2 c 0 value={v(a)*3}
+        \\f1 c 0 vs 2
+        \\f2 c 0 poly(1) vs 0 1
+        \\g1 c 0 a 0 1m
+        \\h1 c 0 vs 10
+        \\b1 c 0 v={v(a)}
+        \\t1 a 0 b 0 z0=50 td=1n
+        \\s1 a b c 0 swm on
+        \\w1 a b vs cswm off
+        \\o1 a 0 b 0 lmod
+        \\y1 a 0 b 0 tmod
+        \\u1 a b 0 umod l=1u
+        \\m1 a b c 0 nch w=1u l=1u
+        \\q1 a b c qmod 2
+        \\d1 a b dmod off
+        \\j1 a b c jmod
+        \\z1 a b c zmod
+        \\n1 a b c 0 vmod
+        \\
+    ;
+    const defs =
+        \\.model swm sw vt=1
+        \\.model cswm csw it=1m
+        \\.model lmod ltra r=1 l=1n c=1p len=1
+        \\.model tmod txl r=1 l=1n c=1p length=1
+        \\.model umod urc
+        \\.model nch nmos level=1
+        \\.model qmod npn
+        \\.model dmod d
+        \\.model jmod njf
+        \\.model zmod nmf
+        \\.model vmod psp103va
+        \\
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const legacy = try std.mem.concat(a, u8, &.{ "letters\n", defs, body, ".subckt cell a b c\n", body, ".ends\nx1 p q r cell\nx2 q r p cell\n.op\n.end\n" });
+    const base = outcome(std.testing.allocator, legacy);
+    try std.testing.expect(base == .digest);
+    const buf = try a.alloc(u8, 2 * legacy.len);
+    const at = withAtHeads(legacy, buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, at, "x@x1 p q r cell") != null);
+    try expectSame("<letter>@<name> heads", base, outcome(std.testing.allocator, at), legacy, at);
+}
+
+test "a ?@ card digests as the legacy card of the kind its master resolves to" {
+    // Oracle: the legacy reader as the reference implementation; each
+    // pair is the language.md Legacy entry written by hand. Named ports
+    // follow the table "The ports of a modelled device" and the
+    // subcircuit's formals. Red before readDevice read `?@` cards.
+    const defs =
+        \\.model nch nmos level=1
+        \\.model nch2.1 nmos level=1 lmin=0 lmax=1 wmin=0 wmax=1
+        \\.model qmod pnp
+        \\.model dmod d
+        \\.model jmod pjf
+        \\.model zmod nhfet
+        \\.model swm sw vt=1
+        \\.model cswm csw it=1m
+        \\.model lmod ltra r=1 l=1n c=1p len=1
+        \\.model tmod txl r=1 l=1n c=1p length=1
+        \\.model umod urc
+        \\.model rmod r rsh=10
+        \\.model vmod psp103va
+        \\.subckt inv in out vdd vss wn=1u
+        \\m1 out in vss vss nch w=wn l=1u
+        \\.ends
+        \\vs a 0 0
+        \\
+    ;
+    const pairs = [_][2][]const u8{
+        .{ "?@x1 (a b c 0) inv wn=2u", "x1 a b c 0 inv wn=2u" },
+        // A subcircuit's own .model, which no global card shadows.
+        .{
+            ".subckt c2 out in vss\n.model lnch nmos level=1\n?@m2 (s=vss d=out b=vss g=in) lnch w=1u l=1u\n.ends\nx9 a b 0 c2",
+            ".subckt c2 out in vss\n.model lnch nmos level=1\nm2 out in vss vss lnch w=1u l=1u\n.ends\nx9 a b 0 c2",
+        },
+        .{ "?@x1 (vss=0 out=b in=a vdd=c) inv", "x1 a b c 0 inv" },
+        .{ "?@load (d=a g=b s=0 b=0) nch w=1u l=1u off", "m@load a b 0 0 nch w=1u l=1u off" },
+        .{ "?@m1 (a b 0 0) nch2 w=0.5u l=0.5u", "m1 a b 0 0 nch2 w=0.5u l=0.5u" },
+        .{ "?@q1 (e=0 b=a c=b) qmod area=2", "q1 b a 0 qmod area=2" },
+        .{ "?@q1 (e=0 b=a c=b s=0) qmod", "q1 b a 0 0 qmod" },
+        .{ "?@d1 (k=0 a=a) dmod area=2 off", "d1 a 0 dmod area=2 off" },
+        .{ "?@j1 (s=0 g=a d=b) jmod", "j1 b a 0 jmod" },
+        .{ "?@z1 (s=0 g=a d=b) zmod", "z1 b a 0 zmod" },
+        .{ "?@s1 (cn=0 cp=b n=0 p=a) swm initial=on", "s1 a 0 b 0 swm on" },
+        .{ "?@w1 (n=0 p=a) cswm probe=vs initial=off", "w1 a 0 vs cswm off" },
+        .{ "?@o1 (b2=0 a2=b b1=0 a1=a) lmod", "o1 a 0 b 0 lmod" },
+        .{ "?@y1 (a1=a b1=0 a2=b b2=0) tmod", "y1 a 0 b 0 tmod" },
+        .{ "?@u1 (n3=0 n2=b n1=a) umod l=1u", "u1 a b 0 umod l=1u" },
+        .{ "?@r1 (n=b p=a) rmod l=1u w=1u", "r1 a b rmod l=1u w=1u" },
+        .{ "?@n1 (a b c 0) vmod", "n1 a b c 0 vmod" },
+        .{ "?@n1 (a b c 0) psp103va w=1u", "n1 a b c 0 psp103va w=1u" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (pairs) |p| {
+        const lang = try std.mem.concat(a, u8, &.{ "t\n", defs, p[0], "\n.op\n.end\n" });
+        const legacy = try std.mem.concat(a, u8, &.{ "t\n", defs, p[1], "\n.op\n.end\n" });
+        const want = outcome(std.testing.allocator, legacy);
+        try std.testing.expect(want == .digest);
+        try expectSame("a ?@ card", want, outcome(std.testing.allocator, lang), legacy, lang);
+    }
+}
+
+test "a ?@ card naming a .model of each type digests as that type's legacy card" {
+    // Oracle: the legacy reader as the reference implementation; each
+    // row's letter written by hand from ngspice inpdomod.c and the card
+    // syntax of that letter (language.md, "The ports of a modelled
+    // device"). A type mapped to the wrong letter, or missing (read as an
+    // N card), changes the digest.
+    const rows = [_][3][]const u8{
+        .{ "nmos", "m", "a b c d" }, .{ "pmos", "m", "a b c d" }, .{ "vdmos", "m", "a b c" },
+        .{ "vdmosn", "m", "a b c" }, .{ "vdmosp", "m", "a b c" }, .{ "npn", "q", "a b c" },
+        .{ "pnp", "q", "a b c" },    .{ "d", "d", "a b" },        .{ "njf", "j", "a b c" },
+        .{ "pjf", "j", "a b c" },    .{ "nmf", "z", "a b c" },    .{ "pmf", "z", "a b c" },
+        .{ "nhfet", "z", "a b c" },  .{ "phfet", "z", "a b c" },  .{ "sw", "s", "a b c d" },
+        .{ "ltra", "o", "a b c d" }, .{ "txl", "y", "a b c d" },  .{ "urc", "u", "a b c" },
+        .{ "r", "r", "a b" },        .{ "res", "r", "a b" },      .{ "c", "c", "a b" },
+        .{ "l", "l", "a b" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (rows) |row| {
+        const model = try std.mem.concat(a, u8, &.{ "t\n.model mk ", row[0], "\n" });
+        const lang = try std.mem.concat(a, u8, &.{ model, "?@k1 (", row[2], ") mk\n.op\n.end\n" });
+        const legacy = try std.mem.concat(a, u8, &.{ model, row[1], "@k1 ", row[2], " mk\n.op\n.end\n" });
+        const want = outcome(std.testing.allocator, legacy);
+        try std.testing.expect(want == .digest);
+        try expectSame("a ?@ card of a .model type", want, outcome(std.testing.allocator, lang), legacy, lang);
+    }
+}
+
+test "a ?@ card's port list is refused when it mixes styles, names a port twice, one its master lacks, or leaves one out" {
+    // Oracle: the spec (language.md, Instances): each list is refused;
+    // the reorder names the port (reader_instance.order).
+    const defs = ".model nch nmos level=1\n.model qmod npn\n.model pmod cpl\n.subckt inv in out\nr1 in out 1k\n.ends\n";
+    const refused = [_][]const u8{
+        "?@m1 (d=a g b=0 s=0) nch",
+        "?@m1 (a g=b 0 0) nch",
+        "?@m1 (d=a g=b s=0 b=0 d=c) nch",
+        "?@m1 (d=a g=b s=0 x=0) nch",
+        "?@m1 (d=a g=b s=0) nch",
+        "?@q1 (c=a b=b s=0) qmod",
+        "?@x1 (in=a) inv",
+        "?@x1 (in=a out=b vdd=c) inv",
+        "?@p1 (a=a b=b) pmod",
+        "?@n1 (d=a) psp103va",
+        "?@m1 (a b 0 0) nch initial=on",
+        "?@m1 (a b 0 0) nch probe=v1",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The control: the same master and ports, written right, read.
+    const good = try std.mem.concat(a, u8, &.{ "t\n", defs, "?@m1 (d=a g=b s=0 b=0) nch\n?@x1 (out=b in=a) inv\n.op\n.end\n" });
+    try std.testing.expect(outcome(std.testing.allocator, good) == .digest);
+    for (refused) |line| {
+        const text = try std.mem.concat(a, u8, &.{ "t\n", defs, line, "\n.op\n.end\n" });
+        try expectSame("a refused ?@ card", .{ .err = error.ParseError }, outcome(std.testing.allocator, text), text, text);
+    }
+    const instance = @import("../Netlist/reader_instance.zig");
+    const mos: instance.Ports = .{ .names = &.{ "d", "g", "s", "b" }, .required = 4 };
+    const bjt: instance.Ports = .{ .names = &.{ "c", "b", "e", "s" }, .required = 3 };
+    try std.testing.expectEqualDeep(instance.Order{ .unknown = "x" }, try instance.order(a, &.{ "d", "x" }, &.{ "1", "2" }, mos));
+    try std.testing.expectEqualDeep(instance.Order{ .repeated = "g" }, try instance.order(a, &.{ "g", "g" }, &.{ "1", "2" }, mos));
+    try std.testing.expectEqualDeep(instance.Order{ .missing = "s" }, try instance.order(a, &.{ "d", "g", "b" }, &.{ "1", "2", "3" }, mos));
+    try std.testing.expectEqualDeep(instance.Order{ .missing = "e" }, try instance.order(a, &.{ "c", "b", "s" }, &.{ "1", "2", "3" }, bjt));
+    const got = try instance.order(a, &.{ "e", "c", "b" }, &.{ "3", "1", "2" }, bjt);
+    try std.testing.expectEqual(3, got.nodes.len);
+    for (got.nodes, [_][]const u8{ "1", "2", "3" }) |n, want| try std.testing.expectEqualStrings(want, n);
 }
 
 test "a body card replayed per instance digests as the same card read once per copy" {
@@ -716,4 +945,3 @@ fn put(w: *std.Io.Writer, bytes: []const u8) void {
 fn print(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) void {
     w.print(fmt, args) catch {};
 }
-

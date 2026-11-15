@@ -110,7 +110,8 @@ pub fn parse(arena: Allocator, src: []const u8, mode: Mode) Error!Ast {
     while (at < text.len) {
         var q = at;
         while (text[q] == ' ' or text[q] == '\t') q += 1;
-        const head = heads[text[q]];
+        // The lowering's `?@` instance card is a card (tokenizer.zig `Lines`).
+        const head: Head = if (text[q] == '?' and text[q + 1] == '@') .slow else heads[text[q]];
         if (head == .skip) {
             at = lineEnd(text, q) + 1;
             continue;

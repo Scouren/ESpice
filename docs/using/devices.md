@@ -218,11 +218,12 @@ commercial user must replace it with a commercially licensed BSIM4.
 
 ## Your own Verilog-A { #your-own-verilog-a }
 
-A deck loads a Verilog-A module at run time with `.hdl`, and an `N` card
-instantiates it by module name, with its parameters as `key=value` pairs:
+A deck loads a Verilog-A module at run time with `.hdl`, and an instance
+whose master is the module's name places it, with its parameters as
+`key=value` pairs (in a legacy deck, an `N` card):
 
 ```text
---8<-- "examples/hdl_divider.sp"
+--8<-- "examples/hdl_divider.esp"
 ```
 
 `vres.va`:
@@ -232,7 +233,7 @@ instantiates it by module name, with its parameters as `key=value` pairs:
 ```
 
 ```sh
-espice hdl_divider.sp --rawfile hdl.txt --format=print
+espice hdl_divider.esp --rawfile hdl.txt --format=print
 ```
 
 ```text

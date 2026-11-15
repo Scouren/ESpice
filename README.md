@@ -5,13 +5,29 @@ compiled at build time by [VerA](https://github.com/OpenFAT/VerA), and one devic
 the CPU, CUDA and HIP through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
-nix run github:OpenFAT/ESPice -- deck.sp         # run an ngspice deck (HSPICE and Spectre are detected and translated)
-espice -r out.raw deck.sp                        # also write waveforms
+nix run github:OpenFAT/ESPice -- deck.esp        # run a deck in ESPice's own netlist language
+espice deck.sp                                   # an ngspice deck runs as it is
+espice -r out.raw deck.esp                       # also write waveforms
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes
 espice --plan deck.sp                            # print the analysis DAG without solving
 ```
 
-[Docs](https://openfat.github.io/ESPice/) · [Install guide](https://openfat.github.io/ESPice/using/install/) · [Changelog](CHANGELOGS.md) · [Testing](TESTING.md)
+A new deck is written in ESPice's netlist language: a file whose first line is `.espice 1`, with
+typed, named arguments and units. It keeps SPICE's directives and lowers to the ngspice dialect, so
+the two mix freely through `.include` and `.lib`, and a PDK needs no change. HSPICE, Spectre and
+other dialects are translated to ngspice first with SpiceRack's `spx translate`.
+
+```espice
+.espice 1
+.title "RC low-pass filter"
+V1 (in 0)   vsource   dc=0 ac=1 pulse(0, 1V, td=0, tr=1us, tf=1us, pw=5ms, per=10ms)
+R1 (in out) resistor  1k
+C1 (out 0)  capacitor 159nF
+.ac freq=dec(10Hz, 100kHz, n=10)
+.tran stop=5ms step=10us
+```
+
+[Docs](https://openfat.github.io/ESPice/) · [The language](https://openfat.github.io/ESPice/using/language/) · [Install guide](https://openfat.github.io/ESPice/using/install/) · [Changelog](CHANGELOGS.md) · [Testing](TESTING.md)
 
 ## Install
 
@@ -49,7 +65,7 @@ point under an `.ac`, are solved once. Syntax and outputs: [analyses](https://op
 ## Models
 
 All in [`models/`](models/), vendored one file per model so a build downloads nothing. Your own:
-`.hdl "model.va"` plus an `N` card compiles a Verilog-A module at run time (OSDI is not loaded).
+`.hdl "model.va"` plus an instance whose master is the module (an `N` card in an ngspice deck) compiles a Verilog-A module at run time (OSDI is not loaded).
 
 | Device | Models | Derived from |
 |---|---|---|

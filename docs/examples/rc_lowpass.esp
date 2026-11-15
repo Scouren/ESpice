@@ -1,0 +1,9 @@
+.espice 1
+.title "RC low-pass filter"
+// 1 kOhm and 159 nF: the corner is near 1 kHz.
+V1 (in 0)   vsource   dc=0 ac=1 pulse(0, 1V, td=0, tr=1us, tf=1us, pw=5ms, per=10ms)
+R1 (in out) resistor  1k
+C1 (out 0)  capacitor 159nF
+.op
+.ac freq=dec(10Hz, 100kHz, n=10)
+.tran stop=5ms step=10us

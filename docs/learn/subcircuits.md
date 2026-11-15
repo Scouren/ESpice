@@ -5,28 +5,29 @@ placed as many times as you like. It is how you build an opamp, a logic
 gate or a standard cell once and reuse it.
 
 ```text
-.subckt name port1 port2 ... [param=default ...]
-  elements
-.ends [name]
+.subckt name (port1 port2 ...) [param=default ...] {
+    instances
+}
 
-Xinstance node1 node2 ... name [param=value ...]
+instance (node1 node2 ...) name [param=value ...]
 ```
 
-The `X` card connects its nodes to the ports in order. Parameters on the
-`.subckt` line are defaults; the `X` card can override any of them, and
-elements inside use them in `{braces}`.
+An instance whose master is the subcircuit connects its nodes to the ports
+in order, or by name: `X1 (inp=a inn=b out=c) opamp`. Parameters on the
+`.subckt` line are defaults; the instance can override any of them, and
+the lines inside use them by name.
 
 ## An opamp, used as an inverting amplifier
 
-```spice
---8<-- "examples/opamp_subckt.sp"
+```espice
+--8<-- "examples/opamp_subckt.esp"
 ```
 
 ```sh
-espice opamp_subckt.sp --rawfile amp.txt --format=print
+espice opamp_subckt.esp --rawfile amp.txt --format=print
 ```
 
-The `.tf` card (DC transfer function) reports the gain from VIN to
+`.tf` (DC transfer function) reports the gain from VIN to
 `v(out)` and the input and output resistances:
 
 ```text
@@ -41,7 +42,7 @@ input resistance is Rin. The `.ac` sweep shows the closed-loop bandwidth.
 
 ## Names inside a subcircuit
 
-Elements and nodes inside a subcircuit get the instance name as a prefix,
+Instances and nodes inside a subcircuit get the instance name as a prefix,
 the way ngspice names them. In the operating point above the internal
 node `int` of `X1` is `v(x1.int)`, and E2's branch current is
 `i(e.x1.e2)`:
@@ -51,32 +52,32 @@ Index	i(vin)	i(e.x1.e1)	i(e.x1.e2)	v(in)	v(x1.p1)	v(x1.int)	v(inv)	v(x1.drv)	v(o
 ```
 
 Node `0` is global: ground inside a subcircuit is the same ground as
-outside. To make other nets global, list them on a `.global` card
-(`.global vdd vss`). Subcircuits can contain other `X` instances, up to 32
-levels deep.
+outside. To make other nets global, list them with `.global`
+(`.global vdd vss`). Subcircuits can contain instances of other
+subcircuits, up to 32 levels deep.
 
 ## Splitting a design into files
 
-`.include file` pastes another file in place. `.lib file section` pastes
-only one section of a library file, the section between `.lib section` and
-`.endl` inside it. PDKs use sections for process corners.
+`.include "file"` reads another file in place. `.lib "file" section`
+reads only one section of a library file, the block of a
+`.lib section { ... }` inside it. PDKs use sections for process corners.
 
-`models.lib`:
+`models.esp.lib`:
 
 ```text
---8<-- "examples/models.lib"
+--8<-- "examples/models.esp.lib"
 ```
 
-`divider.inc`:
+`divider.esp.inc`:
 
 ```text
---8<-- "examples/divider.inc"
+--8<-- "examples/divider.esp.inc"
 ```
 
 The deck picks the slow corner and pulls in the divider:
 
 ```text
---8<-- "examples/include_lib.sp"
+--8<-- "examples/include_lib.esp"
 ```
 
 ```text
@@ -86,18 +87,20 @@ Index	v(a)	v(mid)
 0	7.392795709202897e-1	3.6963978546014487e-1
 ```
 
-Relative paths resolve against the directory of the file that names them.
+Relative paths resolve against the working directory, then the directory
+of the file that names them. An included file may be in either language:
+a PDK's ngspice library is read with `.lib` as it is.
 (The browser playground runs single files only, so this example has no
 Run button. Run it from `docs/examples/` in a checkout.)
 
 ## Exercises
 
 1. Place a second opamp after the first as a unity-gain buffer
-   (`X2 out out2 out2 opamp`). What is `v(out2)`?
+   (`X2 (out out2 out2) opamp`). What is `v(out2)`?
 2. Override the opamp's output resistance on `X1` with `rout=1k`. What
    happens to the output resistance `.tf` reports, and why is it still
    so small?
-3. Switch `include_lib.sp` to the `typ` section. Does `v(a)` go up or
+3. Switch `include_lib.esp` to the `typ` section. Does `v(a)` go up or
    down?
 
 ??? tip "Answers"
@@ -107,5 +110,5 @@ Run button. Run it from `docs/examples/` in a checkout.)
     2. It rises a hundredfold, from 0.55 mΩ to 55 mΩ, but stays far
        below the 1k inside the opamp: the feedback loop divides the
        opamp's own output resistance by its loop gain.
-    3. Down: the typical corner's diode has twice the IS and N = 1, so it
+    3. Down: the typical corner's diode has twice the `is` and `n` = 1, so it
        needs less voltage for 1 mA.

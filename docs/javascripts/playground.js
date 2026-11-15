@@ -330,6 +330,11 @@
     let pending = 0;
     const draw = async () => {
       const ticket = ++pending;
+      // cktImg reads the legacy dialect only: a deck in ESPice's language
+      // (first line `.espice`) runs, with no schematic beside it.
+      const lang = /^\s*\.espice\b/.test(src.value);
+      top.classList.toggle("esp-pg__top--nosch", lang);
+      if (lang) return sch.replaceChildren();
       try {
         const svg = await schematic(src.value);
         if (ticket !== pending) return;
@@ -367,6 +372,11 @@
 
   function init() {
     document.querySelectorAll("pre > code.language-spice, div.language-spice pre > code").forEach(widget);
+    // An ```espice fence becomes a widget only when it is a whole deck: the
+    // reference page's fragments have no `.espice 1` line to run from.
+    document.querySelectorAll("pre > code.language-espice, div.language-espice pre > code").forEach((code) => {
+      if (/^\s*\.espice\b/.test(code.textContent)) widget(code);
+    });
   }
 
   // Material's instant navigation swaps the page without reloading scripts.

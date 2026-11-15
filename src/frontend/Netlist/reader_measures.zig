@@ -331,7 +331,9 @@ pub fn readWcd(r: *Reader, line: []const u8) Error!Wcd {
         const op_len: usize = if (rel.len > 1 and rel[1] == '=') 2 else 1;
         const limit = measureValue(r, std.mem.trim(u8, rel[op_len..], " \t")) catch |err| return reader_diag.failed(r, line, err);
         if (!std.math.isFinite(limit)) return reader_diag.failed(r, line, error.ParseError);
-        try specs.append(r.arena, .{ .measure = card, .above = above, .limit = limit, .bound = rel });
+        // The bound as the table prints it: the operator, one blank, the limit.
+        const bound = try r.arena.print("{s} {s}", .{ rel[0..op_len], std.mem.trim(u8, rel[op_len..], " \t") });
+        try specs.append(r.arena, .{ .measure = card, .above = above, .limit = limit, .bound = bound });
     }
     if (specs.items.len == 0) return reader_diag.failed(r, line, error.ParseError);
     w.specs = specs.items;

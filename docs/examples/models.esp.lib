@@ -1,0 +1,9 @@
+.espice 1
+// Two corners of one diode, as .lib sections.
+.lib typ {
+    .model dlib diode is=1e-14 n=1.0
+}
+
+.lib slow {
+    .model dlib diode is=5e-15 n=1.1
+}

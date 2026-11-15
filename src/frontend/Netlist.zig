@@ -20,6 +20,7 @@
 //! - `pub const tokenizer`
 //! - `pub const spice_number`
 //! - `pub const source`
+//! - `pub const lang`
 //! - `pub const expr`
 //! - `pub const temper_slots`
 //! - `pub const VertexId = card_rows.VertexId`
@@ -76,6 +77,8 @@ pub const tokenizer = @import("tokenizer.zig");
 pub const spice_number = @import("Parse/spice_number.zig");
 /// Deck loading and include expansion, re-exported for the frontend tests.
 pub const source = @import("source.zig");
+/// The ESPice language, lowered to cards this reader reads, re-exported for `prepare`.
+pub const lang = @import("lang.zig");
 const hypergraph = @import("Netlist/hypergraph.zig");
 /// The postfix `Value.expr` spans index, re-exported for the builder.
 pub const expr = @import("Parse/expr.zig");
@@ -239,9 +242,11 @@ pub fn elaborate(arena: Allocator, ast: *const Ast, live: []const []const u8) (E
     return reader_run.run(arena, ast, live);
 }
 
-/// `Ast.parse` then `elaborate` on the deck text `src`, no parameter live.
+/// `Ast.parse` then `elaborate` on the deck text `src`, no parameter live;
+/// a deck in the ESPice language is lowered first (lang.zig).
 pub fn parse(arena: Allocator, src: []const u8) Error!Netlist {
-    return elaborate(arena, &try Ast.parse(arena, src, .deck), &.{}) catch |err| switch (err) {
+    const deck = try lang.lower(arena, arena, src, "<deck>", .top);
+    return elaborate(arena, &try Ast.parse(arena, deck, .deck), &.{}) catch |err| switch (err) {
         error.UnknownParameter => unreachable,
         else => |e| return e,
     };

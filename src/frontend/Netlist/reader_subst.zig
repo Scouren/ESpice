@@ -22,6 +22,7 @@ const netlist_view = @import("netlist_view.zig");
 const reader_frame = @import("reader_frame.zig");
 const reader_nets = @import("reader_nets.zig");
 const reader_diag = @import("reader_diag.zig");
+const reader_instance = @import("reader_instance.zig");
 const Reader = reader.Reader;
 const none = card_rows.none;
 const Error = card_rows.Error;
@@ -139,7 +140,7 @@ pub fn subst(r: *Reader, src: *const expr.Scratch, from: usize, to: usize, frame
             .iprobe => {
                 const a = if (op.a == none) none else a: {
                     const dev = src.names.items[op.a];
-                    const flat = if (frame.path) |path| try reader_nets.joined(r, &.{ dev[0..1], ".", path, ".", dev }) else dev;
+                    const flat = if (frame.path) |path| try reader_nets.joined(r, &.{ &.{reader_instance.probeLetter(r, frame, dev)}, ".", path, ".", dev }) else dev;
                     break :a (try reader_nets.internName(r, flat)).index();
                 };
                 try r.nl.ops.append(r.arena, .{ .code = .iprobe, .a = a, .b = none });

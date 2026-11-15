@@ -1,0 +1,6 @@
+.espice 1
+.title "Diode I-V curve with a DC sweep"
+V1 (a 0) vsource 0
+D1 (a 0) dmod
+.model dmod diode is=1e-14 n=1
+.dc V1=lin(0, 0.8V, step=0.01V)

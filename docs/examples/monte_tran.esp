@@ -1,0 +1,10 @@
+.espice 1
+.title "RC delay spread over Monte Carlo trials"
+// R varies by 3 % (one sigma). The 50 % crossing is at R C ln 2 = 693 ns.
+.param rv = agauss(1k, 30, 1)
+V1 (in 0)   vsource   pwl((0, 0), (1ps, 1V))
+R1 (in out) resistor  rv
+C1 (out 0)  capacitor 1nF
+.option seed=3
+.tran stop=2us step=10ns sweep monte(50)
+.meas tran tc = cross(v(out), 0.5V, rise=1)

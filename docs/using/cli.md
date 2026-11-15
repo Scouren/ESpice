@@ -4,7 +4,9 @@
 espice [OPTION]... FILE...
 ```
 
-Each `FILE` is a netlist. ESPice reads it, runs every analysis it asks for,
+Each `FILE` is a netlist: a deck in ESPice's own
+[language](language.md) (first line `.espice 1`) or an ngspice deck.
+ESPice reads it, runs every analysis it asks for,
 prints the `.meas` results on stdout and a one-line summary per result on
 stderr, and writes the results if you name an output file. Several files
 run one after another, each as its own independent problem.

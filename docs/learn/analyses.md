@@ -2,24 +2,24 @@
 
 Almost everything in circuit simulation starts from four analyses:
 
-| Card | Answers | Independent variable |
+| Directive | Answers | Independent variable |
 |---|---|---|
 | `.op` | the DC bias of every node | none (one point) |
 | `.dc` | the DC bias as a source or parameter sweeps | the swept value |
 | `.ac` | the small-signal frequency response around the bias | frequency |
 | `.tran` | the large-signal response over time | time |
 
-A deck may hold any number of analysis cards; ESPice runs them all and
-writes one result (a "plot") per card.
+A deck may hold any number of analyses; ESPice runs them all and writes
+one result (a "plot") per analysis.
 
 ## An RC low-pass, three ways
 
-```spice
---8<-- "examples/rc_lowpass.sp"
+```espice
+--8<-- "examples/rc_lowpass.esp"
 ```
 
 ```sh
-espice rc_lowpass.sp --rawfile rc.txt --format=print
+espice rc_lowpass.esp --rawfile rc.txt --format=print
 ```
 
 ```text
@@ -34,17 +34,17 @@ RC low-pass filter: 3 devices
 `.op` solves the circuit with capacitors open and inductors shorted. V1's
 DC value is 0, so every node sits at 0 V here. The operating point is also
 where `.ac` linearizes the circuit and where `.tran` starts, so ESPice
-computes it for those analyses even when the deck has no `.op` card.
+computes it for those analyses even when the deck has no `.op`.
 
 ### `.ac`: frequency response
 
-```text
-.ac dec 10 10 100k
+```espice
+.ac freq=dec(10Hz, 100kHz, n=10)
 ```
 
-sweeps from 10 Hz to 100 kHz with 10 points per decade. `oct N` gives N
-points per octave and `lin N` N points in total. The sources' `AC` values
-drive the circuit; here V1 has `AC 1`, so `v(out)` *is* the transfer
+sweeps from 10 Hz to 100 kHz with 10 points per decade. `oct(..., n=N)`
+gives N points per octave and `lin(..., n=N)` N points in total. The
+sources' `ac=` values drive the circuit; here V1 has `ac=1`, so `v(out)` *is* the transfer
 function. AC results are complex, so each column has a real and an
 imaginary part:
 
@@ -61,25 +61,25 @@ a little phase lag.
 
 ### `.tran`: time response
 
-```text
-.tran 10u 5m
+```espice
+.tran stop=5ms step=10us
 ```
 
-runs from 0 to 5 ms. The first number is the print step: it sets the
-default maximum time step and the default rise and fall times of
-`PULSE` sources. ESPice picks its own steps from the local truncation
-error, so the point count (519 here) is not 5 ms / 10 µs. The full
-syntax is `.tran tstep tstop [tstart [tmax]] [uic]`: points before
-`tstart` are simulated but not saved, and `tmax` caps the step.
+runs from 0 to 5 ms. `step` is the print step: it sets the default maximum
+time step and the default rise and fall times of `pulse` sources. ESPice
+picks its own steps from the local truncation error, so the point count
+(519 here) is not 5 ms / 10 µs. The full form is
+`.tran stop= step= [start=] [maxstep=] [uic]`: points before `start` are
+simulated but not saved, and `maxstep` caps the step.
 
 ## `.dc`: sweeping a source
 
-```spice
---8<-- "examples/diode_iv.sp"
+```espice
+--8<-- "examples/diode_iv.esp"
 ```
 
-```text
-.dc V1 0 0.8 0.01
+```espice
+.dc V1=lin(0, 0.8V, step=0.01V)
 ```
 
 steps V1 from 0 to 0.8 V by 10 mV and solves the operating point at each
@@ -95,28 +95,28 @@ Index	v(v-sweep)	i(v1)	v(a)
 ```
 
 The sweep target can be a voltage or current source, a resistor (its
-resistance), or `TEMP` for the temperature. Add a second source and
-range to nest two sweeps; the [next chapter](models.md) does that for
+resistance), a parameter, or `temp` for the temperature. Add a second
+`target=range` to nest two sweeps; the [next chapter](models.md) does that for
 BJT output curves.
 
 ## Initial conditions
 
 By default a transient starts from the operating point. To start it from
 a state you choose, give node voltages with `.ic` and add `uic` to the
-`.tran` card: the transient then skips the operating point and starts from
+`.tran`: the transient then skips the operating point and starts from
 the `.ic` values, with every other node at zero. (Without `uic`, ESPice
 does not use `.ic` at all; ngspice would hold those nodes during the
 operating point instead.)
 
-A capacitor's or inductor's own `ic=` (`C1 out 0 1n ic=0.5`,
-`L1 n 0 1m ic=1m`) also applies only under `uic`: the capacitor's node (its
+A capacitor's or inductor's own `ic=` (`C1 (out 0) capacitor 1nF ic=0.5V`,
+`L1 (n 0) inductor 1mH ic=1mA`) also applies only under `uic`: the capacitor's node (its
 n+ node, or n- negated when n+ is ground) or the inductor's current starts at
 that value. A capacitor between two non-ground nodes sets its n+ node, so
 another charge on that node starts charged too, where ngspice sets the
 capacitor's charge alone.
 
-```spice
---8<-- "examples/rc_ic.sp"
+```espice
+--8<-- "examples/rc_ic.esp"
 ```
 
 ```text
@@ -136,13 +136,13 @@ latch, a ring oscillator) converge to the one you want.
 
 ## Exercises
 
-1. Add `.meas ac f3db WHEN vdb(out)=-3` to `rc_lowpass.sp`. Is the
+1. Add `.meas ac f3db = cross(vdb(out), -3)` to `rc_lowpass.esp`. Is the
    answer close to 1/(2πRC)?
-2. Change the `.ac` card to `lin 100 10 100k`. Why does the low-frequency
+2. Change the `.ac` grid to `lin(10Hz, 100kHz, n=100)`. Why does the low-frequency
    end of the curve now look coarse?
-3. Change `.tran 10u 5m` to `.tran 10u 5m 4m`. How many points does the
+3. Add `start=4ms` to the `.tran`. How many points does the
    transient keep?
-4. In `diode_iv.sp`, sweep from −1 V to 0.8 V. What does the diode
+4. In `diode_iv.esp`, sweep from −1 V to 0.8 V. What does the diode
    current do below 0 V?
 
 ??? tip "Answers"

@@ -4,14 +4,14 @@ Hard-coded values make a deck hard to change. `.param` names a value once;
 expressions compute the rest from it.
 
 ```text
-.param name=value [name=value ...]
+.param name = value [name = value ...]
 ```
 
-A parameter is used inside `{braces}`, and its value may be an expression
-of numbers, other parameters and functions:
+A parameter is used by its name wherever a value goes, and its value may be
+an expression of numbers, other parameters and functions:
 
-```spice
---8<-- "examples/expressions.sp"
+```espice
+--8<-- "examples/expressions.esp"
 ```
 
 ```text
@@ -26,65 +26,52 @@ R is computed from the corner frequency you asked for, and the measured
 corner lands within 0.3 % of 1 kHz (the gap is the sweep's interpolation
 between points).
 
+A parameter keeps the unit it was written with: after `.param f0 = 1kHz`,
+`.tran stop=f0` is refused, since a frequency is no time. Anything
+computed (`1/f0`) is not checked.
+
 ## Expressions
 
 | Kind | What is available |
 |---|---|
-| Arithmetic | `+ - * /`, `^` and `**` for powers, parentheses |
+| Arithmetic | `+ - * /`, `%` (remainder), `**` for powers, parentheses |
 | Comparison and logic | `< > <= >= == !=`, `&&`, `\|\|`, `!`, and `cond ? a : b` |
-| Functions | `sqrt abs min max pow pwr exp ln log log10 sin cos tan atan tanh floor ceil` |
+| Functions | `sqrt abs min max pow pwr exp ln log log10 sin cos tan atan tanh floor ceil` and [more](../using/language.md#expressions) |
 | Statistics | `agauss gauss unif aunif limit` (nominal value unless Monte Carlo is on; see [chapter 9](monte-carlo.md)) |
 
 `log` is the natural logarithm, like `ln`; use `log10` for base 10.
+`x ** y` and `pow(x, y)` are the real power, so `(-2)**3` is −8, and a
+negative base with a fractional exponent has no value: a parameter that
+computes one fails the deck. `pwr(x, y)` is sign(x)·|x|^y.
 
-A power of a negative base means what ngspice 44.2 gives it, which
-depends on where the expression sits:
+In a behavioural source (`bsource`), expressions can also read `v(node)`,
+`v(a,b)`, `i(source)`, `time` and `temper`.
 
-| Form | In a `.param` or a `{...}` value | In a B, E or G expression |
-|---|---|---|
-| `x^y`, `x**y` | \|x\|^y: `(-2)^3` is 8, `(-2)^2.5` is 5.657 | \|x\|^y, the same |
-| `pow(x, y)` | C's pow: `pow(-2,3)` is -8, and a card that reads `pow(-2,2.5)` stops the deck (`NonFiniteParameter`) | \|x\|^y: 8 and 5.657 |
-| `pwr(x, y)` | \|x\|^y: 8 and 5.657 | sign(x)·\|x\|^y: -8 and -5.657 |
-
-A `.param` keeps its meaning where a B source reads it, and a `.func`
-body takes the meaning of the expression that calls it. Integer
-exponents are no exception: use `x*x*x` for a signed cube anywhere.
-
-In a behavioural `B` source, expressions can also read `v(node)`,
-`v(a,b)`, `i(Vsource)`, `time` and `temper`.
-
-`temper` also works in `R`, `C` and `.model` values and in `F` and `H`
-gains, which follow the temperature as in ngspice. A `V`, `I` or linear
-`E` or `G` value cannot read it, as ngspice cannot. A top-level `.param`
-must evaluate where it stands, as in ngspice: one that reads a name no
-`.param` defines (`hertz`, `time`, `pi`, a probe) is refused even when
-no card reads it. One that reads `temper` is left to the card that reads it.
-
-ESPice also accepts an expression in single quotes (`R1 a b '2*rval'`)
-and a bare parameter name as a value (`R1 a b rval`), the two forms HSPICE
-takes. An HSPICE deck runs through SpiceRack's translation; see
-[dialects](../using/dialects.md).
+A top-level `.param` must evaluate where it stands: one that reads a name
+no `.param` defines (`hertz`, `time`, `pi`, a probe) is refused even when
+nothing reads it. One that reads `temper` is left to the value that reads
+it.
 
 ## Scope
 
 A `.param` at the top level is global. Parameters on a `.subckt` line, or
-on `.param` cards inside a subcircuit, are local to each instance, and an
-`X` card's `name=value` pairs override them for that instance.
+set by `.param` inside a subcircuit, are local to each instance, and an
+instance's `name=value` settings override them for that instance.
 
 ## `.step`: run everything again with a new value
 
 `.step` reruns every analysis in the deck once per value:
 
 ```text
-.step param name list v1 v2 ...
-.step param name start stop step
-.step [lin|dec|oct] param name start stop points-or-step
-.step temp list t1 t2 ...
-.step Vsource list v1 v2 ...
+.step name=[v1, v2, ...]
+.step name=lin(start, stop, step=s)
+.step name=dec(start, stop, n=points)       also oct
+.step temp=[t1, t2, ...]
+.step Vsource=[v1, v2, ...]
 ```
 
-```spice
---8<-- "examples/step_param.sp"
+```espice
+--8<-- "examples/step_param.esp"
 ```
 
 ```text
@@ -105,23 +92,23 @@ RC corner against R, with .step: 3 devices
   AC Analysis (rval=4000): 21 points, 4 variables
 ```
 
-Each run gets its own plot, named for the point, and each `.meas` card is
+Each run gets its own plot, named for the point, and each `.meas` is
 evaluated per run. Doubling R halves the corner, as 1/(2πRC) says. Several
-`.step` cards make a grid; the last one varies fastest.
+`.step` lines make a grid; the last one varies fastest.
 
 ## Exercises
 
-1. In `expressions.sp`, change `f0` to 20k. What does the `.meas` line
+1. In `expressions.esp`, change `f0` to 20kHz. What does the `.meas` line
    report, and what do you change to fix it?
 2. Write a `.param` that sets `rpar` to R1 and R2 in parallel, for
-   `.param r1=3k r2=6k`.
-3. Use `.step` to run `diode_iv.sp` (chapter 3) at −40, 27 and 125 °C.
+   `.param r1 = 3k  r2 = 6k`.
+3. Use `.step` to run `diode_iv.esp` (chapter 3) at −40, 27 and 125 °C.
 
 ??? tip "Answers"
 
-    1. The `.ac` card stops at 10 kHz, below the new corner, so the
+    1. The `.ac` stops at 10 kHz, below the new corner, so the
        response never falls 3 dB inside the sweep and ESPice prints
-       `Error: measure  f3db : out of interval`. Extend the sweep to 100k.
-    2. `.param rpar={r1*r2/(r1+r2)}`, which is 2k.
-    3. `.step temp list -40 27 125`. You get three DC plots, named
+       `Error: measure  f3db : out of interval`. Extend the sweep to 100kHz.
+    2. `.param rpar = r1*r2/(r1 + r2)`, which is 2k.
+    3. `.step temp=[-40C, 27C, 125C]`. You get three DC plots, named
        `(temp=-40)`, `(temp=27)` and `(temp=125)`.

@@ -1,0 +1,9 @@
+.espice 1
+.title "Divider spread with agauss and a Monte Carlo DC"
+// agauss(nominal, variation, sigmas): 30 ohms is the 3-sigma spread.
+.param r1v = agauss(1k, 30, 3)  r2v = agauss(1k, 30, 3)
+V1 (in 0)   vsource  1V
+R1 (in out) resistor r1v
+R2 (out 0)  resistor r2v
+.option seed=7
+.dc sweep monte(200)

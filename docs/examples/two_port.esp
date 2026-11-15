@@ -1,0 +1,9 @@
+.espice 1
+.title "LC low-pass as a two-port"
+// Each port is a vsource with port= and z0=.
+VP1 (in 0)  vsource   dc=0 ac=1 port=1 z0=50Ohm
+C1  (in 0)  capacitor 31.8pF
+L1  (in out) inductor 159nH
+C2  (out 0) capacitor 31.8pF
+VP2 (out 0) vsource   dc=0 port=2 z0=50Ohm
+.sp freq=dec(1MHz, 1GHz, n=10)

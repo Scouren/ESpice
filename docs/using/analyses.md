@@ -1,9 +1,13 @@
 # Analyses
 
-One section per analysis card. Each gives the syntax, what it computes,
-the result it writes (plot name and columns) and a one-line example. Node
-voltages come out as `v(node)`, branch currents as `i(source)`. Frequency
-sweeps everywhere take the same grid:
+One section per analysis. Each gives the card's syntax in the
+[legacy dialect](reference.md), what it computes, the result it writes
+(plot name and columns) and an example in the
+[ESPice language](language.md), whose [Analyses](language.md#analyses)
+section gives every signature. Node voltages come out as `v(node)`,
+branch currents as `i(source)`. Frequency sweeps on a legacy card take the
+same grid everywhere; the language writes it as a
+[range](language.md#ranges), `dec(fstart, fstop, n=N)`:
 
 ```text
 dec N fstart fstop    N points per decade
@@ -19,7 +23,7 @@ at the last one not past `fstop`. A `lin` grid with `fstart = fstop` is one
 point.
 
 ESPice adds the prerequisites an analysis needs (an `.ac` needs an
-operating point) and shares them between analyses. `espice --plan deck.sp`
+operating point) and shares them between analyses. `espice --plan deck.esp`
 shows the graph.
 
 ## DC
@@ -40,7 +44,7 @@ publishes `Operating Point (time=t)`. `format` (`all`, `brief`, `current`,
 If Newton's method does not converge directly, ESPice steps gmin and then
 the sources down, as ngspice does.
 
-```text
+```espice
 .op
 ```
 
@@ -62,8 +66,8 @@ instead of a source (HSPICE `.DC`) re-evaluates the netlist at each value;
 the first column is then the parameter's name (`.dc wn 1u 4u 1u` writes
 `wn`).
 
-```text
-.dc VIN 0 1.8 0.01 VDD 1.6 2.0 0.2
+```espice
+.dc VIN=lin(0, 1.8V, step=0.01V) VDD=lin(1.6V, 2.0V, step=0.2V)
 ```
 
 A single-axis sweep of 32 points or more runs as segments, up to 64, in
@@ -86,8 +90,8 @@ voltage or current, plus the input and output resistances. Plot
 `Transfer Function`: `transfer_function`, `input_resistance`,
 `output_resistance`.
 
-```text
-.tf v(out) VIN
+```espice
+.tf out=v(out) src=VIN
 ```
 
 ### `.sens` { #sens }
@@ -103,8 +107,8 @@ contributes its DC value only, not its waveform parameters. A parameter
 whose default 0 means infinite (a BJT's `vaf`, `ikf`) reads 0, as in
 ngspice.
 
-```text
-.sens v(out)
+```espice
+.sens out=v(out)
 ```
 
 ### `.dcmatch` { #dcmatch }
@@ -126,8 +130,8 @@ device's own `w`, `l` and `m`, evaluated per device:
 relative). Plot `DC Mismatch`: `total_3sigma` and one `<card>@<param>`
 column per contribution.
 
-```text
-.dcmatch v(out)
+```espice
+.dcmatch out=v(out)
 ```
 
 ### `.dcsens`, `.acmatch` { #acmatch }
@@ -165,7 +169,8 @@ response to every source's `AC` magnitude (`DC Incremental Analysis`).
 .temp t
 ```
 
-Sets the circuit temperature in °C. It is no analysis. As in ngspice
+Sets the circuit temperature in °C. It is no analysis, and the language
+writes it `.option temp=`. As in ngspice
 44.2, the last `.temp` card wins over every `.options temp=`, whichever
 comes first. A `.temp` card with more than one value prints a warning and
 the circuit runs at 27 °C. That includes three values, which older
@@ -175,8 +180,8 @@ tstop tstep` (plot `DC transfer characteristic`, first column
 `.step temp list t1 t2 ...`. A temperature at or below −273.15 °C is
 refused.
 
-```text
-.dc temp -40 125 5
+```espice
+.dc temp=lin(-40C, 125C, step=5C)
 ```
 
 ### `.mc` { #mc }
@@ -191,8 +196,8 @@ nonzero primary value from a Gaussian with relative sigma `sigma`
 For controlled variation, use `agauss` and `MONTE=` instead
 ([chapter 9](../learn/monte-carlo.md)).
 
-```text
-.mc 1000 0.01
+```espice
+.mc trials=1000 sigma=0.01
 ```
 
 ## Small signal
@@ -209,8 +214,8 @@ The circuit linearized at its operating point and driven by the sources'
 Frequency points are solved in SIMD batches over one factorization
 pattern.
 
-```text
-.ac dec 20 1 1g
+```espice
+.ac freq=dec(1Hz, 1GHz, n=20)
 ```
 
 ### `.noise` { #noise }
@@ -231,8 +236,8 @@ I source as the input, `i(inoise_total)` in A rms, as ngspice names it).
 phase noise in dBc/Hz is 10·log10(onoise²/2); SpiceRack writes HSPICE's
 `.acphasenoise` as this `.noise`.
 
-```text
-.noise v(out) VIN dec 10 10 10meg 1
+```espice
+.noise out=v(out) src=VIN freq=dec(10Hz, 10MHz, n=10) contributions
 ```
 
 ### `.pz` { #pz }
@@ -260,8 +265,8 @@ circuit has fewer finite roots, or when a zero is too ill-conditioned to
 separate from the transfer's zeros at infinity (the far end of a long
 ladder).
 
-```text
-.pz in 0 out 0 vol pz
+```espice
+.pz in=v(in, 0) out=v(out, 0) drive=voltage find=both
 ```
 
 ### `.disto` { #disto }
@@ -277,8 +282,8 @@ and `DISTORTION - 3rd harmonic`, or with two tones `DISTORTION - IM: f1+f2`,
 `IM: f1-f2` and `IM: 2f1-f2`, plus a `Distortion Analysis` summary
 (`v1_mag`, `v2_mag`, `hd2`, ...).
 
-```text
-.disto dec 10 1k 100k
+```espice
+.disto freq=dec(1kHz, 100kHz, n=10)
 ```
 
 ### `.sp`, `.lin`, `.net` { #sp }
@@ -322,24 +327,24 @@ when it is balanced. `MIXEDMODE2PORT=xy` picks port 1's and port 2's mode
 for `.lin`'s H, stability factors and noise: `s` for a single-ended port,
 `d` or `c` for a balanced one. `.hblin` refuses a balanced port.
 
-```spice
-* port 1 balanced across a and b, port 2 single-ended at c: modes d1, s2, c1
-Vp1_p a 0 dc 0 portnum 1 z0 50
-Vp1_n b 0 dc 0 portnum 1 z0 50
-Vp2 c 0 dc 0 portnum 2 z0 50
-Ra a c 50
-Rb b c 50
-Rab a b 100
-.sp dec 10 1meg 1g
-.end
+```espice
+.espice 1
+// port 1 balanced across a and b, port 2 single-ended at c: modes d1, s2, c1
+Vp1_p (a 0) vsource  dc=0 port=1 z0=50Ohm
+Vp1_n (b 0) vsource  dc=0 port=1 z0=50Ohm
+Vp2   (c 0) vsource  dc=0 port=2 z0=50Ohm
+Ra    (a c) resistor 50
+Rb    (b c) resistor 50
+Rab   (a b) resistor 100
+.sp freq=dec(1MHz, 1GHz, n=10)
 ```
 
-```spice
---8<-- "examples/two_port.sp"
+```espice
+--8<-- "examples/two_port.esp"
 ```
 
 ```sh
-espice two_port.sp --format=touchstone --rawfile lc.s2p
+espice two_port.esp --format=touchstone --rawfile lc.s2p
 ```
 
 ### `.stb` { #stb }
@@ -364,7 +369,7 @@ own. Plots `Loop Stability Analysis` (`loop_gain`, `loop_gain_forward`,
 (`gain_margin`, `phase_crossover_freq`, `phase_margin`, `unity_gain_freq`,
 `loop_gain_minifreq`), which `.meas lstb pm phase_margin` reads.
 
-```text
+```espice
 .lstb mode=single vsource=Vprobe
 ```
 
@@ -386,8 +391,8 @@ selects Gear-2, and `.option maxord=1` backward Euler under either method.
 As in ngspice, no method runs above order 2, so `maxord` 3 to 6 is Gear-2.
 Plot `Transient Analysis`, first column `time`.
 
-```text
-.tran 1n 10u
+```espice
+.tran stop=10us step=1ns
 ```
 
 The explicit `tmax` is independent of `tstep`. For example,
@@ -411,10 +416,10 @@ can change the implicit ceiling even though TSTART suppresses output.
 
 For example, the measured ring controls can be expressed as:
 
-```text
-.options tran_ceiling=duration
-.options reltol=1e-5 abstol=1e-14 vntol=1e-8 chgtol=3e-17 trtol=1
-.tran 2p 2000p
+```espice
+.option tran_ceiling=duration
+.option reltol=1e-5 abstol=1e-14 vntol=1e-8 chgtol=3e-17 trtol=1
+.tran stop=2000ps step=2ps
 ```
 
 This is equivalent to an explicit 200 ps TMAX with those same tolerances.
@@ -440,8 +445,8 @@ period. One plot per output, `Fourier Analysis
 sine starting at the window, as ngspice's: `sin(0 1 1k)` reads 0 degrees.
 An output `v(a,b)` is the difference of the two nodes.
 
-```text
-.four 1k v(out)
+```espice
+.four v(out) f0=1kHz
 ```
 
 ### `.fft` { #fft }
@@ -457,8 +462,8 @@ power of two) and windowed (`rect`, `bart`, `hann`, `hamm`, `black`,
 `FFT Analysis v(out)`: `frequency` and one complex column. `.meas fft`
 reads THD, SNR, SNDR, ENOB and SFDR from it.
 
-```text
-.fft v(out) NP=1024 WINDOW=hann
+```espice
+.fft v(out) np=1024 window=hann
 ```
 
 ### `.trannoise` { #trannoise }
@@ -474,8 +479,8 @@ runs on the deck's `.tran` card;
 carries the noise covariance instead of sampling and publishes `onoise`.
 Plot `Transient Noise Analysis`.
 
-```text
-.trannoise v(out) samples=3 seed=1
+```espice
+.trannoise out=v(out) samples=3 seed=1
 ```
 
 ### `.envelope` { #envelope }
@@ -488,8 +493,8 @@ Envelope-following transient: full carrier periods
 integrated, the envelope stepped across them. Plot `Envelope Analysis`
 with per-output `peak(...)` and `rms(...)` columns.
 
-```text
-.envelope 1m 5m
+```espice
+.envelope period=1ms stop=5ms
 ```
 
 ### `.matex` { #matex }
@@ -501,8 +506,8 @@ with per-output `peak(...)` and `rms(...)` columns.
 Transient by matrix exponential (R-MATEX, Krylov). Plot `MATEX Transient
 Analysis`.
 
-```text
-.matex 1u 2m
+```espice
+.matex stop=2ms step=1us
 ```
 
 ## Periodic steady state
@@ -531,8 +536,8 @@ residual must be within (swing·reltol + vntol, or abstol for a current)
 ·trtol·steadycoeff. An oscillator that does not converge within the cap
 fails (`NoPeriodicSteadyState`); ngspice instead publishes its best cycle.
 
-```text
-.pss 1k 256
+```espice
+.pss f0=1kHz points=256
 ```
 
 ### `.pac`, `.pxf` { #pac }
@@ -552,8 +557,8 @@ Function Analysis`, `pxf_h<k>(out)`). `.pac` names no output: it uses the
 last node the deck names, and so does `.pxf` without `v(out)`. Both read
 the grid as `.ac` does, `POI` included.
 
-```text
-.pac 1k dec 4 10 10k
+```espice
+.pac f0=1kHz freq=dec(10Hz, 10kHz, n=4)
 ```
 
 ### `.pnoise` { #pnoise }
@@ -572,8 +577,8 @@ Analysis (time=t)`, `ptdnoise_density`), at the fundamental of the deck's
 first driven `.pss` (`MissingAnalysisCard` without one), as `.hbac` takes
 the `.hb` tone.
 
-```text
-.pnoise v(out) Vin dec 3 10 10k 1k 3
+```espice
+.pnoise out=v(out) src=Vin freq=dec(10Hz, 10kHz, n=3) f0=1kHz sidebands=3
 ```
 
 ### `.hb` { #hb }
@@ -588,8 +593,8 @@ Harmonic balance (default 8 harmonics). The multitone `TONES=` form gives
 quasi-periodic solutions and reports phasors. Plot `Harmonic Balance`, first
 column `frequency`, one row per harmonic.
 
-```text
-.hb 1k 8
+```espice
+.hb f0=1kHz harmonics=8
 ```
 
 ### `.hbac`, `.hbxf`, `.hbnoise` { #hbac }
@@ -625,8 +630,8 @@ Oscillator phase noise about the autonomous HB solution of the deck's
 `.hb v(osc) f0guess` (or the tone given here). Plot `Phase Noise Analysis`,
 `phnoise`.
 
-```text
-.phasenoise v(t) dec 2 1k 1meg
+```espice
+.phasenoise out=v(t) freq=dec(1kHz, 1MHz, n=2)
 ```
 
 ### `.qpss` { #qpss }
@@ -638,28 +643,29 @@ Oscillator phase noise about the autonomous HB solution of the deck's
 Two-tone quasi-periodic steady state, keeping `k1` and `k2` harmonics of
 each tone (default 5). Plot `Quasi-Periodic Steady State`.
 
-```text
-.qpss 1000 1414.2 2 2
+```espice
+.qpss f1=1000 f2=1414.2 nharms=[2, 2]
 ```
 
 ## Safe operating area { #soa }
 
-`.option soa=1` (ngspice's `.option warn=1` works too) holds every accepted
+`.option soa` (in a legacy deck `.option soa=1`, or ngspice's
+`.option warn=1`) holds every accepted
 point of each operating point, DC sweep and transient to the limits the
 model cards state: `vgs_max`, `vgd_max`, `vgb_max`, `vds_max`, `vbs_max`,
 `vbd_max` (MOS), `vbe_max`, `vbc_max`, `vce_max` (BJT) and `bv_max`
 (diode, resistor, capacitor). Each limit bounds the
 magnitude of its terminal voltage; a diode's `bv_max` bounds its reverse voltage.
 
-```spice
-SOA check
-V1 d 0 1
-V2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)
-M1 d g 0 0 nm
-.model nm nmos level=1 vgs_max=1.8 vds_max=1.95
-.option soa=1 maxwarns=20
-.tran 10n 4u
-.end
+```espice
+.espice 1
+.title "SOA check"
+V1 (d 0)     vsource 1V
+V2 (g 0)     vsource pwl((0, 0), (1us, 2V), (2us, 0), (3us, 2V), (4us, 0))
+M1 (d g 0 0) nm
+.model nm mos1 type=n vgs_max=1.8 vds_max=1.95
+.option soa maxwarns=20
+.tran stop=4us step=10ns
 ```
 
 Here the gate passes 1.8 V twice. Each excursion prints one line on
@@ -680,8 +686,8 @@ cannot state.
 
 A kit whose model cards state no limits can name them in a file:
 
-```text
-.option soa=1 soalimits="sky130_soa.json"
+```espice
+.option soa soalimits="sky130_soa.json"
 ```
 
 ```json
@@ -695,7 +701,7 @@ value is never shadowed. The path is relative to the deck. A file that is
 not one such object of finite numbers under the keys above refuses the
 deck, naming the file.
 
-The counts are measurable: `.meas tran soa_n param='soa_count()'` is the
+The counts are measurable: `.meas tran soa_n = soa_count()` is the
 number of excursions in the result the card reads (each `.step` point its
 own); it has no value where a limit was not checked. Under
 `--measures` ([output](output.md#measurements-as-json)) each excursion is
@@ -704,20 +710,21 @@ also an object under `soa`.
 ## Runs over variants
 
 These wrap other analyses rather than being analyses themselves; see the
-[language reference](reference.md#statistics):
+[language reference](language.md#sweeps):
 
 - `.step` reruns every analysis per point; plots are named
   `<plot> (name=value)`.
 - `.alter` blocks rerun the deck with changes: `<plot> (alter=n)`. With
   `.step` too, the base run keeps its step points and each `.alter` run
   steps again.
-- `SWEEP DATA=`, `SWEEP MONTE=` and `SWEEP OPTIMIZE=` on one card:
+- `sweep data(...)`, `sweep monte(...)` and `sweep optimize(...)` on one
+  analysis (legacy `SWEEP DATA=`, `MONTE=`, `OPTIMIZE=`):
   `<plot> (monte=n)`, `(optimize=...)`.
 - `.step temp`: `<plot> (temp=t)`.
 - `.mosra` adds `MOSRA Degradation` (aging per device) and reruns the
   aged circuit.
-- `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` estimates a failure rate too
-  rare to count (below).
+- `sweep monte(n, sigma_scale=[...], fail=...)` estimates a failure rate
+  too rare to count (below).
 - `.wcd` finds each spec's worst-case distance in sigmas (below).
 
 ### Scaled-sigma sampling { #scaled-sigma }
@@ -729,19 +736,20 @@ Gu, "Fast statistical analysis of rare circuit failure events via
 scaled-sigma sampling", IEEE TCAD 34(7), 2015) draws with every sigma
 made larger, where failures are common, and extrapolates back:
 
-```spice
---8<-- "examples/monte_sss.sp"
+```espice
+--8<-- "examples/monte_sss.esp"
 ```
 
-- `SIGMA_SCALE=s1,...` runs `MONTE` trials at each scale: every
+- `sigma_scale=[s1, ...]` (legacy `SIGMA_SCALE=s1,...`) runs the
+  `monte` trials at each scale: every
   statistical parameter (`agauss`/`gauss` draws, `.variation` local and
   global, `DEV`/`LOT`, a kit's in-model mismatch) is drawn with its sigma
   multiplied by s. A uniform (`unif`, `aunif`) is scaled in its
   standard-normal image, Φ(s·Φ⁻¹(u)), so its mass moves to its edges; a
   `limit` is unchanged. Each scale's trials are numbered after the last
   scale's (`(monte=n)` plots), so the scales draw independently.
-- `FAIL=` is a quoted boolean expression over the analysis's own `.meas`
-  names. A trial whose measure has no value, or that did not converge,
+- `fail=` (legacy `FAIL='...'`) is a boolean expression over the
+  analysis's own `.meas` names. A trial whose measure has no value, or that did not converge,
   counts as a failure.
 - ESPice fits ln P_f(s) = α + β·ln s − γ/s² by weighted least squares
   over the scales where some, but not all, trials failed (weights from the
@@ -752,7 +760,8 @@ made larger, where failures are common, and extrapolates back:
 - The interval is statistical only: the model's own error at s = 1 is not
   in it. The extrapolation is long, so the interval is wide. On
   `docs/examples/monte_sss.sp` (1000 trials at each of five scales, true
-  P_f = Q(5) = 2.9e-7) it prints P_f(1) = 4.7e-6 in [1.7e-11, 1.0].
+  P_f = Q(5) = 2.9e-7) it prints P_f(1) = 4.7e-6 in [1.7e-11, 1.0], and
+  so does `docs/examples/monte_sss.esp`.
 - Fewer than three such scales is refused, naming the scales where none or
   all trials failed: the run's exit status is an error. `--measures`
   writes the same numbers as `{"kind": "sss", ...}`.
@@ -768,12 +777,13 @@ point in the space of the statistical parameters, with partial yield
 Φ(β_w) (Antreich, Graeb, Wieser, IEEE TCAD 13(1), 1994). It reaches 6σ
 statements without 10⁹ samples:
 
-```spice
---8<-- "examples/wcd_ota.sp"
+```espice
+--8<-- "examples/wcd_ota.esp"
 ```
 
-- `.wcd m1 'op L1' m2 'op L2' ... [MAXITER=20] [TOL=0.01] [TOP=5]`: each
-  named `.meas` card with its bound is a spec. `op` is `>=`, `>`, `<=` or
+- `.wcd (m1 op L1) (m2 op L2) ... [maxiter=20] [tol=0.01] [top=5]`
+  (legacy `.wcd m1 'op L1' ... MAXITER= TOL= TOP=`): each named `.meas`
+  with its bound is a spec. `op` is `>=`, `>`, `<=` or
   `<` (the same for a continuous measure); `L` is a number or a `.param`
   expression.
 - The statistical parameters are the ones `SWEEP MONTE` draws: each

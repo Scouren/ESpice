@@ -1,0 +1,20 @@
+.espice 1
+.title "Inverting amplifier with an opamp subcircuit"
+// A single-pole opamp: open-loop gain a0, pole at fp, output resistance rout.
+.subckt opamp (inp inn out) a0=100k fp=10 rout=10 {
+    E1 (int 0 inp inn) vcvs      a0
+    R1 (int p1)        resistor  1/(2*3.14159265*fp*1u)
+    C1 (p1 0)          capacitor 1uF
+    E2 (drv 0 p1 0)    vcvs      1
+    Ro (drv out)       resistor  rout
+}
+
+.param rin = 1k  rf = 10k
+VIN (in 0)        vsource  dc=0.1V ac=1
+R1  (in inv)      resistor rin
+R2  (inv out)     resistor rf
+X1  (0 inv out)   opamp    a0=200k
+RL  (out 0)       resistor 10k
+.op
+.tf out=v(out) src=VIN
+.ac freq=dec(1Hz, 10MHz, n=10)

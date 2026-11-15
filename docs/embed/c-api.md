@@ -53,7 +53,7 @@ Set what you need, then call `espice_create`:
 |---|---|
 | `source_kind` | `ESPICE_FILE`: `source` is a path. `ESPICE_BYTES`: `source` is netlist text |
 | `source`, `origin` | the path or text; `origin` names the file relative includes resolve against |
-| `dialect` | `ESPICE_NGSPICE` (0) only. Any other value fails with `UnsupportedDialect` (`ESPICE_INVALID_ARGUMENT`): translate an HSPICE, Spectre, LTspice, Xyce or VACASK deck with `spx translate --from <d> --to ngspice DECK` first and pass its output |
+| `dialect` | `ESPICE_NGSPICE` (0) only; under it a deck whose first line is `.espice 1` is read as [ESPice's language](../using/language.md). Any other value fails with `UnsupportedDialect` (`ESPICE_INVALID_ARGUMENT`): translate an HSPICE, Spectre, LTspice, Xyce or VACASK deck with `spx translate --from <d> --to ngspice DECK` first and pass its output |
 | `backend`, `explicit_gpu` | `ESPICE_CPU`, `ESPICE_AUTO`, `ESPICE_CUDA`, `ESPICE_HIP`; `explicit_gpu = 1` is the CLI's `--gpu` |
 | `output_format`, `output_path` | write results to a file as the CLI's `--format` and `--rawfile` do; an empty path writes nothing |
 | `max_parallel` | queries that may run at once, as `--jobs` |

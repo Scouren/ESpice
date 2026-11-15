@@ -152,16 +152,18 @@ const Ctx = struct {
 
     /// What `card` multiplies a value of card `name` by: its `m=`, over its
     /// `scale=` for `times_m_per_scale`, each 1 when the card gives none, as
-    /// `net_passive.zig` folds them.
-    // ponytail: scans the card letter's devices per name; index the cards
+    /// `net_passive.zig` folds them. Only R, C and L rows carry a factor
+    /// (opvar_ngspice.zig), so the card is found among those by its name,
+    /// which need not start with its letter.
+    // ponytail: scans the R, C and L devices per name; index the cards
     // by name if a deck saves thousands of these.
     fn cardFactor(ctx: Ctx, name: []const u8, card: ngspice.Card) f64 {
         if (card == .none) return 1;
-        const letter = std.ascii.toLower(name[0]);
-        if (!std.ascii.isLower(letter)) return 1;
-        const kv = for (ctx.nl.bucket(letter)) |e| {
-            const d = ctx.nl.device(e);
-            if (std.ascii.eqlIgnoreCase(d.name, name)) break d.kv;
+        const kv = find: for ("rcl") |letter| {
+            for (ctx.nl.bucket(letter)) |e| {
+                const d = ctx.nl.device(e);
+                if (std.ascii.eqlIgnoreCase(d.name, name)) break :find d.kv;
+            }
         } else return 1;
         const m = cardNumber(kv, "m") orelse 1;
         return switch (card) {

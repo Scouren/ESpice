@@ -9,6 +9,7 @@
 //! - `pub const Row = struct`
 //! - `pub fn failed(r: *Reader, line: []const u8, err: Error) Error`
 //! - `pub fn unsupported(r: *Reader, line: []const u8, what: []const u8) Error`
+//! - `pub fn invalid(r: *Reader, line: []const u8, what: []const u8) Error`
 //! - `pub fn note(r: *Reader, row: Row) Allocator.Error!void`
 //! - `pub fn reserve(r: *Reader) Allocator.Error!void`
 //! - `pub fn noteUnreadable(r: *Reader, card: []const u8) void`
@@ -21,7 +22,7 @@ const card_rows = @import("card_rows.zig");
 const Reader = reader.Reader;
 const Error = card_rows.Error;
 
-/// What a row says. `malformed` and `refused` are refusals: they name the
+/// What a row says. `malformed`, `refused` and `invalid` are refusals: they name the
 /// card that stopped the read, so the spine's "cannot read the card"
 /// fallback stays silent once one is logged. The rest log their own line.
 pub const Code = enum(u8) {
@@ -29,6 +30,8 @@ pub const Code = enum(u8) {
     malformed,
     /// `text` says what ESPice cannot run: "netlist: <text>: <card>".
     refused,
+    /// `text` says what is wrong with the card: "netlist: <text>: <card>".
+    invalid,
     /// No refusal named the card the read stopped on.
     unreadable,
     /// `text` is the caller's live name that no global `.param` defines.
@@ -64,10 +67,18 @@ pub fn unsupported(r: *Reader, line: []const u8, what: []const u8) Error {
     return error.UnsupportedCard;
 }
 
+/// Records `line` as malformed, `what` saying how; returns `ParseError`.
+pub fn invalid(r: *Reader, line: []const u8, what: []const u8) Error {
+    try refusal(r, .{ .code = .invalid, .subject = r.ast.written(line), .text = what });
+    return error.ParseError;
+}
+
 /// Records a diagnostic that is no refusal (a warning, or an error that
 /// logs its own line). Its `subject` is already as the deck spells it.
 pub fn note(r: *Reader, row: Row) Allocator.Error!void {
-    std.debug.assert(row.code != .malformed and row.code != .refused);
+    std.debug.assert(row.code != .malformed);
+    std.debug.assert(row.code != .refused);
+    std.debug.assert(row.code != .invalid);
     try push(r, row);
 }
 
@@ -91,7 +102,7 @@ pub fn render(r: *const Reader) void {
     if (@import("builtin").is_test) return;
     const log = std.log;
     for (r.diag.rows.items) |d| switch (d.code) {
-        .malformed, .refused => log.err("netlist: {s}: {s}", .{ d.text, d.subject }),
+        .malformed, .refused, .invalid => log.err("netlist: {s}: {s}", .{ d.text, d.subject }),
         .unreadable => {
             // A card with no visible byte prints escaped, never blank.
             const blank = for (d.subject) |c| {

@@ -1,8 +1,9 @@
 # ESPice
 
-ESPice is a SPICE circuit simulator. It reads ngspice netlists, and
-HSPICE, Spectre, LTspice, Xyce and VACASK ones once SpiceRack's `spx`
-has translated them, and runs DC, AC, transient, noise, S-parameter, stability,
+ESPice is a SPICE circuit simulator. New decks are written in its own
+typed [netlist language](using/language.md); it also reads ngspice
+netlists as they are, and HSPICE, Spectre, LTspice, Xyce and VACASK ones
+once SpiceRack's `spx` has translated them, and runs DC, AC, transient, noise, S-parameter, stability,
 periodic steady-state, harmonic-balance and Monte Carlo analyses, 36
 analysis types in all. Every device model, from the resistor to
 BSIM4 and PSP, is Verilog-A compiled into the simulator, and you can load
@@ -23,16 +24,16 @@ Install it ([other ways](using/install.md)):
 nix profile install github:OpenFAT/ESPice
 ```
 
-Save this as `rc.sp`:
+Save this as `rc.esp`:
 
-```spice
---8<-- "examples/rc_lowpass.sp"
+```espice
+--8<-- "examples/rc_lowpass.esp"
 ```
 
 Run it:
 
 ```sh
-espice rc.sp --rawfile rc.raw
+espice rc.esp --rawfile rc.raw
 ```
 
 ```text
@@ -51,7 +52,8 @@ RC low-pass filter: 3 devices
 |---|---|
 | learn SPICE from the start | [Learn SPICE](learn/index.md) |
 | run an existing ngspice, HSPICE or Spectre deck | [Dialects](using/dialects.md), then [Diagnostics](using/diagnostics.md) |
-| look up a card or element | [Language reference](using/reference.md), [Analyses](using/analyses.md) |
+| write a new deck | [The ESPice netlist language](using/language.md) |
+| look up a legacy card or element | [Legacy dialect reference](using/reference.md), [Analyses](using/analyses.md) |
 | know every command-line flag | [Command line](using/cli.md) |
 | use your own Verilog-A model | [Devices and models](using/devices.md#your-own-verilog-a) |
 | read the results in another tool | [Output](using/output.md) |
