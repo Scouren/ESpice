@@ -12,14 +12,14 @@
       "locked": {
         "lastModified": 1794714323,
         "narHash": "sha256-GmDJ0FrD//miNd0HPUofTHeJWGs5Jz2Ktb8CTrjXnDg=",
-        "ref": "dev/perf-oracles",
+        "ref": "main",
         "rev": "c9bf6bb8419049f1158db181b6a2f9e32ff033f1",
         "revCount": 130,
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
       },
       "original": {
-        "ref": "dev/perf-oracles",
+        "ref": "main",
         "rev": "c9bf6bb8419049f1158db181b6a2f9e32ff033f1",
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
