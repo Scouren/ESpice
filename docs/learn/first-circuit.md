@@ -132,6 +132,6 @@ V1 (in 0) vsource pulse(0, 10V, td=1ms,
        point is not unique. ESPice refuses the deck:
 
         ```text
-        error: topology: a node has no DC path to ground (capacitor-only island) — the operating point is not unique
+        error: topology: node 'x' has no DC path to ground, so the operating point is not unique
         Error: divider.esp: FloatingNode
         ```

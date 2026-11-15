@@ -127,20 +127,29 @@ for deck in measure.sp; do
   fi
 done
 
-# A refused deck says why once (docs/learn/first-circuit.md, exercise 3):
-# one "no DC path" line and the Error line, with -r and without (the
-# default mode once solved a warm operating point first and said it twice).
+# A refused deck says why once, naming what to fix: one topology line and
+# the Error line, with -r and without (the default mode once solved a warm
+# operating point first and said it twice). The floating node is
+# docs/learn/first-circuit.md's exercise 3; the V/L loop runs under uic
+# and is refused by an .op (core/validate.zig `admitTopology`).
 printf '.espice 1\n.title "Voltage divider"\nV1 (in 0)  vsource  10V\nR1 (in out) resistor 1k\nC1 (out x) capacitor 1nF\n.op\n' >"$work/float.esp"
-for mode in plain raw; do
-  total=$((total + 1))
-  if [ "$mode" = raw ]; then set -- -r "$work/out.raw"; else set --; fi
-  (cd "$work" && timeout 60 "$exe" --backend cpu "$@" float.esp >"$work/float.out" 2>&1)
-  # Exactly the two lines: nothing else (a leak report, a second solve's line).
-  if [ "$(wc -l <"$work/float.out")" != 2 ] || [ "$(grep -c 'no DC path' "$work/float.out")" != 1 ] || ! grep -qx 'Error: float.esp: FloatingNode' "$work/float.out"; then
-    fail=$((fail + 1))
-    echo "FAIL a floating node ($mode) is not refused with one line"
-    cat "$work/float.out"
-  fi
+printf 'v/l loop\nV1 a 0 1\nL1 a 0 1u\n.op\n.end\n' >"$work/loop.cir"
+for refusal in "float.esp|FloatingNode|node 'x' has no DC path" "loop.cir|VoltageSourceLoop|'l1' closes a loop"; do
+  deck=${refusal%%|*}
+  rest=${refusal#*|}
+  err=${rest%%|*}
+  why=${rest#*|}
+  for mode in plain raw; do
+    total=$((total + 1))
+    if [ "$mode" = raw ]; then set -- -r "$work/out.raw"; else set --; fi
+    (cd "$work" && timeout 60 "$exe" --backend cpu "$@" "$deck" >"$work/refused.out" 2>&1)
+    # Exactly the two lines: nothing else (a leak report, a second solve's line).
+    if [ "$(wc -l <"$work/refused.out")" != 2 ] || [ "$(grep -c "topology: .*$why" "$work/refused.out")" != 1 ] || ! grep -qx "Error: $deck: $err" "$work/refused.out"; then
+      fail=$((fail + 1))
+      echo "FAIL $deck ($mode) is not refused with one line naming it"
+      cat "$work/refused.out"
+    fi
+  done
 done
 
 echo "doc decks: $((total - fail)) of $total run"
