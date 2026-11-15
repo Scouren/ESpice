@@ -377,7 +377,7 @@ PASS	conformance/tests/netlist/hspice/fft_meas.sp
 PASS	conformance/tests/netlist/hspice/fft_meas_ngspice.sp
 PASS	conformance/tests/netlist/hspice/fft_rect.sp
 PASS	conformance/tests/netlist/hspice/fft_rect_ngspice.sp
-XFAIL	conformance/tests/netlist/hspice/gmindc.sp
+PASS	conformance/tests/netlist/hspice/gmindc.sp
 PASS	conformance/tests/netlist/hspice/gshunt.sp
 PASS	conformance/tests/netlist/hspice/gshunt_ngspice.sp
 XFAIL	conformance/tests/netlist/hspice/hblin_mixer.sp
