@@ -53,7 +53,9 @@ const stall_factor = std.math.pow(f64, 10.0, 1.0 / @as(f64, stall_solves));
 /// The ladder from `x` as given. A circuit with a capacitor-only island
 /// (`needs_tran_op`) and no holds skips the static rungs and goes straight
 /// to OPtran. Fails with error.FloatingNode when a node has no DC path to
-/// ground outside a TRANOP.
+/// ground outside a TRANOP, unlogged: its caller renders it, and a deck's
+/// queries are refused before they run (`core.validate.validateDeck`,
+/// which names the node).
 pub fn solve(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Options, hold: []const Force) !converger.Result {
     assert(x.len == ckt.n);
     // Holds can pin the floating nodes, as they do in ngspice, so a held
@@ -64,10 +66,7 @@ pub fn solve(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Op
         // wherever settling from zero landed. ngspice accepts that under
         // TRANOP, where the transient owns the initial condition; a
         // standalone .op/.ac/.pz has no such owner, so the deck is rejected.
-        if (!options.tran_op) {
-            std.log.err("topology: a node has no DC path to ground (capacitor-only island) — the operating point is not unique", .{});
-            return error.FloatingNode;
-        }
+        if (!options.tran_op) return error.FloatingNode;
         return transientOp(ckt, ws, x, options, hold);
     }
     // Rung 1: plain Newton with no diagonal gmin. ngspice's NIiter loads one
