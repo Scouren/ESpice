@@ -1,8 +1,8 @@
 # ESPice
 
 ESPice is a SPICE circuit simulator. It reads ngspice netlists, and
-HSPICE, Spectre, LTspice, Xyce and VACASK ones through SpiceRack's
-translation, and runs DC, AC, transient, noise, S-parameter, stability,
+HSPICE, Spectre, LTspice, Xyce and VACASK ones once SpiceRack's `spx`
+has translated them, and runs DC, AC, transient, noise, S-parameter, stability,
 periodic steady-state, harmonic-balance and Monte Carlo analyses, 36
 analysis types in all. Every device model, from the resistor to
 BSIM4 and PSP, is Verilog-A compiled into the simulator, and you can load

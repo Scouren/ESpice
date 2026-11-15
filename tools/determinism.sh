@@ -16,7 +16,7 @@ one() {
   key=$(printf %s "$deck" | tr / _)
   for t in 1 "$n"; do
     (cd "$(dirname "$deck")" && ESPICE_THREADS=$t ESPICE_SOLVER_THREADS=$t timeout 900 \
-      "$exe" --backend cpu --format=binary -b -r "$work/$key.$t.raw" --tokenizer ngspice \
+      "$exe" --backend cpu --format=binary -b -r "$work/$key.$t.raw" \
       "$(basename "$deck")" >/dev/null 2>&1)
     echo $? >"$work/$key.$t.rc"
   done

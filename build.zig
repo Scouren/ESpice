@@ -264,9 +264,9 @@ pub fn build(b: *Build) void {
     // src/device/tests/catalog.zig reads models/*.va for their aliases.
     const run_device_tests = t.run(g.tests.device, &.{}, true);
     for (treeFiles(b, &.{"models"})) |f| run_device_tests.addFileInput(f);
-    // spicerack.zig's `detect` test walks the corpus decks.
+    // main.zig's version test reads build.zig.zon.
     const run_exe_tests = t.run(exe.root_module, &.{tests_espice}, false);
-    for (test_data) |f| run_exe_tests.addFileInput(f);
+    run_exe_tests.addFileInput(b.path("build.zig.zon"));
 
     for ([_]*Build.Step.Run{
         run_espice_tests,

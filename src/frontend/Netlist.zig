@@ -7,8 +7,8 @@
 //! re-reads its subcircuit's lines under a frame), then analysis nets. Values
 //! are rows of flat tables; an expression that does not fold stays postfix.
 //!
-//! Reads one dialect, ngspice's plus ESPice's own cards; every other
-//! dialect arrives translated by SpiceRack (src/spicerack.zig).
+//! Reads one dialect, ngspice's plus ESPice's own cards; another dialect
+//! is translated before it reaches ESPice (SpiceRack's `spx translate`).
 //! Cites ngspice (inpcom.c, inp.c recifeval, subckt.c modtranslate,
 //! INPgetModBin) for the cards, the HSPICE manuals ([SA], [CR]) for the
 //! cards ESPice took from HSPICE, and dev/research/ngspice-syntax.md (§ and

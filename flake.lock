@@ -105,26 +105,7 @@
         "flake-utils": "flake-utils",
         "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",
-        "spicerack": "spicerack",
         "zig-overlay": "zig-overlay"
-      }
-    },
-    "spicerack": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1794590138,
-        "narHash": "sha256-IsC4NMZ+n2mr5b9RqVqcO1f2HvuxTooIBLKIFOP8BrU=",
-        "ref": "espice-kit",
-        "rev": "231d9c9c34ac142c55d06a9a985739afb160b1ab",
-        "revCount": 2177,
-        "type": "git",
-        "url": "https://github.com/Scouren/SpiceRack"
-      },
-      "original": {
-        "ref": "espice-kit",
-        "rev": "231d9c9c34ac142c55d06a9a985739afb160b1ab",
-        "type": "git",
-        "url": "https://github.com/Scouren/SpiceRack"
       }
     },
     "systems": {

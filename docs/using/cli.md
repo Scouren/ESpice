@@ -37,9 +37,6 @@ Usage: espice [OPTION]... FILE...
       --warm-start            Start each transient's OP from the nominal one
       --tangents=P,...        Print d(.meas)/d(P) of the first .tran's cards for these .params
       --tangent-step=S        Relative step of --tangents (default 1e-6)
-      --tokenizer=FMT         ngspice|hspice|spectre|ltspice|xyce|vacask (default: detected from the deck,
-                              else ngspice); any but ngspice is translated by SpiceRack's spice2rack first
-      --spicerack=PATH        The spice2rack binary (default: $ESPICE_SPICERACK, else the one beside espice, else spice2rack on PATH)
       --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
   -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
                               directory; repeatable, in order
@@ -86,39 +83,6 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
   statistics to `[T1, T2]` seconds of the run. The transient runs to its
   end and on the CPU. `FILE` takes one netlist. See
   [Output](output.md#terminal-currents-as-json).
-
-`--tokenizer=FMT`
-: The netlist dialect: `ngspice` (alias `ng`), `hspice` (`hs`), `spectre`
-  (`scs`), `ltspice`, `xyce` or `vacask`. ESPice reads ngspice; any other
-  dialect runs as SpiceRack's ngspice translation of the deck
-  (`spice2rack`, see `--spicerack`), with SpiceRack's time on stderr
-  apart from ESPice's. The single-dash spelling `-tokenizer=hspice` works
-  too. Without it, ESPice reads the deck's own file (not its includes)
-  and picks Spectre for a `simulator lang=` line or a `name (nodes)
-  master` instance, HSPICE for a spelling both ESPice and ngspice 44.2
-  refuse (`.dcvolt`, `.temperature`, `.sn`, `.snac`, `.snnoise`, `.snxf`,
-  `.snosc`, `.hbosc`, `.acphasenoise`, `.power`, `.stimuli`, `.jitter`,
-  `.dc ... START=`, a `P` card's `PORT=`, an `E` or `G` card's `SCALE=`,
-  `MAX=`, `MIN=` or `ABS=`), and ngspice otherwise, with a
-  note on stderr when it is not ngspice. It never picks LTspice, Xyce or
-  VACASK. An HSPICE deck that runs as written, ESPice's own HSPICE cards
-  (`.data`, `.alter`, `.lin`, ...) included, reads as ngspice, whose
-  defaults differ (TNOM 27 instead of 25): name `--tokenizer=hspice` for
-  it, and `--tokenizer=ngspice` to read a deck with HSPICE cards as
-  written. See [Dialects](dialects.md).
-
-`--spicerack=PATH`
-: The `spice2rack` binary that translates a deck in another dialect;
-  default `$ESPICE_SPICERACK`, else the `spice2rack` a release ships in
-  `bin/` beside `espice` (the executable's real directory, so a symlink to
-  it finds it too), else `spice2rack` on `PATH`. It runs as
-  `spice2rack --dialect D --to espice --kit -o DIR DECK` into a fresh
-  directory under `$TMPDIR`, deleted when the deck ends. A missing binary
-  is `SpiceRackNotFound`, a refused deck `SpiceRackRefused`, a crash or
-  any other failure `SpiceRackFailed`; the deck is
-  never read as ngspice instead. Two lines on stderr time it:
-  `espice: spicerack translated DECK (D -> ngspice, N files) in S s`, then
-  `espice: finished DECK in S s, plus S s in spicerack`.
 
 `--vpi=APP`
 : Load the VPI application `APP`, a shared library exporting
@@ -303,7 +267,6 @@ failed points' values as NaN, then the error.
 | `ZIG` | `zig` on `PATH` | the Zig compiler `.hdl` uses to build Verilog-A models at run time |
 | `ESPICE_CACHE` | see below | cache directory for compiled `.hdl` models (`$ESPICE_CACHE/hdl`) |
 | `ESPICE_GPU_LU` | unset | `1` forces the GPU LU factorization on under a GPU backend, `0` forces it off |
-| `ESPICE_SPICERACK` | `spice2rack` on `PATH` | the SpiceRack binary that translates a deck in another dialect (`--spicerack` overrides it) |
 
 A thread count that is unset, zero or not a number reads as 1. The `.hdl`
 cache is `$ESPICE_CACHE/hdl`, else `$XDG_CACHE_HOME/espice/hdl`, else
@@ -323,10 +286,10 @@ espice amp.sp -r amp.raw
 # Text tables
 espice amp.sp -r amp.txt --format=print
 
-# An HSPICE deck, S-parameters to Touchstone: spice2rack translates it
-# first (an HSPICE-only card picks the dialect by itself; --tokenizer
-# makes sure)
-espice --tokenizer=hspice filter.sp --format=touchstone -r filter.s2p
+# An HSPICE deck, S-parameters to Touchstone: SpiceRack translates it
+# first (see Dialects)
+spx translate --from hspice --to ngspice filter.sp > filter.ngspice.sp
+espice filter.ngspice.sp --format=touchstone -r filter.s2p
 
 # Four analyses at once, eight device threads
 ESPICE_THREADS=8 espice --jobs=4 big.sp -r big.raw

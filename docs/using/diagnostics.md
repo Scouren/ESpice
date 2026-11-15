@@ -23,11 +23,6 @@ Error: bad_args.sp: InvalidAnalysisArguments
 | `UnsupportedSelfHeating` | a card ngspice would self-heat on a model ESPice runs isothermal: a VDMOS with a thermal node, or with `thermal` and `rthjc`; a B3SOI-FD or -DD with `shmod=1` and a non-zero `rth0`. A diode self-heats ([diode self-heating](devices.md#diode-self-heating)) | drop the thermal node, the flag or `rth0` to run it isothermal |
 | `LibrarySectionNotFound`, `InvalidLibrarySection` | `.lib file section` names a section the file does not have | check the section names inside the library |
 | `IncludeDepthExceeded` | includes nested more than 32 deep, usually a file including itself | |
-| `SpiceRackNotFound` | a deck in another dialect than ngspice, and no `spice2rack` to translate it: not at `--spicerack`, `$ESPICE_SPICERACK` or on `PATH` | install SpiceRack, or name it with `--spicerack=PATH`; `--tokenizer=ngspice` reads the deck as written. See [Dialects](dialects.md#other-dialects-spicerack) |
-| `SpiceRackRefused` | `spice2rack` refused a construct of the deck: the line before names its file, line, column and code (`error: spicerack: deck.sp: deck:6:1: W0001 a statement kept as another dialect's text`) | rewrite what SpiceRack names, or report the construct to SpiceRack |
-| `SpiceRackFailed` | `spice2rack` failed some other way: an unreadable deck, a crash (exit 101) or a signal, a usage error, or past 64 KiB of stdout or 1 MiB of stderr; the line before has its exit | report it to SpiceRack with that line |
-| `SpiceRackNoEntry` | `spice2rack` succeeded but printed no single path of a translated deck that exists | a SpiceRack without `--to espice --kit`: update it |
-| `SpiceRackNeedsFile` | a deck in another dialect came through a pipe or FIFO (`/dev/stdin`, `<(...)`): spice2rack opens the deck by path, with no stdin, and would read nothing | save it to a file first |
 
 ```text
 error: netlist: cannot read the card: .subckt

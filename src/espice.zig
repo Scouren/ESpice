@@ -51,9 +51,6 @@ pub const Options = config.Options;
 pub const MeasureWriters = config.MeasureWriters;
 /// Where runtime `.hdl` compilation finds its toolchain (`Options.hdl_toolchain`).
 pub const HdlToolchain = config.HdlToolchain;
-/// `$TMPDIR`, else `/tmp` when unset or empty, as the facade reads it: where
-/// the CLI's SpiceRack kit goes.
-pub const tmpDir = config.tmpDir;
 /// Why publication stopped (`Problem.output_error`).
 pub const DeliveryError = publish.DeliveryError;
 /// Query request types (`core.query`): what `append_queries` takes.

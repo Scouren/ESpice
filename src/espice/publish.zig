@@ -232,8 +232,8 @@ fn modeZ0(gpa: Allocator, ports: []const requests.Port, z0: *std.ArrayList(f64))
 
 /// Writes a `.lin format=touchstone` result as `<file>.s<N>p` in
 /// `Problem.out_dir`, beside the output file as `.save` and `.stim` write
-/// theirs (deck_files.zig), never beside the deck, which under SpiceRack is
-/// the kit the CLI deletes. `file` defaults to the deck's name without its
+/// theirs (deck_files.zig), never beside the deck, which may be a
+/// translator's temporary copy. `file` defaults to the deck's name without its
 /// extension (HSPICE names it after the netlist). Against the ports' own z0.
 fn writeTouchstone(self: *Problem, file: []const u8, plot: output.Plot) !void {
     const stem = if (file.len > 0) file else std.fs.path.stem(self.origin);

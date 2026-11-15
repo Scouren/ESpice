@@ -2,84 +2,37 @@
 
 ESPice reads one netlist dialect, ngspice's, with the HSPICE cards listed
 below that no ngspice spelling collides with. A deck in any other dialect
-(HSPICE, Spectre, LTspice, Xyce or VACASK) runs as SpiceRack's ngspice
-translation of it: the CLI hands it to `spice2rack` first and reads only
-what comes back. Without `--tokenizer` the CLI picks the dialect from
-markers in the deck's own file, ngspice when none is present (see
-[`--tokenizer`](cli.md#options)). A marker is a spelling ESPice's own
-reader refuses, and ngspice 44.2 too: Spectre's `simulator lang=` or `r1
-(a b) resistor` form, or HSPICE's `.dcvolt`, `.temperature`, `.sn`,
-`.snac`, `.snnoise`, `.snxf`, `.snosc`, `.hbosc`, `.acphasenoise`,
-`.power`, `.stimuli`, `.jitter`, `.dc ... START=`, a `P` card's
-`PORT=`, or an `E` or `G` card's `SCALE=`, `MAX=`, `MIN=` or `ABS=`. So a
-deck that runs as written is never
-translated, and the stderr note names the line and spelling that sent a
-deck to SpiceRack. Name the dialect to be sure:
-
-```sh
-espice deck.sp                        # detected; ngspice without markers
-espice --tokenizer=hspice deck.sp     # or hs: translated by spice2rack
-espice --tokenizer=spectre deck.scs   # or scs
-espice --tokenizer=ngspice deck.sp    # read as written, never translated
-```
+(HSPICE, Spectre, LTspice, Xyce or VACASK) is translated to ngspice first
+by [SpiceRack](https://github.com/Scouren/SpiceRack)'s `spx`, installed
+separately; ESPice neither ships nor runs it.
 
 ## Other dialects: SpiceRack
 
-For a deck in another dialect the CLI runs
-
 ```sh
-spice2rack --dialect <d> --to espice --kit -o <dir> <deck>
+spx translate --from hspice --to ngspice deck.sp > deck.ngspice.sp
+espice deck.ngspice.sp
 ```
 
-into a fresh directory under `$TMPDIR` (else `/tmp`). The kit holds the
-translated deck and a translated copy of every file it reaches, in their
-relative layout, with every `.include` and `.lib` path rewritten to an
-absolute path into the kit (an absolute PDK path is mirrored under it).
-ESPice reads the entry SpiceRack prints, so each include resolves to its
-copy and never to a file of the same name in the working directory, and
-deletes the directory when the deck ends. Output paths (`-r`, `.stim`
-files, `--measures=FILE`) stay relative to the working directory.
-
-The binary is `--spicerack=PATH`, else `$ESPICE_SPICERACK`, else
-`spice2rack` on `PATH`. SpiceRack is installed separately: the flake does
-not ship it until a SpiceRack release with `--to espice --kit` is pinned.
-
-SpiceRack's notes pass through on stderr as it wrote them, and two lines
-there keep its time apart from ESPice's:
-
-```text
-espice: spicerack translated <deck> (<d> -> ngspice, <n> files) in <s> s
-espice: finished <deck> in <s> s, plus <s> s in spicerack
-```
-
-A deck SpiceRack refuses stops with `SpiceRackRefused` and SpiceRack's
-coded line; one it cannot translate, with `SpiceRackFailed`,
-`SpiceRackNotFound` or `SpiceRackNoEntry` (see
-[Diagnostics](diagnostics.md)); it is never read as ngspice instead. A deck
-in another dialect is read from a file: one through a pipe or FIFO is
-refused with `SpiceRackNeedsFile`, as spice2rack would read it empty.
-spice2rack gets the deck's real path, so `espice --tokenizer=hspice
-/dev/stdin < deck.sp` translates `deck.sp` itself, includes and all.
-
-Every difference between ngspice and another dialect is SpiceRack's to
-translate: HSPICE's TNOM of 25 °C, `.temp` lists, multi-segment `.tran`,
-untyped `.measure` cards and TARG's inherited `TD`, its `P` port, its
-include search order and `.option search`, its signed
-`sqrt`, `log`, `log10` and `pow`, the `x` (mega) suffix, the `SFFM` and
-`AM` argument orders, `$` comments and ` \` continuations, and its other
-spellings of ngspice cards (`.temperature`, `.dcvolt` and bare `.ic` /
-`.nodeset` pairs, `.dc src START= STOP= STEP=`, `.noise v(out) src` and
-`.pz v(out) src` without a grid or ports, and the option names `gmindc`,
-`absv`, `relv`, `absi` and `method=bdf`), and its other spellings of
-ESPice's cards: `.sn` (`.pss`), `.snac` (`.pac`), `.snnoise` (`.pnoise`),
-`.snxf` (`.pxf v(out)`), `.snosc` (`.pss v(osc)`), `.hbosc` (`.hb
-v(osc)`), `.acphasenoise` (`.noise`; phnoise is 10·log10(onoise²/2)),
-`.power` (four `.meas tran` cards), `.stimuli` (`.stim`) and `.jitter`
-(`.meas ... jitter`); Spectre's
-statements, its case-sensitive names and `name:param` operating-point
-variables. The library reads ngspice only: the C API refuses any other
-`dialect` with `UnsupportedDialect` ([The C API](../embed/c-api.md)), and
-the Zig `Options` has none.
+`spx translate` writes the netlist to stdout and its report to stderr, and
+exits 1 when part of the deck has no ngspice form. Every difference
+between ngspice and another dialect is SpiceRack's to translate: HSPICE's
+TNOM of 25 °C, `.temp` lists, multi-segment `.tran`, untyped `.measure`
+cards and TARG's inherited `TD`, its `P` port, its include search order
+and `.option search`, its signed `sqrt`, `log`, `log10` and `pow`, the
+`x` (mega) suffix, the `SFFM` and `AM` argument orders, `$` comments and
+` \` continuations, and its other spellings of ngspice cards
+(`.temperature`, `.dcvolt` and bare `.ic` / `.nodeset` pairs, `.dc src
+START= STOP= STEP=`, `.noise v(out) src` and `.pz v(out) src` without a
+grid or ports, and the option names `gmindc`, `absv`, `relv`, `absi` and
+`method=bdf`), and its other spellings of ESPice's cards: `.sn` (`.pss`),
+`.snac` (`.pac`), `.snnoise` (`.pnoise`), `.snxf` (`.pxf v(out)`),
+`.snosc` (`.pss v(osc)`), `.hbosc` (`.hb v(osc)`), `.acphasenoise`
+(`.noise`; phnoise is 10·log10(onoise²/2)), `.power` (four `.meas tran`
+cards), `.stimuli` (`.stim`) and `.jitter` (`.meas ... jitter`);
+Spectre's statements, its case-sensitive names and `name:param`
+operating-point variables. ESPice reads such a spelling as written and
+refuses it like any unknown card. The C API refuses any `dialect` but
+ngspice with `UnsupportedDialect` ([The C API](../embed/c-api.md)).
 
 A small HSPICE deck, with parameters used bare, `PULSE` without
 parentheses, an untyped `.measure` and an `.alter` run:
@@ -89,7 +42,8 @@ parentheses, an untyped `.measure` and an `.alter` run:
 ```
 
 ```sh
-espice --tokenizer=hspice hspice_alter.sp
+spx translate --from hspice --to ngspice hspice_alter.sp > alter.sp
+espice alter.sp
 ```
 
 ```text
@@ -113,7 +67,8 @@ The `.alter` run doubles R, and the 50 % crossing moves from RC ln 2 =
 ```
 
 ```sh
-espice --tokenizer=spectre spectre_rc.scs
+spx translate --from spectre --to ngspice spectre_rc.scs > rc.sp
+espice rc.sp
 ```
 
 ## ngspice
@@ -146,7 +101,7 @@ u n p f a` (case-insensitive), and `d` works as an exponent (`1d-3`).
 
 These HSPICE features are part of ESPice's own dialect, because none of
 them collides with an ngspice spelling. The CLI reads a deck that uses
-them as written; `--tokenizer=hspice` sends it through SpiceRack instead.
+them as written.
 
 - **Runs and sweeps:** `.alter` blocks (cumulative, one run each, plots
   named `(alter=n)`); `.data` tables with `SWEEP DATA=name`; `SWEEP

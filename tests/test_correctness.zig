@@ -21,11 +21,11 @@
 //! With `--perturb` every expected value moves by 0.1% (`perturb`) and a deck
 //! that still passes is reported LOOSE: its tolerance cannot see an error
 //! that size. It reports and never fails (the nightly tier).
-//! After the decks, the `spicerack/` checks run the CLI's SpiceRack step
-//! against fake spice2rack binaries (tests/spicerack/, `spicerack_checks`),
-//! `vpi/bare_name` the CLI's `--vpi` file name, and
+//! After the decks, `vpi/bare_name` checks the CLI's `--vpi` file name, and
 //! `netlist/behavioural_dropped` its warning for a dropped field (`cli_checks`).
-//! A deck on the SpiceRack route (`tokenizer` hspice or spectre) whose run
+//! A deck in another dialect (`tokenizer` hspice or spectre) runs as
+//! SpiceRack's `spx translate --from <tokenizer> --to ngspice` of it, with
+//! `spx` on PATH: a missing one fails the deck, never skips it. One whose run
 //! warns that ESPice dropped input fails as `DroppedInput` unless its oracle
 //! lists the warning as a `stderr_line` check (`droppedInput`).
 //! `--zig PATH` and `--perf LEVERS` set `ZIG` and `ESPICE_PERF` in every
@@ -64,10 +64,9 @@ const Expectation = struct {
     checks: []const Json = &.{},
     category: ?[]const u8 = null,
 };
-/// `tokenizer`: the `--tokenizer` dialect the deck is read in; null keeps
-/// espice's default (ngspice). The CLI runs any other through spice2rack
-/// (src/spicerack.zig), found as a user's espice finds it: a missing one
-/// fails the deck, never skips it.
+/// `tokenizer`: the dialect the deck is written in; null keeps
+/// espice's dialect (ngspice). Any other is translated by `spx` first
+/// (`translate`); espice reads ngspice alone.
 const Oracle = struct { schema_version: u8, netlist_sha256: []const u8, expect: Expectation, tokenizer: ?[]const u8 = null };
 /// espice's `--measures` JSON (src/espice/report.zig) as `measure` reads
 /// it: each `.meas` result and optimized parameter as its exact f64, null
@@ -339,41 +338,10 @@ fn worker(runner: *Runner) void {
     }
 }
 
-/// The translation step's contract (src/spicerack.zig), run through the
-/// CLI with fake spice2rack binaries from tests/spicerack/. Each runs as a
-/// pseudo-deck under its name, after the decks: PASS or FAIL, chosen by
-/// `--filter`, outside VERDICTS.tsv. The first three went red before the
-/// step existed: `--spicerack` was a usage error (exit 2), and
-/// `--tokenizer=hspice` read deck.hsp natively and printed no spicerack line.
-/// `include` goes red when the kit names an include relatively: ngspice's
-/// order reads the working directory's decoy.inc first. `fifo` goes red
-/// without the CLI's regular-file check: the fake translates the FIFO's
-/// name and the run exits 0. The file kinds (`touchstone` to `hdl`,
-/// `checkKitFile`) run files_spice2rack.sh, whose kit names the one file
-/// its entry reads by its absolute path into the kit; `data`, `vec` and
-/// `load` go red when it names the file relatively (ngspice's order reads
-/// the working directory's decoy first), `touchstone`, `soalimits`, `vpi`
-/// and `hdl` only when ESPice resolves those from the working directory too
-/// (prepare.zig `deckRelative` reads them beside the entry). `lin` goes red
-/// when `.lin format=touchstone` writes beside the deck, which is the kit
-/// the CLI deletes, not beside the -r output (publish.zig `writeTouchstone`).
-/// `refused` (e2ad5d7's exit 1 and refusal text) went red while every
-/// non-zero exit was `SpiceRackFailed`; `refused_exit3` (P8-324's exit 3,
-/// a coded line and no refusal header) goes red while only that text
-/// decides; `crashed`, the refusal text then a panic's exit 101, goes red
-/// when the text alone decides.
-const spicerack_checks = [_][]const u8{
-    "spicerack/translated", "spicerack/missing",   "spicerack/refused",    "spicerack/refused_exit3", "spicerack/crashed",
-    "spicerack/include",    "spicerack/fifo",      "spicerack/touchstone", "spicerack/data",          "spicerack/vec",
-    "spicerack/load",       "spicerack/soalimits", "spicerack/vpi",        "spicerack/lin",           "spicerack/hdl",
-    "spicerack/sibling",
-};
-const SpicerackCheck = enum { translated, missing, refused, refused_exit3, crashed, include, fifo, touchstone, data, vec, load, soalimits, vpi, lin, hdl, sibling };
-
-/// Every check of the CLI's own handling that runs after the decks, as the
-/// spicerack ones do: those, then `vpi/bare_name` (`runVpiBareName`) and
-/// `netlist/behavioural_dropped` (`runBehaviouralDropped`).
-const cli_checks = spicerack_checks ++ [_][]const u8{ "vpi/bare_name", "netlist/behavioural_dropped" };
+/// Every check of the CLI's own handling that runs after the decks:
+/// `vpi/bare_name` (`runVpiBareName`) and `netlist/behavioural_dropped`
+/// (`runBehaviouralDropped`).
+const cli_checks = [_][]const u8{ "vpi/bare_name", "netlist/behavioural_dropped" };
 
 /// Runs the check `name` and prints its verdict; true when it passed.
 fn cliCheck(io: Io, app: []const u8, name: []const u8, timeout_seconds: u32) bool {
@@ -382,9 +350,7 @@ fn cliCheck(io: Io, app: []const u8, name: []const u8, timeout_seconds: u32) boo
     var report: Io.Writer.Allocating = .init(arena.allocator());
     diagnostics = &report.writer;
     defer diagnostics = null;
-    const run = if (std.mem.startsWith(u8, name, "spicerack/"))
-        runSpicerackCheck(arena.allocator(), io, app, name, timeout_seconds)
-    else if (std.mem.startsWith(u8, name, "vpi/"))
+    const run = if (std.mem.startsWith(u8, name, "vpi/"))
         runVpiBareName(arena.allocator(), io, app, timeout_seconds)
     else
         runBehaviouralDropped(arena.allocator(), io, app, timeout_seconds);
@@ -471,209 +437,6 @@ fn runBehaviouralDropped(a: Allocator, io: Io, app: []const u8, timeout_seconds:
     }
 }
 
-/// `translated`: oracle, the native run of the ngspice twin the fake
-/// writes, bit for bit, and the fake's 0.2 s sleep as a floor under the
-/// SpiceRack time both stderr lines report. `missing` and `refused`:
-/// oracle, the contract's coded error and exit 1, the fake's stderr passed
-/// through, and no raw file, so the deck was never read natively; `refused`
-/// and `refused_exit3` as `SpiceRackRefused` with spice2rack's coded line,
-/// `crashed` as `SpiceRackFailed` with its exit 101.
-/// `include`: oracle, the divider worked by hand, v(out) = 2 V * 1k / (1k +
-/// 1k) = 1 V from the kit's decoy.inc; the working directory's gives 1.5 V.
-/// `fifo`: oracle, the contract's coded refusal (`SpiceRackNeedsFile`, exit
-/// 1) for a deck spice2rack would open and find empty.
-fn runSpicerackCheck(a: Allocator, io: Io, app: []const u8, name: []const u8, timeout_seconds: u32) !void {
-    const dir = "tests/spicerack";
-    const fixtures = try Io.Dir.cwd().realPathFileAlloc(io, dir, a);
-    const scratch = try scratchDir(a, io, "spicerack");
-    defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
-    const out = try Io.Dir.cwd().realPathFileAlloc(io, scratch, a);
-    const exe = try Io.Dir.cwd().realPathFileAlloc(io, app, a);
-    const kind = std.meta.stringToEnum(SpicerackCheck, name["spicerack/".len..]).?;
-    const fake = try std.fmt.allocPrint(a, "{s}/{s}", .{ fixtures, switch (kind) {
-        .translated, .fifo, .sibling => "fake_spice2rack.sh",
-        .missing => "no_such_spice2rack",
-        .refused => "refusing_spice2rack.sh",
-        .refused_exit3 => "exit3_spice2rack.sh",
-        .crashed => "crashing_spice2rack.sh",
-        .include => "kit_spice2rack.sh",
-        .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl => "files_spice2rack.sh",
-    } });
-    const deck = switch (kind) {
-        .fifo => fifo: {
-            const path = try std.fmt.allocPrint(a, "{s}/deck.hsp", .{out});
-            const made = try std.process.run(a, io, .{ .argv = &.{ "mkfifo", path } });
-            if (!made.term.success()) return error.MkfifoFailed;
-            break :fifo path;
-        },
-        // files_spice2rack.sh picks the kit by the deck's name, unread.
-        .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl => stub: {
-            const path = try std.fmt.allocPrint(a, "{s}/{t}.hsp", .{ out, kind });
-            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "* never read: files_spice2rack.sh writes the kit this name picks\n.end\n" });
-            break :stub path;
-        },
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .sibling => "deck.hsp",
-    };
-    if (kind == .sibling) return runSibling(a, io, exe, fake, out, dir, deck);
-    const raw = try std.fmt.allocPrint(a, "{s}/translated.raw", .{out});
-    const result = try runEspice(a, io, &.{ exe, "--backend", backend_name, "--format=binary", "-b", "-r", raw, "--tokenizer", "hspice", "--spicerack", fake, deck }, dir, timeout_seconds);
-    switch (kind) {
-        .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl => return checkKitFile(a, io, kind, deck, raw, result),
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo, .sibling => {},
-    }
-    if (kind == .include) {
-        try requireSuccess(result);
-        _ = try stderrLine(result.stderr, "espice: spicerack translated deck.hsp (hspice -> ngspice, 2 files) in ");
-        const plots = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited));
-        if (plots.len != 1 or plots[0].rows != 1) return error.UnexpectedPlots;
-        const v_out = plots[0].value(0, try plots[0].column("v(out)")).re;
-        if (!(@abs(v_out - 1) <= 1e-9)) {
-            diagnostic("  v(out) = {d} V, not the kit's 1 V (1.5 V is the working directory's decoy.inc)\n", .{v_out});
-            return error.IncludeFromWorkDir;
-        }
-        return;
-    }
-    if (kind != .translated) {
-        if (result.term != .exited or result.term.exited != 1) {
-            diagnostic("  process {any}\n{s}\n", .{ result.term, result.stderr });
-            return error.ExpectedExit1;
-        }
-        _ = try stderrLine(result.stderr, switch (kind) {
-            .missing => "Error: deck.hsp: SpiceRackNotFound",
-            .refused, .refused_exit3 => "Error: deck.hsp: SpiceRackRefused",
-            .crashed => "Error: deck.hsp: SpiceRackFailed",
-            .fifo => try std.fmt.allocPrint(a, "Error: {s}: SpiceRackNeedsFile", .{deck}),
-            .translated, .include, .touchstone, .data, .vec, .load, .soalimits, .vpi, .lin, .hdl, .sibling => unreachable, // returned above
-        });
-        if (kind == .refused) _ = try stderrLine(result.stderr, "error: spicerack: deck.hsp: deck:2:1: W0001 a statement kept as another dialect's text");
-        if (kind == .refused_exit3) _ = try stderrLine(result.stderr, "error: spicerack: deck.hsp: deck:2:1: W0336 a construct no ngspice form expresses");
-        if (kind == .crashed) _ = try stderrLine(result.stderr, "thread 'main' panicked at ");
-        if (Io.Dir.cwd().access(io, raw, .{})) |_| return error.ReadNatively else |_| {}
-        return;
-    }
-    try requireSuccess(result);
-    const twin = try std.fmt.allocPrint(a, "{s}/twin.raw", .{out});
-    try requireSuccess(try runEspice(a, io, &.{ exe, "--backend", backend_name, "--format=binary", "-b", "-r", twin, "--tokenizer", "ngspice", "twin.sp" }, dir, timeout_seconds));
-    const want = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, twin, a, .unlimited));
-    try repeatable(want, try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited)));
-    _ = try stderrLine(result.stderr, "note: fake spice2rack translated deck.hsp");
-    const lines = [_][2][]const u8{
-        .{ "espice: spicerack translated deck.hsp (hspice -> ngspice, 1 files) in ", " s" },
-        .{ "espice: finished deck.hsp in ", " s in spicerack" },
-    };
-    for (lines) |l| {
-        const rest = try stderrLine(result.stderr, l[0]);
-        const value = std.mem.cutSuffix(u8, rest, l[1]) orelse return error.TimingLine;
-        // The last number on the line is SpiceRack's time.
-        const at = if (std.mem.lastIndexOfScalar(u8, value, ' ')) |i| i + 1 else 0;
-        const spent = std.fmt.parseFloat(f64, value[at..]) catch return error.TimingLine;
-        if (!(spent >= 0.2)) {
-            diagnostic("  {s}{s}: under the fake's 0.2 s\n", .{ l[0], rest });
-            return error.TimingLine;
-        }
-    }
-}
-
-/// A file-kind check: files_spice2rack.sh's kit for `kind`, the entry and
-/// the one file it reads (2 files), run from tests/spicerack/, where a
-/// decoy of that file's name holds another value. Oracles, worked by hand
-/// from the kit's file (the decoy's in parentheses): `touchstone`,
-/// hspice/s_element.sp's network at DC, the 100 ohm shunt at p1 beside 10
-/// ohm into the 50 ohm load, 37.5 ohm behind the 50 ohm source: v(p2) =
-/// 1 V * 37.5 / 87.5 * 50 / 60 = 5/14 V (a flat series 50 ohm: 1/3 V);
-/// `data`, rl = 1k: v(out) = 2 V * 1k / 2k = 1 V (3k: 1.5 V); `vec`, a at
-/// VIH = 1 V from t = 0 (3 V); `load`, v(b) = 0.25 V at t = 0 under uic,
-/// the `.ic` itself (0.75 V); `hdl`, a Verilog-A R = 1k compiled at run
-/// time (`--zig`) under r1 = 1k: v(out) = 2 V * 1k / 2k = 1 V (3k:
-/// 1.5 V); `soalimits`, vgs = 2 V past vgs_max 1.5 V,
-/// the one excursion (vds = 1 V past vds_max 0.5 V); `vpi`, the refusal
-/// (exit 1, no raw) names the kit's app.vpi, which is no shared object (the
-/// decoy's names tests/spicerack/app.vpi). Each value is exact to rounding
-/// in the kit's data; the S element's fit is exact on a rational network.
-/// `lin` reads no file (1 file): oracle, the `.save`/`.stim` rule that a
-/// side file lands beside the -r output, so lin.s2p is there after the run.
-/// `sibling`: oracle, the fake's own stderr note. espice and the fake, as
-/// `spice2rack`, share a `bin/`, and the run passes no `--spicerack` and
-/// no `ESPICE_SPICERACK`: it must take the sibling over PATH's, as a
-/// release archive ships it. Red before the sibling lookup: PATH's
-/// spice2rack ran, or none was found.
-fn runSibling(a: Allocator, io: Io, exe: []const u8, fake: []const u8, out: []const u8, cwd: []const u8, deck: []const u8) !void {
-    const bin = try std.fmt.allocPrint(a, "{s}/bin", .{out});
-    try Io.Dir.cwd().createDirPath(io, bin);
-    const copy = try std.fmt.allocPrint(a, "{s}/espice", .{bin});
-    // The fake copies the twin.sp beside it into the kit.
-    const twin = try std.fmt.allocPrint(a, "{s}/twin.sp", .{std.fs.path.dirname(fake).?});
-    for ([_][2][]const u8{ .{ exe, copy }, .{ fake, try std.fmt.allocPrint(a, "{s}/spice2rack", .{bin}) }, .{ twin, try std.fmt.allocPrint(a, "{s}/twin.sp", .{bin}) } }) |pair| {
-        const cp = try std.process.run(a, io, .{ .argv = &.{ "cp", pair[0], pair[1] } });
-        if (!cp.term.success()) return error.CopyFailed;
-    }
-    var env = try child_env.?.clone(a);
-    _ = env.swapRemove("ESPICE_SPICERACK");
-    const raw = try std.fmt.allocPrint(a, "{s}/sibling.raw", .{out});
-    const result = try std.process.run(a, io, .{
-        .argv = &.{ copy, "--backend", backend_name, "--format=binary", "-b", "-r", raw, "--tokenizer", "hspice", deck },
-        .cwd = .{ .path = cwd },
-        .environ_map = &env,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    try requireSuccess(result);
-    _ = try stderrLine(result.stderr, "note: fake spice2rack translated deck.hsp");
-}
-
-fn checkKitFile(a: Allocator, io: Io, kind: SpicerackCheck, deck: []const u8, raw: []const u8, result: std.process.RunResult) !void {
-    const files: u8 = if (kind == .lin) 1 else 2;
-    _ = try stderrLine(result.stderr, try std.fmt.allocPrint(a, "espice: spicerack translated {s} (hspice -> ngspice, {d} files) in ", .{ deck, files }));
-    const want: struct { node: []const u8, volts: f64, decoy: f64 } = switch (kind) {
-        .lin => {
-            try requireSuccess(result);
-            const s2p = try std.fmt.allocPrint(a, "{s}/lin.s2p", .{std.fs.path.dirname(raw).?});
-            const written = Io.Dir.cwd().readFileAlloc(io, s2p, a, .unlimited) catch |err| {
-                diagnostic("  no {s} ({s}): the .lin file stayed in the deleted kit\n", .{ s2p, @errorName(err) });
-                return error.SideFileLost;
-            };
-            if (std.mem.indexOf(u8, written, "# Hz S RI R 50\n") == null) return error.SideFileLost;
-            return;
-        },
-        .touchstone => .{ .node = "v(p2)", .volts = 5.0 / 14.0, .decoy = 1.0 / 3.0 },
-        .data => .{ .node = "v(out)", .volts = 1, .decoy = 1.5 },
-        .vec => .{ .node = "v(a)", .volts = 1, .decoy = 3 },
-        .load => .{ .node = "v(b)", .volts = 0.25, .decoy = 0.75 },
-        .hdl => .{ .node = "v(out)", .volts = 1, .decoy = 1.5 },
-        .soalimits => {
-            try requireSuccess(result);
-            _ = try stderrLine(result.stderr, "soa: m1 vgs = 2.0000 V > vgs_max 1.5 V (op)");
-            _ = try stderrLine(result.stderr, "soa: 1 excursions on 1 instances");
-            return;
-        },
-        .vpi => {
-            if (result.term != .exited or result.term.exited != 1) {
-                diagnostic("  process {any}\n{s}\n", .{ result.term, result.stderr });
-                return error.ExpectedExit1;
-            }
-            // The kit's directory is absolute (src/spicerack.zig `translate`).
-            const opened = try stderrLine(result.stderr, "error: vpi: ");
-            if (!std.mem.startsWith(u8, opened, "/") or std.mem.indexOf(u8, opened, "/espice-spicerack-") == null or
-                std.mem.indexOf(u8, opened, "/app.vpi: cannot open the application") == null)
-            {
-                diagnostic("  opened {s}, not the kit's app.vpi\n", .{opened});
-                return error.FileFromWorkDir;
-            }
-            if (Io.Dir.cwd().access(io, raw, .{})) |_| return error.RanPastRefusal else |_| {}
-            return;
-        },
-        .translated, .missing, .refused, .refused_exit3, .crashed, .include, .fifo, .sibling => unreachable, // runSpicerackCheck's own
-    };
-    try requireSuccess(result);
-    const plots = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, raw, a, .unlimited));
-    if (plots.len != 1 or plots[0].rows == 0) return error.UnexpectedPlots;
-    const got = plots[0].value(0, try plots[0].column(want.node)).re;
-    if (!(@abs(got - want.volts) <= 1e-9 * want.volts)) {
-        diagnostic("  {s} = {d} V, not the kit's {d} V ({d} V is the working directory's decoy)\n", .{ want.node, got, want.volts, want.decoy });
-        return error.FileFromWorkDir;
-    }
-}
-
 /// The rest of the first `stderr` line starting with `prefix`;
 /// `error.MissingLine` when none does.
 fn stderrLine(stderr: []const u8, prefix: []const u8) ![]const u8 {
@@ -703,7 +466,7 @@ fn droppedInput(stderr: []const u8, checks: []const Json) !?[]const u8 {
 }
 
 // Oracle: gshunt's and gmindc's stderr as unit run 13's ESPice wrote them
-// for their SpiceRack kits, with the lists their oracles would hold.
+// for their SpiceRack translations, with the lists their oracles would hold.
 test "droppedInput: a drop warning the oracle does not list is the verdict" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -791,7 +554,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
     // the GPU path it asked for. Under `auto` too: a failed kernel build is a bug either way.
     if (!equal(backend_name, "cpu") and std.mem.indexOf(u8, result.stderr, "hdl: no device kernels for ") != null) return error.DeviceKernelsFailed;
     try requireSuccess(result);
-    // A routed deck ran SpiceRack's translation: a warning that ESPice
+    // A routed deck ran spx's translation: a warning that ESPice
     // dropped part of it is input the translation lost, whatever the numbers.
     const routed = if (oracle.tokenizer) |t| !equal(t, "ngspice") else false;
     if (routed) if (try droppedInput(result.stderr, oracle.expect.checks)) |l| {
@@ -913,7 +676,11 @@ fn sameResults(a: Allocator, base: []const Plot, got: []const Plot, v: metamorph
 /// start code leaves the exit code alone on one, so only stderr shows it.
 fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: []const u8, timeout_seconds: u32, tokenizer: ?[]const u8) !std.process.RunResult {
     const measures = try std.fmt.allocPrint(a, "--measures={s}.json", .{output});
-    const base = [_][]const u8{ app, "--backend", backend_name, "--format=binary", "-b", "-r", output, measures, "--tokenizer", tokenizer orelse "ngspice", std.fs.path.basename(netlist) };
+    const deck = if (tokenizer) |dialect| switch (try translate(a, io, netlist, dialect, output, timeout_seconds)) {
+        .deck => |d| d,
+        .refused => |result| return result,
+    } else std.fs.path.basename(netlist);
+    const base = [_][]const u8{ app, "--backend", backend_name, "--format=binary", "-b", "-r", output, measures, deck };
     var with_vpi: [base.len + 2][]const u8 = undefined;
     const argv: []const []const u8 = if (marked(a, io, netlist, "VPI FIXTURE")) blk: {
         @memcpy(with_vpi[0..base.len], &base);
@@ -923,6 +690,37 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
         break :blk &with_vpi;
     } else &base;
     return runEspice(a, io, argv, std.fs.path.dirname(netlist).?, timeout_seconds);
+}
+
+/// `netlist` in `dialect` as `spx translate --from DIALECT --to ngspice`
+/// writes it (stdout), at `<output>.sp`, an absolute path. espice still runs
+/// from the deck's directory, which ngspice's include order searches first,
+/// so a relative `.include` finds the original file, untranslated.
+/// spx's exit 1 (something could not be expressed) is the deck's refusal:
+/// a run exiting 1 with `Error: <deck>: SpxRefused` after spx's report,
+/// which `checkRejection` reads as unsupported_input. `error.SpxNotFound`
+/// when no spx is on PATH; any other exit is `error.SpxFailed`.
+// ponytail: includes are not translated; a routed deck that includes
+// another-dialect file needs spx to inline it or a kit mode.
+fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, output: []const u8, timeout_seconds: u32) !union(enum) { deck: []const u8, refused: std.process.RunResult } {
+    std.debug.assert(dialect.len != 0 and output.len != 0);
+    const deck = try std.fmt.allocPrint(a, "{s}.sp", .{output});
+    const argv = [_][]const u8{ "spx", "translate", "--from", dialect, "--to", "ngspice", std.fs.path.basename(netlist) };
+    const result = runEspice(a, io, &argv, std.fs.path.dirname(netlist).?, timeout_seconds) catch |err| switch (err) {
+        error.FileNotFound => return error.SpxNotFound,
+        else => return err,
+    };
+    if (result.term == .exited and result.term.exited == 1) {
+        var refused = result;
+        refused.stderr = try std.fmt.allocPrint(a, "{s}\nError: {s}: SpxRefused\n", .{ result.stderr, netlist });
+        return .{ .refused = refused };
+    }
+    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0) {
+        diagnostic("  spx {any}\n{s}\n", .{ result.term, result.stderr });
+        return error.SpxFailed;
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = deck, .data = result.stdout });
+    return .{ .deck = deck };
 }
 
 /// Runs the espice command `argv` in `cwd`. `error.Timeout` after
@@ -992,9 +790,9 @@ fn checkRejection(category: []const u8, result: std.process.RunResult) !void {
         .{ "UnregisteredSystf", "unsupported_input" },
         .{ "VpiSecondSystfModule", "unsupported_input" },
         .{ "UnpairedPoleRoot", "unsupported_input" },
-        // spice2rack's refusal of a construct, never its absence or crash
-        // (SpiceRackNotFound, SpiceRackFailed): spicerack.zig `refusal`.
-        .{ "SpiceRackRefused", "unsupported_input" },
+        // spx's exit 1, a construct it could not express, never its
+        // absence or crash (`translate`).
+        .{ "SpxRefused", "unsupported_input" },
         .{ "unsupported_input", "unsupported_input" },
     });
     var lines = std.mem.splitScalar(u8, result.stderr, '\n');

@@ -1,40 +1,26 @@
 # ESPice
 
-A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compiled at build time by
-[VerA](https://github.com/OpenFAT/VerA), and one device kernel builds for the CPU, CUDA and HIP
-through [Gompute](https://github.com/OmarSiwy/Gompute).
+A SPICE simulator written in Zig. Every device, from the resistor to BSIM4, is a Verilog-A model
+compiled at build time by [VerA](https://github.com/OpenFAT/VerA), and one device kernel runs on
+the CPU, CUDA and HIP through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
-espice deck.sp                                   # ngspice deck; HSPICE or Spectre detected, translated by spice2rack
+nix run github:OpenFAT/ESPice -- deck.sp         # run an ngspice deck (HSPICE and Spectre are detected and translated)
 espice -r out.raw deck.sp                        # also write waveforms
-espice --format=touchstone -r out.s2p deck.sp
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes
+espice --plan deck.sp                            # print the analysis DAG without solving
 ```
 
-Docs: <https://openfat.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOGS.md)
+[Docs](https://openfat.github.io/ESPice/) · [Install guide](https://openfat.github.io/ESPice/using/install/) · [Changelog](CHANGELOGS.md) · [Testing](TESTING.md)
 
 ## Install
 
-| Route | Command |
-|---|---|
-| Install script (Linux, macOS) | `curl -fsSL https://raw.githubusercontent.com/OpenFAT/ESPice/main/tools/install.sh \| sh` (`sh -s -- 0.20.0` pins a version): reads `sources.json`, checks the download's sha256, caches it, and keeps versions side by side under `~/.local/share/espice` |
-| Debian, Ubuntu, Mint | `sudo apt install ./espice-0.20.0-linux-amd64.deb` (`arm64` too) |
-| Fedora, openSUSE | `sudo dnf install ./espice-0.20.0-linux-amd64.rpm` (`zypper install` on openSUSE) |
-| Arch | `sudo pacman -U ./espice-0.20.0-linux-amd64.pkg.tar.zst`, or the release's `PKGBUILD` (`espice-bin`) with `makepkg`; on the AUR once published |
-| NVIDIA / AMD GPUs (Linux) | `espice-cuda-0.20.0-linux-{amd64,arm64}.{deb,rpm,pkg.tar.zst}` (any NVIDIA GPU from Turing on; needs the driver) or `espice-hip-0.20.0-linux-amd64.*` (every AMD target the release builds, picked at start; needs ROCm's HIP runtime). One of `espice`, `espice-cuda`, `espice-hip` at a time |
-| Homebrew (macOS, Linux) | `brew install OpenFAT/espice/espice`, once the tap is published (the release's `espice.rb`) |
-| Nix (release binary) | `nix run github:OpenFAT/ESPice#latest -- deck.sp`, or `'#"0.20.0"'` for a given release |
-| Nix (from source) | `nix run github:OpenFAT/ESPice -- deck.sp`; `nix profile install github:OpenFAT/ESPice` (`.#espice-cuda` adds CUDA) |
-| Release tarball | [GitHub releases](https://github.com/OpenFAT/ESPice/releases): every platform and CPU level, with `SHA256SUMS`; GPU builds as self-extracting `.run` bundles |
+```sh
+nix run github:OpenFAT/ESPice -- deck.sp                     # from source, no install
+nix profile install github:OpenFAT/ESPice                    # .#espice-cuda adds CUDA
+```
 
-The packages, the install script, Homebrew and Nix install the CPU build at the baseline instruction
-set. Every route but the two from source needs a published release, and none exists yet; until
-one does, use Nix from source or build from source. Runtime `.hdl`
-models build with Zig 0.18.0-dev.349: the Linux packages and Nix carry it; with the install script,
-Homebrew or a tarball, put it on `PATH` or in `$ZIG`. More in the
-[install guide](https://openfat.github.io/ESPice/using/install/).
-
-From source (Zig 0.18.0-dev.349, provided by the devshell; VerA and Gompute are pinned in
+From a checkout (the devshell provides Zig 0.18.0-dev.349; VerA and Gompute are pinned in
 `build.zig.zon`):
 
 ```sh
@@ -42,75 +28,113 @@ nix develop            # .#ci for CPU only
 zig build              # zig-out/bin/espice; -Dgpu=false skips the GPU kernels
 ```
 
-`espice --version` prints the installed version.
+Packages (`.deb`, `.rpm`, `.pkg.tar.zst`, Homebrew, the install script, CUDA and HIP builds) come
+with the first release; the [install guide](https://openfat.github.io/ESPice/using/install/) has
+every route.
 
-## Dependencies
+## Analyses
 
-For Ubuntu 20.04 or newer and Linux Mint 20 or newer. The release binaries link only glibc 2.28+,
-so running ESPice on the CPU needs nothing beyond the base system.
-
-| To | Install |
+| Group | Cards |
 |---|---|
-| Run on the CPU | nothing |
-| Run on an NVIDIA GPU | the proprietary driver, which provides `libcuda.so.1`: `sudo ubuntu-drivers autoinstall` (or Mint's Driver Manager). The CUDA toolkit is not needed at run time. |
-| Run on an AMD GPU | the ROCm HIP runtime from AMD's repository (`amdgpu-install --usecase=hip`), which provides `libamdhip64.so`. |
-| Load `.hdl` models at run time | nothing with the Linux packages or Nix; otherwise (install script, Homebrew, tarball) Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
-| Build from source with Nix (recommended) | `sudo apt install curl git xz-utils`, then Nix: `sh <(curl -L https://nixos.org/nix/install) --daemon`; `nix develop` then provides Zig, Python and the GPU toolkits |
-| Build from source without Nix | `sudo apt install git curl xz-utils python3`, and Zig `0.18.0-dev.349+d924f83bf` from <https://ziglang.org/download/> |
-| Embed precompiled CUDA kernels (optional) | `ptxas` and `fatbinary` on `PATH`, from NVIDIA's CUDA 12 toolkit repository (`cuda-toolkit-12-x`; Ubuntu's own `nvidia-cuda-toolkit` is too old for recent GPUs). Without them the driver compiles the kernels on first use. |
-| Run the test corpus | `python3`; `nodejs` for the WebAssembly playground comparison |
+| DC | `.op` `.dc` `.tf` `.sens` `.dcmatch` `.dcsens` `.acmatch` `.dcxf` `.acxf` `.dcinc` `.temp` |
+| Small signal | `.ac` `.noise` `.pz` `.disto` `.sp` `.lin` `.net` `.stb` `.lstb` |
+| Transient | `.tran` `.four` `.fft` `.trannoise` `.envelope` `.matex` |
+| Periodic steady state | `.pss` `.pac` `.pxf` `.pnoise` `.qpss` |
+| Harmonic balance | `.hb` `.hbac` `.hbxf` `.hbnoise` `.hblin` `.phasenoise` |
+| Variation | `.mc`, scaled-sigma sampling, worst-case distance, safe operating area |
 
-## What it does
+Analyses form a DAG and run on every core (`--jobs`); shared prerequisites, such as the operating
+point under an `.ac`, are solved once. Syntax and outputs: [analyses](https://openfat.github.io/ESPice/using/analyses/).
 
-- **Analyses:** `op dc dcmatch sens tf temp`, `ac noise sp stb pz disto`,
-  `tran tran_noise four envelope matex`, `pss pac pnoise pxf qpss hb`, `mc`.
-- **Devices:** BSIM1–4, BSIM-SOI, BSIM-CMG, PSP, HiSIM2/HV, MOS 1/2/3/6/9, VDMOS, Gummel-Poon,
-  VBIC, HICUM, JFET/MESFET/HFET, passives, controlled and behavioural sources, switches,
-  transmission lines.
-- **Your own models:** `.hdl "model.va"` plus an `N` card compiles a Verilog-A module at run time
-  (the Linux packages and Nix carry that Zig; with other routes it must be on `PATH` or in `$ZIG`; cached under
-  `~/.cache/espice/hdl`). OSDI is not loaded.
-- **Output:** binary/ASCII raw, CSV, Touchstone, PSF, FSDB, SST2, CITIfile, print.
-- **Parallel by default:** analyses form a DAG and run on every core (`--jobs`). `--plan` prints the
-  DAG without solving.
-- **Sweep throughput:** when nothing reads the waveforms, `.meas` cards stream, each transient stops
-  once its measures resolve, and OPs warm-start from the nominal one. The printed values match a
-  full run. `--full-waveforms` turns this off.
-- **Lanes:** `--backend cuda` (or `hip`) runs sweep points as GPU lanes; `auto` picks the GPU only on
-  FP64-class cards. CPU lanes (`--lanes`) are off by default.
-- **Library:** `include/espice.h` is the C API, including the points API for optimizer loops
-  (append points, read measures and tangents).
+## Models
 
-`espice --help` lists every flag. Exit code is 1 if any deck fails, 2 on a usage error.
+All in [`models/`](models/), vendored one file per model so a build downloads nothing. Your own:
+`.hdl "model.va"` plus an `N` card compiles a Verilog-A module at run time (OSDI is not loaded).
 
-## Performance
+| Device | Models | Derived from |
+|---|---|---|
+| Passives, sources, switches | R, C, L, K, V, I, E, G, F, H, B, S, W | ngspice / SPICE3 (BSD-3); C, L, Laplace, pole and delay forms written for ESPice |
+| Transmission lines | T, LTRA, TXL, CPL (2–4 conductors), uniform RC | ngspice / SPICE3 |
+| Data elements | S-parameter blocks (1–4 ports), W-element lines (1–4 conductors) | written for ESPice |
+| Diode | junction diode | ngspice / SPICE3 |
+| | JUNCAP2 200.6.2 | CMC release (NXP, TU Delft) |
+| | DIODE_CMC 3.0 | CMC release |
+| | ASM-ESD 101.1.0 | IIT Kanpur release |
+| BJT | Gummel-Poon | ngspice / SPICE3 |
+| | VBIC 1.3 (4 terminal) | VACASK, from Dietmar Warning's VA-Models |
+| | HICUM/L2 3.2.0, HICUM/L0 2.1.0 | HICUM group release |
+| | Mextram 505.6.0 | CMC release (NXP, TU Delft, Auburn) |
+| MOSFET | MOS 1/2/3/6/9, BSIM1, BSIM2, BSIM3, B3SOI-FD, B3SOI-DD, VDMOS | ngspice / SPICE3 |
+| | BSIM4 (`LEVEL=14`/`54`) | Cogenda VA-BSIM48 (**CC-BY-NC 4.0, no commercial use**) |
+| | BSIM-CMG 112.1.0, BSIM-IMG 103.1.0, BSIM-BULK 107.2.1, BSIM-SOI 101.0.0 | UC Berkeley release |
+| | PSP 103.8.2, PSP 104.1.0 (QS, NQS, self-heating) | CMC release (NXP, TU Delft, CEA) |
+| | L-UTSOI 102.9.0 | CEA-Leti release |
+| | HiSIM2 | Hiroshima University / STARC |
+| | HiSIM_HV 2.5.1, HiSIM_SOI 1.5.0, HiSIM_SOTB 1.3.0 | Hiroshima University release |
+| | MOSVAR 1.4.0 | CMC release |
+| HEMT | ASM-HEMT 101.6.0 | IIT Kanpur release |
+| | MVSG_CMC 5.0.0 | CMC release |
+| Resistor | R2_CMC 1.0.2, R3_CMC 1.1.2 | CMC release |
+| Other FETs | JFET, JFET2, MESFET, MESA, HFET1, HFET2 | ngspice / SPICE3 |
+
+Releases and licences per file: [models/LICENSES.md](models/LICENSES.md). Card and `LEVEL`
+mapping: [devices](https://openfat.github.io/ESPice/using/devices/).
+
+## Accuracy
+
+Measured against other SPICE simulators on the
+[conformance corpus](https://github.com/OpenFAT/VAMS-Conformance-Suite) (about 920 decks), per
+analysis. Each cell: decks agreeing / decks compared, and the worst relative error among the
+agreeing ones.
+
+| Analysis | vs ngspice | vs Xyce | vs VACASK |
+|---|---:|---:|---:|
+| `.op` | — | — | — |
+| `.dc` | — | — | — |
+| `.tf` / `.sens` | — | — | — |
+| `.ac` | — | — | — |
+| `.noise` | — | — | — |
+| `.pz` | — | — | — |
+| `.disto` | — | — | — |
+| `.sp` | — | — | — |
+| `.stb` | — | — | — |
+| `.tran` | — | — | — |
+| `.four` / `.fft` | — | — | — |
+| `.pss` / `.pac` / `.pnoise` | — | — | — |
+| `.hb` | — | — | — |
+
+Not measured yet. A reference converges at its own tolerance (ngspice at `reltol = 1e-3`), so
+errors below it are reported as agreement, not as precision.
+
+## Benchmarks
+
+One chart per analysis: wall time (y) against circuit size in devices after subcircuit expansion
+(x), both log, ESPice against each reference simulator.
 
 <!-- bench:start -->
-| Compared with | Decks both ran | ESPice faster | Median speedup | Agree / differ |
-|---|---:|---:|---:|---:|
-| ngspice | 473 | 466 | 3.3x | 424 / 13 |
-| VACASK | 270 | 270 | 3.5x | 234 / 17 |
-
-Median of 3 runs after a warm-up, process startup included, CPU backend, 32 x Intel(R) Core(TM) i9-14900HX, commit `3a57edf3`, 2026-07-29 (local run; `.github/workflows/bench.yml` regenerates this on each release).
+Not measured yet.
 <!-- bench:end -->
+
+Reproduce: `nix develop .#benchmarking -c zig build bench`, then `tools/bench_plot.py` (which
+rewrites the block above).
 
 ## Tests
 
-`zig build test` runs the unit suites and then the fixture corpus: about 920 decks in
-`tests/conformance/tests/netlist/`, each scored against its `.expected.json` (oracles from ngspice and
-VACASK). The decks live in the
-[VAMS Conformance Suite](https://github.com/OpenFAT/VAMS-Conformance-Suite), a submodule
-(`git submodule update --init tests/conformance`; the flake reads the same commit as its `conformance`
-input). Add or fix a deck there, then move the submodule and `nix flake update conformance` together. Narrow a run with `-Dtest-filter=NAME` (unit tests) and
-`-- --filter op/` (decks). Benchmarks:
-`nix develop .#benchmarking -c zig build bench`, charted per analysis by `tools/bench_plot.py` (each release attaches them; the history over releases is on the [`bench-history`](https://github.com/OpenFAT/ESPice/releases/tag/bench-history) release). What each check proves, and which run when: [TESTING.md](TESTING.md).
+```sh
+git submodule update --init tests/conformance
+nix develop .#ci -c zig build test              # unit suites, then the deck corpus
+```
+
+Each deck is scored against its `.expected.json`, which records the tool and version that produced
+it. What each check proves and when it runs: [TESTING.md](TESTING.md).
 
 ## Contributing
 
-Maintained by one person. Branches, pins and how to send a change: [CONTRIBUTING.md](CONTRIBUTING.md). Vulnerabilities: [SECURITY.md](SECURITY.md).
+Maintained by one person. Branches and how to send a change: [CONTRIBUTING.md](CONTRIBUTING.md).
+Vulnerabilities: [SECURITY.md](SECURITY.md).
 
 ## License
 
 Apache-2.0 ([LICENSE](LICENSE)). Models in `models/` keep their own licences
-([models/LICENSES.md](models/LICENSES.md)); `models/bsim4va.va` (BSIM4, `LEVEL=14`/`54`) is
-CC-BY-NC 4.0, so commercial users must replace it.
+([models/LICENSES.md](models/LICENSES.md)); `bsim4va.va` is CC-BY-NC 4.0, so commercial users must
+replace it.

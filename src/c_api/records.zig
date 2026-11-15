@@ -213,7 +213,7 @@ comptime {
 pub fn status(err: anyerror) u32 {
     const code: Code = switch (err) {
         error.InvalidArgument, error.InvalidConcurrency, error.InvalidComponent, error.QueryNotReady, error.DuplicateQuery => .invalid_argument,
-        // A dialect other than ngspice: spice2rack translates it first.
+        // A dialect other than ngspice: `spx translate` converts it first.
         error.UnsupportedDialect => .invalid_argument,
         // Malformed caller input (analysis cards, query options, directive edits), not a numerical failure.
         error.InvalidAnalysisArguments, error.InvalidQueryOptions, error.UnsupportedDirectiveMutation => .invalid_argument,

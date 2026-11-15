@@ -22,11 +22,6 @@
     conformance.url = "git+https://github.com/Scouren/Conformance-Suite?ref=dev/perf-oracles&rev=c0348882ff257bef9ff85a35a398559a7271073d";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
-    # SpiceRack's source, for spice2rack (`--to espice --kit`): the CLI runs it
-    # on every non-ngspice deck. Its own flake pulls two ESPice revs, so this
-    # takes the source alone and builds the one binary below.
-    spicerack.url = "git+https://github.com/Scouren/SpiceRack?ref=espice-kit&rev=231d9c9c34ac142c55d06a9a985739afb160b1ab";
-    spicerack.flake = false;
   };
 
   outputs =
@@ -37,7 +32,6 @@
       zig-overlay,
       nix-bundle,
       conformance,
-      spicerack,
       ...
     }:
     {
@@ -143,18 +137,6 @@
         # The reference simulators come from the conformance suite's flake.
         refPkgs = conformance.packages.${system};
 
-        # SpiceRack's translator, which the CLI finds on PATH or by ESPICE_SPICERACK.
-        spice2rack = pkgs.rustPlatform.buildRustPackage {
-          pname = "spice2rack";
-          version = (lib.importTOML "${spicerack}/Cargo.toml").package.version;
-          src = spicerack;
-          cargoLock.lockFile = "${spicerack}/Cargo.lock";
-          buildNoDefaultFeatures = true;
-          cargoBuildFlags = [ "--bin" "spice2rack" ];
-          # Its suites need the reference simulators; SpiceRack's CI runs them.
-          doCheck = false;
-          meta.mainProgram = "spice2rack";
-        };
         version = builtins.head (builtins.match ''.*\.version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon));
 
         devShells = rec {
@@ -162,7 +144,6 @@
             packages = [
               zig
               pkgs.python3
-              spice2rack
             ];
             # One global cache per Zig store path: two builds of the same Zig version
             # sharing ~/.cache/zig evict each other's build runner on every `zig build`.
@@ -238,7 +219,6 @@
                 -Dhip-arch=${hip} -Dcuda-arch=${cuda} \
                 -j$NIX_BUILD_CORES --prefix "$out"
               wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig \
-                --set-default ESPICE_SPICERACK ${lib.getExe spice2rack} \
                 --run ${lib.escapeShellArg callerDir} \
                 ${lib.optionalString (hip != "none")
                   "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.rocmPackages.clr ]}"
@@ -280,7 +260,7 @@
 
         packages = {
           default = espice;
-          inherit espice spice2rack;
+          inherit espice;
         }
         // releases
         // lib.optionalAttrs (latest != null) { inherit latest; }

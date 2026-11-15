@@ -56,7 +56,7 @@ pub const Token = struct {
     /// A card that only renames one of these is SpiceRack's to translate,
     /// never a second entry: `.sn`, `.snac`, `.snnoise`, `.snxf`, `.snosc`,
     /// `.hbosc`, `.acphasenoise`, `.power`, `.stimuli` and `.jitter` are
-    /// unknown cards (spicerack.zig `detect` names them).
+    /// unknown cards.
     pub const keywords = std.StaticStringMap(Card).initComptime(.{
         .{ "end", .end },                   .{ "ends", .ends },                 .{ "subckt", .subckt },
         // `.macro`/`.eom` and `.parameter(s)`: ngspice 44.2 reads them too

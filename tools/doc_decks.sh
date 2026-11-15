@@ -21,8 +21,25 @@ run() { # run LABEL DIR DECK [espice args...]
   fi
 }
 
-for deck in docs/examples/*.sp; do run "$deck" docs/examples "$(basename "$deck")"; done
-for deck in docs/examples/*.scs; do run "$deck" docs/examples "$(basename "$deck")" --tokenizer spectre; done
+# A deck in another dialect runs as `spx translate`'s ngspice of it, as
+# dialects.md says to run it; no spx on PATH fails it, never skips it.
+translated() { # translated FROM DECK
+  total=$((total + 1))
+  if ! (cd docs/examples && spx translate --from "$1" --to ngspice "$2" >"$work/translated.sp" 2>"$work/log"); then
+    fail=$((fail + 1))
+    echo "FAIL $2: spx translate --from $1"
+    tail -5 "$work/log"
+    return
+  fi
+  total=$((total - 1))
+  run "docs/examples/$2 ($1)" docs/examples "$work/translated.sp"
+}
+for deck in docs/examples/*.sp; do
+  [ "$deck" = docs/examples/hspice_alter.sp ] && continue
+  run "$deck" docs/examples "$(basename "$deck")"
+done
+translated hspice hspice_alter.sp
+translated spectre spectre_rc.scs
 
 # Inline blocks; a block that is one `--8<--` include is an example run above.
 while IFS= read -r page; do
@@ -42,8 +59,6 @@ done < <(find docs -name '*.md' | sort)
 # A deck read through a pipe or FIFO prints what the file prints (#234): the
 # dialect check once drained the pipe and the run saw an empty deck.
 # stdout and stderr both count; each run's deck path is replaced by DECK.
-# A deck in another dialect goes to spice2rack, which reads no pipe: the
-# CLI refuses it (SpiceRackNeedsFile), checked below.
 for deck in measure.sp; do
   total=$((total + 1))
   each() { (cd docs/examples && timeout 60 "$exe" --backend cpu "$1" <"$deck" 2>&1 | sed "s|$1|DECK|g"); }
@@ -59,13 +74,6 @@ for deck in measure.sp; do
     diff "$work/file.out" "$work/pipe.out" | head -5
   fi
 done
-total=$((total + 1))
-if (cd docs/examples && cat spectre_rc.scs | timeout 60 "$exe" --backend cpu /dev/stdin >"$work/pipe.out" 2>&1) ||
-  ! grep -q 'SpiceRackNeedsFile' "$work/pipe.out"; then
-  fail=$((fail + 1))
-  echo "FAIL spectre_rc.scs through a pipe: not refused with SpiceRackNeedsFile"
-  tail -5 "$work/pipe.out"
-fi
 
 echo "doc decks: $((total - fail)) of $total run"
 [ "$fail" -eq 0 ]

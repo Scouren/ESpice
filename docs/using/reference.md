@@ -204,8 +204,8 @@ selected by the instance's L and W; `.option scale=` scales them.
 A relative path is looked for as ngspice looks: in the working directory,
 then beside the file that names it. Then, an ESPice extension, beside the
 top deck (with a warning). Includes nest up to 32 levels. HSPICE's
-`.option search='dir'` is not read: SpiceRack resolves a translated deck's
-includes itself.
+`.option search='dir'` is not read: SpiceRack's translation of an HSPICE
+deck carries it.
 
 ### Options
 
