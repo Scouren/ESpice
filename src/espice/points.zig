@@ -212,7 +212,8 @@ pub fn tangentDeck(self: *Problem, jobs: []Query, h: f64, steps: [][]const f64) 
 /// Solves the template's nominal operating point into `Deck.warm_op`, once,
 /// with the tolerances of the first transient in `jobs` (else the first
 /// query's); nothing without a job that reads one. A nominal point that
-/// does not converge leaves it empty, so every point starts cold.
+/// does not converge leaves it empty, so every point starts cold; one that
+/// cannot exist (a node with no DC path) fails with error.FloatingNode.
 pub fn solveWarmOp(self: *Problem, jobs: []const Query) !void {
     if (self.prepared.deck.warm_op.len != 0) return;
     // Nothing reads it when every job starts from `.ic` (`uic`): on
@@ -236,6 +237,10 @@ pub fn solveWarmOp(self: *Problem, jobs: []const Query) !void {
     var id: [1]QueryId = undefined;
     _ = try session.append(&.{.{ .op = .{ .tol = tol, .tran_op = tran_op } }}, &id);
     try session.runAll(.{ .quantum = .completion });
+    // A deck whose operating point cannot exist fails here, said once: the
+    // deck's own queries would solve it again and refuse it again. Any
+    // other failure leaves them to the cold ladder.
+    if (session.failure()) |err| if (err == error.FloatingNode) return err;
     const x = try session.operatingPoint(id[0]) orelse return;
     self.prepared.deck.warm_op = try self.arena.allocator().dupe(f64, x);
     assert(self.prepared.deck.warm_op.len == x.len);
