@@ -423,7 +423,7 @@ PASS	conformance/tests/netlist/hspice/pattern_source.sp
 PASS	conformance/tests/netlist/hspice/pattern_source_ngspice.sp
 PASS	conformance/tests/netlist/hspice/pole_source.sp
 PASS	conformance/tests/netlist/hspice/pole_step.sp
-XFAIL	conformance/tests/netlist/hspice/port_series_z0.sp
+PASS	conformance/tests/netlist/hspice/port_series_z0.sp
 XFAIL	conformance/tests/netlist/hspice/power.sp
 PASS	conformance/tests/netlist/hspice/power_ngspice.sp
 XFAIL	conformance/tests/netlist/hspice/ptdnoise_diode.sp
@@ -486,7 +486,7 @@ PASS	conformance/tests/netlist/invalid/four_zero_fundamental.sp
 PASS	conformance/tests/netlist/invalid/hb_fractional_harmonics.sp
 PASS	conformance/tests/netlist/invalid/hb_negative_frequency.sp
 PASS	conformance/tests/netlist/invalid/hspice_brace_behavioural.sp
-XFAIL	conformance/tests/netlist/invalid/hspice_brace_expression.sp
+PASS	conformance/tests/netlist/invalid/hspice_brace_expression.sp
 XFAIL	conformance/tests/netlist/invalid/hspice_brace_measure.sp
 XFAIL	conformance/tests/netlist/invalid/hspice_exponent_scale.sp
 PASS	conformance/tests/netlist/invalid/hspice_percent_operator.sp
