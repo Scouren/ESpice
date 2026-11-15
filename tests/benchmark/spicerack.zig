@@ -27,7 +27,7 @@ pub const Translation = struct {
     refused: []const u8 = "",
 };
 
-/// Runs `exe translate --from DIALECT --to ngspice DECK` once and writes its
+/// Runs `exe translate --from DIALECT --to espice DECK` once and writes its
 /// stdout to `<scratch>/translated.sp`. Every string is allocated in `a`. A
 /// binary that cannot start, a non-zero exit, or an empty stdout is a
 /// refusal that says so, never an error: the reference columns still run
@@ -40,7 +40,7 @@ pub fn translate(a: Allocator, io: Io, exe: []const u8, dialect: []const u8, dec
     assert(deck.len != 0 and exe.len != 0);
     const start = Io.Timestamp.now(io, .awake);
     const result = std.process.run(a, io, .{
-        .argv = &.{ exe, "translate", "--from", dialect, "--to", "ngspice", std.fs.path.basename(deck) },
+        .argv = &.{ exe, "translate", "--from", dialect, "--to", "espice", std.fs.path.basename(deck) },
         .cwd = .{ .path = std.fs.path.dirname(deck) orelse "." },
         .stdout_limit = .limited(64 * 1024 * 1024),
     }) catch |err|

@@ -5,7 +5,7 @@ ngspice's, with the HSPICE cards no ngspice spelling collides with. A file
 whose first line is `.espice 1` is in ESPice's own language instead, which
 [The ESPice netlist language](language.md) defines; every other file is
 read as this page says, and the two mix through `.include` and `.lib`. A deck
-in another dialect arrives as SpiceRack's ngspice translation of it (see
+in another dialect arrives as SpiceRack's translation of it (`sprack translate --to espice`) (see
 [Dialects](dialects.md)). The lists come from the parser's
 tables: the card keyword map and the element letter map. A card not listed
 here is refused with `UnsupportedCard`, naming the line.

@@ -24,7 +24,7 @@
 //! After the decks, `vpi/bare_name` checks the CLI's `--vpi` file name, and
 //! `netlist/behavioural_dropped` its warning for a dropped field (`cli_checks`).
 //! A deck in another dialect (`tokenizer` hspice or spectre) runs as
-//! SpiceRack's `sprack translate --from <tokenizer> --to ngspice` of it, with
+//! SpiceRack's `sprack translate --from <tokenizer> --to espice` of it, with
 //! `sprack` on PATH: a missing one fails the deck, never skips it. One whose run
 //! warns that ESPice dropped input fails as `DroppedInput` unless its oracle
 //! lists the warning as a `stderr_line` check (`droppedInput`).
@@ -692,7 +692,7 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
     return runEspice(a, io, argv, std.fs.path.dirname(netlist).?, timeout_seconds);
 }
 
-/// `netlist` in `dialect` as `sprack translate --from DIALECT --to ngspice`
+/// `netlist` in `dialect` as `sprack translate --from DIALECT --to espice`
 /// writes it (stdout), at `<output>.sp`, an absolute path. espice still runs
 /// from the deck's directory, which ngspice's include order searches first,
 /// so a relative `.include` finds the original file, untranslated.
@@ -705,7 +705,7 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
 fn translate(a: Allocator, io: Io, netlist: []const u8, dialect: []const u8, output: []const u8, timeout_seconds: u32) !union(enum) { deck: []const u8, refused: std.process.RunResult } {
     std.debug.assert(dialect.len != 0 and output.len != 0);
     const deck = try std.fmt.allocPrint(a, "{s}.sp", .{output});
-    const argv = [_][]const u8{ "sprack", "translate", "--from", dialect, "--to", "ngspice", std.fs.path.basename(netlist) };
+    const argv = [_][]const u8{ "sprack", "translate", "--from", dialect, "--to", "espice", std.fs.path.basename(netlist) };
     const result = runEspice(a, io, &argv, std.fs.path.dirname(netlist).?, timeout_seconds) catch |err| switch (err) {
         error.FileNotFound => return error.SprackNotFound,
         else => return err,
