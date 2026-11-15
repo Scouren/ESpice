@@ -10,17 +10,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1794762618,
-        "narHash": "sha256-+iFPqoT2vCoM6GrRIIKNziJHDK9xFOHxmKpz648e3Kc=",
+        "lastModified": 1794767514,
+        "narHash": "sha256-eDCPjGfqrAXHvbRGwNGfOHpUSN4DmpoqvKT6HygVFfU=",
         "ref": "main",
-        "rev": "1ebd3cfcec1820e7f1e2888c141a2656452fa7f5",
-        "revCount": 216,
+        "rev": "3cdbdec7143e812faa31b67e08b78c6ae26985d6",
+        "revCount": 218,
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
       },
       "original": {
         "ref": "main",
-        "rev": "1ebd3cfcec1820e7f1e2888c141a2656452fa7f5",
+        "rev": "3cdbdec7143e812faa31b67e08b78c6ae26985d6",
         "type": "git",
         "url": "https://github.com/Scouren/Conformance-Suite"
       }
